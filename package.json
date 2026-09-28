@@ -1,0 +1,51 @@
+{
+  "name": "flop-close-call-orchestrator",
+  "version": "0.1.0",
+  "private": true,
+  "description": "FLOP Technocore Close Call multi-DID agent orchestrator (contest close-1)",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0 <25"
+  },
+  "packageManager": "pnpm@9.12.3",
+  "scripts": {
+    "cli": "tsx apps/orchestrator/src/cli.ts",
+    "start": "tsx apps/orchestrator/src/main.ts",
+    "lint": "eslint . --max-warnings 0",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "node scripts/build.mjs",
+    "serve": "node dist/main.mjs",
+    "verify:all": "tsx scripts/verify-all.ts",
+    "soak-test": "tsx scripts/soak-test.ts",
+    "cost-report": "tsx scripts/cost-report.ts",
+    "disk-report": "tsx scripts/disk-report.ts",
+    "identities:generate": "tsx scripts/generate-identities.ts",
+    "verify:backup": "tsx scripts/verify-backup.ts"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.48.0",
+    "@noble/curves": "1.6.0",
+    "@noble/hashes": "1.5.0",
+    "@scure/base": "1.1.9",
+    "age-encryption": "0.3.1",
+    "better-sqlite3": "12.6.2",
+    "fastify": "5.1.0",
+    "pino": "9.5.0",
+    "undici": "6.20.1",
+    "zod": "3.23.8"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.14.0",
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "22.9.0",
+    "esbuild": "0.24.0",
+    "eslint": "9.14.0",
+    "tsx": "4.19.2",
+    "typescript": "5.6.3",
+    "typescript-eslint": "8.13.0",
+    "vitest": "2.1.4"
+  }
+}

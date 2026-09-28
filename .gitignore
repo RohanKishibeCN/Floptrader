@@ -1,0 +1,29 @@
+# Runtime state: the SQLite database, WAL sidecars, archives, public inventory.
+# Never commit — it holds live participation and trade evidence.
+data/
+
+# Age-encrypted seed bundles and the age identity files. Committing these would
+# defeat the whole key-management section.
+secrets/
+
+# PM2 / process logs. The contents are ignored, the directory is not, so a fresh
+# clone has a `logs/` for the systemd unit's ReadWritePaths and for PM2.
+logs/*
+!logs/.gitkeep
+
+# Build output from scripts/build.mjs.
+dist/
+
+# Local environment overrides. `.env.example` is committed; `.env` is not.
+.env
+.env.local
+
+# Tooling caches.
+node_modules/
+*.tsbuildinfo
+.vitest/
+
+# Editor / OS noise.
+.DS_Store
+.idea/
+.vscode/
