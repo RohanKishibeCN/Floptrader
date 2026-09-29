@@ -242,6 +242,28 @@ describe('archive maintenance: evidence is permanent', () => {
   });
 });
 
+describe('permanent-count snapshot tolerates a pre-migration database', () => {
+  it('skips a table that predates the current schema instead of throwing', () => {
+    const db = openDatabase({ path: ':memory:' });
+    try {
+      // `disk-report` inspects whatever database is on disk without migrating
+      // it, so a database written before these tables existed must not crash
+      // the report — an absent table is a diagnostic gap, not a startup error.
+      db.exec('DROP TABLE room_registry');
+      db.exec('DROP TABLE referee_anomalies');
+
+      const counts = snapshotPermanentCounts(db);
+      expect(counts).not.toHaveProperty('room_registry');
+      expect(counts).not.toHaveProperty('referee_anomalies');
+      // Everything that is present is still counted.
+      expect(counts.identities).toBe(0);
+      expect(counts.trades).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+});
+
 describe('archive maintenance: debug events', () => {
   it('drops old debug events but keeps a permanent code however old it is', async () => {
     const ctx = makeCtx();
