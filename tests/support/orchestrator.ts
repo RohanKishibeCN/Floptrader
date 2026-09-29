@@ -154,6 +154,12 @@ export interface HarnessOptions {
   transport?: FakeTransport;
   /** A scriptable Lark WebSocket transport, so a drop can be induced on demand. */
   wsFactory?: WsFactory;
+  /**
+   * The archive's own transport. The published archive is a different host from
+   * technocore, so it gets its own double; without one a check simply records
+   * `archive_unavailable`.
+   */
+  archiveFetchImpl?: typeof fetch;
   now?: () => Date;
   /** Extra environment; merged last, so a test can override any knob. */
   env?: Record<string, string>;
@@ -307,6 +313,7 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
 
   const overrides: RuntimeOverrides = {
     fetchImpl: transport.fetchImpl as unknown as typeof fetch,
+    ...(options.archiveFetchImpl ? { archiveFetchImpl: options.archiveFetchImpl } : {}),
     now,
     skipHealth: true,
     readDiskUsage: () => diskUsedPercent,

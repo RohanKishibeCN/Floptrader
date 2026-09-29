@@ -690,6 +690,13 @@ export class MessageRepository {
     return (this.db.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n;
   }
 
+  /** One stored message, used to re-post a local message the referee missed. */
+  get(room: string, seq: number): MessageRow | undefined {
+    return this.db.prepare('SELECT * FROM messages WHERE room = ? AND seq = ?').get(room, seq) as
+      | MessageRow
+      | undefined;
+  }
+
   countByKind(): Record<string, number> {
     const rows = this.db
       .prepare('SELECT kind, COUNT(*) AS n FROM messages GROUP BY kind')
@@ -730,6 +737,21 @@ export class MessageRepository {
         'SELECT * FROM messages WHERE room = ? AND kind = ? AND seq > ? ORDER BY seq ASC LIMIT ?',
       )
       .all(room, kind, sinceSeq, limit) as MessageRow[];
+  }
+
+  /**
+   * The newest message of one kind in a room.
+   *
+   * `signedOnly` restricts it to rows whose room signature verified, which is
+   * what the dynamic room ranking means by "has a recent signed trade" — an
+   * unsigned claim in an owner room is not evidence of anything.
+   */
+  lastOfKind(room: string, kind: string, signedOnly = false): MessageRow | undefined {
+    const sql = signedOnly
+      ? `SELECT * FROM messages WHERE room = ? AND kind = ? AND signature_valid = 1
+          ORDER BY seq DESC LIMIT 1`
+      : 'SELECT * FROM messages WHERE room = ? AND kind = ? ORDER BY seq DESC LIMIT 1';
+    return this.db.prepare(sql).get(room, kind) as MessageRow | undefined;
   }
 }
 
@@ -806,6 +828,23 @@ export class RefereeRepository {
         `SELECT * FROM referee_snapshots WHERE kind = ? AND sweep >= ? ORDER BY sweep ASC, seq ASC`,
       )
       .all(kind, sweep) as RefereeSnapshotRow[];
+  }
+
+  /**
+   * The signature-valid price/flow rows for one sweep.
+   *
+   * Used to recover the `file` hash the referee signed for that sweep, which is
+   * what makes a `full` archive record a second copy of a signed post rather
+   * than an unchecked download.
+   */
+  signedForSweep(sweep: number): RefereeSnapshotRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM referee_snapshots
+          WHERE sweep = ? AND signature_valid = 1 AND kind IN ('price', 'flow')
+          ORDER BY seq ASC`,
+      )
+      .all(sweep) as RefereeSnapshotRow[];
   }
 
   /**
@@ -912,6 +951,20 @@ export interface TradeRow {
   agent_id?: string | null;
   counter_agent_id?: string | null;
   settle_sweep?: number | null;
+  /**
+   * The referee's own reason for a void, when it named one.
+   *
+   * `funds` is the only one that is ambiguous — the referee does not say *which*
+   * side was short — so this is paired with `referee_funds_side`, which is always
+   * `unknown` for a referee `funds` verdict.
+   */
+  referee_reason?: string | null;
+  /** The referee's side, which for `funds` is `unknown`. Never a local guess. */
+  referee_funds_side?: string | null;
+  /** Our own inference: `maker` | `taker` | `both` | `unknown`. Not a verdict. */
+  local_funds_side?: string | null;
+  /** `official` when the values came from the referee; `local_inference` otherwise. */
+  funds_side_confidence?: string | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -926,10 +979,13 @@ export class TradeRepository {
       .prepare(
         `INSERT OR IGNORE INTO trades (
            id, season, maker_did, taker_did, side, qty, px, until_sweep, maker_sig, taker_sig,
-           status, reason, room, seq, agent_id, counter_agent_id, settle_sweep, created_at, updated_at)
+           status, reason, room, seq, agent_id, counter_agent_id, settle_sweep,
+           referee_reason, referee_funds_side, local_funds_side, funds_side_confidence,
+           created_at, updated_at)
          VALUES (@id, @season, @maker_did, @taker_did, @side, @qty, @px, @until_sweep,
            @maker_sig, @taker_sig, @status, @reason, @room, @seq, @agent_id, @counter_agent_id,
-           @settle_sweep, @created_at, @updated_at)`,
+           @settle_sweep, @referee_reason, @referee_funds_side, @local_funds_side,
+           @funds_side_confidence, @created_at, @updated_at)`,
       )
       .run({
         ...row,
@@ -941,6 +997,10 @@ export class TradeRepository {
         agent_id: row.agent_id ?? null,
         counter_agent_id: row.counter_agent_id ?? null,
         settle_sweep: row.settle_sweep ?? null,
+        referee_reason: row.referee_reason ?? null,
+        referee_funds_side: row.referee_funds_side ?? null,
+        local_funds_side: row.local_funds_side ?? null,
+        funds_side_confidence: row.funds_side_confidence ?? null,
         created_at: row.created_at ?? at,
         updated_at: at,
       });
@@ -955,13 +1015,78 @@ export class TradeRepository {
     return this.db.prepare('SELECT * FROM trades WHERE id = ?').get(id) as TradeRow | undefined;
   }
 
-  updateStatus(id: string, status: string, reason: string | null, settleSweep?: number): void {
+  /**
+   * Move a trade's status, and optionally record the referee's verdict.
+   *
+   * `patch.refereeReason`/`refereeFundsSide` are write-once: the referee is the
+   * authority, so a later local pass cannot overwrite `official` with a guess.
+   */
+  updateStatus(
+    id: string,
+    status: string,
+    reason: string | null,
+    settleSweep?: number,
+    patch: {
+      refereeReason?: string | null;
+      refereeFundsSide?: string | null;
+    } = {},
+  ): void {
     this.db
       .prepare(
         `UPDATE trades SET status = ?, reason = ?, settle_sweep = COALESCE(?, settle_sweep),
+           referee_reason = COALESCE(?, referee_reason),
+           referee_funds_side = COALESCE(?, referee_funds_side),
            updated_at = ? WHERE id = ?`,
       )
-      .run(status, reason, settleSweep ?? null, nowIso(), id);
+      .run(
+        status,
+        reason,
+        settleSweep ?? null,
+        patch.refereeReason ?? null,
+        patch.refereeFundsSide ?? null,
+        nowIso(),
+        id,
+      );
+  }
+
+  /** Record the referee's verdict without touching the local status. */
+  recordRefereeVerdict(
+    id: string,
+    verdict: { reason: string; fundsSide?: string | null; settleSweep?: number | null },
+  ): boolean {
+    if (!this.exists(id)) return false;
+    const officialFundsSide =
+      verdict.reason === 'funds' ? (verdict.fundsSide ?? 'unknown') : (verdict.fundsSide ?? null);
+    // `funds_side_confidence` is `official` whenever the referee named a reason:
+    // the reason is the referee's own conclusion, even when the side is unknown.
+    this.db
+      .prepare(
+        `UPDATE trades SET referee_reason = ?, referee_funds_side = ?,
+           funds_side_confidence = 'official',
+           settle_sweep = COALESCE(?, settle_sweep), updated_at = ? WHERE id = ?`,
+      )
+      .run(verdict.reason, officialFundsSide, verdict.settleSweep ?? null, nowIso(), id);
+    return true;
+  }
+
+  /**
+   * Store the local funds-side inference.
+   *
+   * Refuses to touch a row whose `funds_side_confidence` is already `official`:
+   * the referee's `unknown` is the answer, and a local guess must never overwrite
+   * it. When the row has no official verdict yet, the inference is recorded with
+   * `local_inference` so the report can label it correctly.
+   */
+  setLocalFundsSide(id: string, side: 'maker' | 'taker' | 'both' | 'unknown'): void {
+    const row = this.get(id);
+    if (!row) return;
+    if (row.funds_side_confidence === 'official') return;
+    this.db
+      .prepare(
+        `UPDATE trades SET local_funds_side = ?, funds_side_confidence = 'local_inference',
+           updated_at = ? WHERE id = ?`,
+      )
+      .run(side, nowIso(), id);
   }
 
   countByStatus(): Record<string, number> {
@@ -970,6 +1095,43 @@ export class TradeRepository {
       .all() as Array<{ status: string; n: number }>;
     return Object.fromEntries(rows.map((row) => [row.status, row.n]));
   }
+
+  /** Trades the referee voided for `funds`, with the official side `unknown`. */
+  fundsVerdicts(): TradeRow[] {
+    return this.db
+      .prepare("SELECT * FROM trades WHERE referee_reason = 'funds' ORDER BY id")
+      .all() as TradeRow[];
+  }
+
+  /** Official reason labels, for the report. */
+  refereeReasonCounts(): Record<string, number> {
+    const rows = this.db
+      .prepare(
+        `SELECT referee_reason AS reason, COUNT(*) AS n FROM trades
+          WHERE referee_reason IS NOT NULL GROUP BY referee_reason`,
+      )
+      .all() as Array<{ reason: string; n: number }>;
+    return Object.fromEntries(rows.map((row) => [row.reason, row.n]));
+  }
+
+  /**
+   * Trades carrying our own funds-side inference, and none from the referee.
+   *
+   * The count the report needs to say "local inference, not a referee
+   * conclusion": a row the referee has ruled on is `official` and excluded.
+   */
+  countLocalInference(): number {
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM trades
+            WHERE local_funds_side IS NOT NULL AND (funds_side_confidence IS NULL
+              OR funds_side_confidence = 'local_inference')`,
+        )
+        .get() as { n: number }
+    ).n;
+  }
+
 
   count(): number {
     return (this.db.prepare('SELECT COUNT(*) AS n FROM trades').get() as { n: number }).n;
@@ -1570,8 +1732,311 @@ export class RefereeAnomalyRepository {
       .all(kind) as RefereeAnomalyRow[];
   }
 
+  /** The rooms a given anomaly kind named, for the dynamic room ranking. */
+  roomsWithKind(kind: string): Set<string> {
+    const rows = this.db
+      .prepare(
+        'SELECT DISTINCT room FROM referee_anomalies WHERE kind = ? AND room IS NOT NULL',
+      )
+      .all(kind) as Array<{ room: string }>;
+    return new Set(rows.map((row) => row.room));
+  }
+
   count(): number {
     return (this.db.prepare('SELECT COUNT(*) AS n FROM referee_anomalies').get() as { n: number }).n;
+  }
+}
+
+/**
+ * One sweep of the published archive, as the monitor found it.
+ *
+ * The three outcomes are kept apart on purpose: `verified` (bytes matched the
+ * index, and for a `full` record the referee's signed hash), `unavailable` (a
+ * 404 — the archive is behind, which is not a contest failure) and a mismatch
+ * (`verified = 0` with an `error`). Nothing here can mark a mint failed.
+ */
+export interface ArchiveSweepRow {
+  sweep: number;
+  status: string;
+  path: string | null;
+  expected_sha256: string | null;
+  actual_sha256: string | null;
+  verified: number;
+  redacted_trades: number | null;
+  fetched_at: string | null;
+  unavailable: number;
+  error: string | null;
+  updated_at?: string;
+}
+
+export class ArchiveSweepRepository {
+  constructor(private readonly db: SqliteDatabase) {}
+
+  upsert(row: ArchiveSweepRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO archive_sweeps (
+           sweep, status, path, expected_sha256, actual_sha256, verified, redacted_trades,
+           fetched_at, unavailable, error, updated_at)
+         VALUES (@sweep, @status, @path, @expected_sha256, @actual_sha256, @verified,
+           @redacted_trades, @fetched_at, @unavailable, @error, @updated_at)
+         ON CONFLICT(sweep) DO UPDATE SET
+           status = excluded.status,
+           path = excluded.path,
+           expected_sha256 = excluded.expected_sha256,
+           actual_sha256 = excluded.actual_sha256,
+           verified = excluded.verified,
+           redacted_trades = excluded.redacted_trades,
+           fetched_at = excluded.fetched_at,
+           unavailable = excluded.unavailable,
+           error = excluded.error,
+           updated_at = excluded.updated_at`,
+      )
+      .run({
+        ...row,
+        path: row.path ?? null,
+        expected_sha256: row.expected_sha256 ?? null,
+        actual_sha256: row.actual_sha256 ?? null,
+        redacted_trades: row.redacted_trades ?? null,
+        fetched_at: row.fetched_at ?? null,
+        error: row.error ?? null,
+        updated_at: nowIso(),
+      });
+  }
+
+  get(sweep: number): ArchiveSweepRow | undefined {
+    return this.db.prepare('SELECT * FROM archive_sweeps WHERE sweep = ?').get(sweep) as
+      | ArchiveSweepRow
+      | undefined;
+  }
+
+  all(): ArchiveSweepRow[] {
+    return this.db.prepare('SELECT * FROM archive_sweeps ORDER BY sweep ASC').all() as ArchiveSweepRow[];
+  }
+
+  /** Sweeps the index named but the archive has not served (a 404). */
+  unavailableSweeps(): number[] {
+    return (
+      this.db
+        .prepare('SELECT sweep FROM archive_sweeps WHERE unavailable = 1 ORDER BY sweep ASC')
+        .all() as Array<{ sweep: number }>
+    ).map((row) => row.sweep);
+  }
+
+  /** Sweeps whose bytes did not hash to what was claimed: a finding, not a gap. */
+  mismatchedSweeps(): number[] {
+    return (
+      this.db
+        .prepare(
+          'SELECT sweep FROM archive_sweeps WHERE unavailable = 0 AND verified = 0 ORDER BY sweep ASC',
+        )
+        .all() as Array<{ sweep: number }>
+    ).map((row) => row.sweep);
+  }
+
+  countByStatus(): Record<string, number> {
+    const rows = this.db
+      .prepare('SELECT status, COUNT(*) AS n FROM archive_sweeps GROUP BY status')
+      .all() as Array<{ status: string; n: number }>;
+    return Object.fromEntries(rows.map((row) => [row.status, row.n]));
+  }
+
+  verifiedCount(): number {
+    return (
+      this.db.prepare('SELECT COUNT(*) AS n FROM archive_sweeps WHERE verified = 1').get() as {
+        n: number;
+      }
+    ).n;
+  }
+
+  maxVerifiedSweep(): number | null {
+    const row = this.db
+      .prepare('SELECT MAX(sweep) AS sweep FROM archive_sweeps WHERE verified = 1')
+      .get() as { sweep: number | null };
+    return row.sweep;
+  }
+
+  count(): number {
+    return (this.db.prepare('SELECT COUNT(*) AS n FROM archive_sweeps').get() as { n: number }).n;
+  }
+}
+
+export interface ArchiveStateRow {
+  id: number;
+  latest_index_sweep: number | null;
+  latest_verified_sweep: number | null;
+  lag_sweeps: number | null;
+  last_check_at: string | null;
+  last_error: string | null;
+  updated_at: string;
+}
+
+export class ArchiveStateRepository {
+  constructor(private readonly db: SqliteDatabase) {}
+
+  get(): ArchiveStateRow | undefined {
+    return this.db.prepare('SELECT * FROM archive_state WHERE id = 1').get() as
+      | ArchiveStateRow
+      | undefined;
+  }
+
+  set(patch: {
+    latestIndexSweep: number | null;
+    latestVerifiedSweep: number | null;
+    lagSweeps: number | null;
+    lastCheckAt: string | null;
+    lastError: string | null;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO archive_state (
+           id, latest_index_sweep, latest_verified_sweep, lag_sweeps, last_check_at,
+           last_error, updated_at)
+         VALUES (1, @latestIndexSweep, @latestVerifiedSweep, @lagSweeps, @lastCheckAt,
+           @lastError, @updated_at)`,
+      )
+      .run({ ...patch, updated_at: nowIso() });
+  }
+}
+
+/**
+ * A local message the referee reported as `missed`, and the re-post of it.
+ *
+ * `missed` means the referee never read the message, so it does not count. The
+ * queue is the audit trail: one row per original message, at most one re-post,
+ * carrying the same business content under a new outer nonce.
+ */
+export type RepostStatus = 'pending' | 'posted' | 'failed' | 'skipped';
+
+export interface RepostRow {
+  id?: number;
+  original_room: string;
+  original_seq: number;
+  agent_id: string;
+  did: string;
+  message_kind: string;
+  trade_id: string | null;
+  original_text: string;
+  reason: string | null;
+  status: RepostStatus;
+  attempts: number;
+  new_room: string | null;
+  new_nonce: string | null;
+  new_seq: number | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export class RepostRepository {
+  constructor(private readonly db: SqliteDatabase) {}
+
+  /** The unique key (room, seq, did) makes a re-queue after a restart a no-op. */
+  enqueue(
+    row: Omit<RepostRow, 'id' | 'attempts' | 'status' | 'new_room' | 'new_nonce' | 'new_seq'> & {
+      status?: RepostStatus;
+      new_room?: string | null;
+      new_nonce?: string | null;
+      new_seq?: number | null;
+    },
+  ): boolean {
+    const info = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO repost_queue (
+           original_room, original_seq, agent_id, did, message_kind, trade_id, original_text,
+           reason, status, attempts, new_room, new_nonce, new_seq, created_at, updated_at)
+         VALUES (@original_room, @original_seq, @agent_id, @did, @message_kind, @trade_id,
+           @original_text, @reason, @status, 0, @new_room, @new_nonce, @new_seq, @created_at, @updated_at)`,
+      )
+      .run({
+        ...row,
+        trade_id: row.trade_id ?? null,
+        reason: row.reason ?? null,
+        status: row.status ?? 'pending',
+        new_room: row.new_room ?? null,
+        new_nonce: row.new_nonce ?? null,
+        new_seq: row.new_seq ?? null,
+        created_at: row.created_at ?? nowIso(),
+        updated_at: nowIso(),
+      });
+    return info.changes > 0;
+  }
+
+  /** Rows already handled for a given original message. */
+  has(originalRoom: string, originalSeq: number, did: string): boolean {
+    return (
+      this.db
+        .prepare(
+          'SELECT 1 FROM repost_queue WHERE original_room = ? AND original_seq = ? AND did = ?',
+        )
+        .get(originalRoom, originalSeq, did) !== undefined
+    );
+  }
+
+  pending(limit = 20): RepostRow[] {
+    return this.db
+      .prepare("SELECT * FROM repost_queue WHERE status = 'pending' ORDER BY id ASC LIMIT ?")
+      .all(limit) as RepostRow[];
+  }
+
+  /**
+   * Rows to attempt on this pass: never-attempted, plus bounded retries.
+   *
+   * A failure is retried a fixed number of times and then left as `failed` for
+   * the report. There is no unbounded retry loop: a message the service keeps
+   * refusing must not become a permanent write every tick.
+   */
+  retryable(limit = 20, maxAttempts = 3): RepostRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM repost_queue WHERE status IN ('pending','failed') AND attempts < ?
+          ORDER BY id ASC LIMIT ?`,
+      )
+      .all(maxAttempts, limit) as RepostRow[];
+  }
+
+  all(): RepostRow[] {
+    return this.db.prepare('SELECT * FROM repost_queue ORDER BY id ASC').all() as RepostRow[];
+  }
+
+  markPosted(
+    id: number,
+    result: { newRoom: string; newNonce: string; newSeq: number | null },
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE repost_queue SET status = 'posted', attempts = attempts + 1, new_room = ?,
+           new_nonce = ?, new_seq = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(result.newRoom, result.newNonce, result.newSeq, nowIso(), id);
+  }
+
+  markFailed(id: number, error: string): void {
+    this.db
+      .prepare(
+        `UPDATE repost_queue SET status = 'failed', attempts = attempts + 1, reason = ?,
+           updated_at = ? WHERE id = ?`,
+      )
+      .run(error, nowIso(), id);
+  }
+
+  /** Terminal, and deliberately not retried: e.g. the lock has passed. */
+  markSkipped(id: number, reason: string): void {
+    this.db
+      .prepare(
+        `UPDATE repost_queue SET status = 'skipped', reason = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(reason, nowIso(), id);
+  }
+
+  countByStatus(): Record<string, number> {
+    const rows = this.db
+      .prepare('SELECT status, COUNT(*) AS n FROM repost_queue GROUP BY status')
+      .all() as Array<{ status: string; n: number }>;
+    return Object.fromEntries(rows.map((row) => [row.status, row.n]));
+  }
+
+  count(): number {
+    return (this.db.prepare('SELECT COUNT(*) AS n FROM repost_queue').get() as { n: number }).n;
   }
 }
 
@@ -1601,6 +2066,9 @@ export interface Repositories {
   larkOutbox: LarkOutboxRepository;
   upstream: UpstreamRepository;
   archiveManifests: ArchiveManifestRepository;
+  archiveSweeps: ArchiveSweepRepository;
+  archiveState: ArchiveStateRepository;
+  reposts: RepostRepository;
   roomRegistry: RoomRegistryRepository;
   refereeAnomalies: RefereeAnomalyRepository;
   events: EventRepository;
@@ -1625,6 +2093,9 @@ export function createRepositories(db: SqliteDatabase): Repositories {
     larkOutbox: new LarkOutboxRepository(db),
     upstream: new UpstreamRepository(db),
     archiveManifests: new ArchiveManifestRepository(db),
+    archiveSweeps: new ArchiveSweepRepository(db),
+    archiveState: new ArchiveStateRepository(db),
+    reposts: new RepostRepository(db),
     roomRegistry: new RoomRegistryRepository(db),
     refereeAnomalies: new RefereeAnomalyRepository(db),
     events: new EventRepository(db),

@@ -66,6 +66,10 @@ export interface RefereeObservation {
   enteredConservativeMode: boolean;
   /** True when the seed's package hash disagrees with the pin. */
   packageDrift: boolean;
+  /** True when a live price post omitted `applied`. Recorded as an anomaly. */
+  appliedMissing?: boolean;
+  /** True when a live price post omitted `for`, so the band is unusable. */
+  limitsForMissing?: boolean;
 }
 
 export interface RefereeVerifierOptions {
@@ -106,6 +110,17 @@ export interface RefereeVerifierOptions {
   maxReferenceAgeSeconds?: number;
   /** `off` disables the staleness signal entirely, for fixtures and dry runs. */
   staleReferenceMode?: 'off' | 'no_new_active_trade';
+  /**
+   * Live mode tightens the two fields a trade depends on.
+   *
+   * In a dry run a missing `applied` or a missing `for` is tolerated: the
+   * previous close stands in, and the published band is still the referee's own
+   * numbers. Live, both are holes in the input a trade is priced from, so a
+   * missing `applied` enters conservative mode and a missing `for` makes the
+   * published band unusable for a new trade. A dry run never widens live risk:
+   * the flag only ever makes the live path stricter.
+   */
+  live?: boolean;
 }
 
 interface SweepLedger {
@@ -122,6 +137,8 @@ interface AppliedPayload {
   final?: RefereeFinal;
   mints: string[];
   packageDrift: boolean;
+  appliedMissing?: boolean;
+  limitsForMissing?: boolean;
 }
 
 export class RefereeVerifier {
@@ -132,6 +149,7 @@ export class RefereeVerifier {
   private readonly requireSeedBeforeState: boolean;
   private readonly maxReferenceAgeSeconds: number;
   private readonly staleReferenceMode: 'off' | 'no_new_active_trade';
+  private readonly live: boolean;
   private refereeDid: string | null;
   private packageHash: string | null = null;
   private expectedPackageHash: string | null;
@@ -147,6 +165,18 @@ export class RefereeVerifier {
   private limits: { low: Decimal; high: Decimal } | null = null;
   /** `price.for`: the sweep `limits` apply to. */
   private limitsForSweep: number | null = null;
+  /**
+   * False when the published band may not be used to price a live trade.
+   *
+   * Set by a live post that omits `for`, or that names a sweep other than
+   * `n + 1`. The band itself is still stored verbatim — we simply refuse to
+   * build a trade from it. Never consulted in a dry run.
+   */
+  private limitsUsable = true;
+  /** True when a live post omitted `applied`. */
+  private appliedMissing = false;
+  /** True when a live post omitted `for`. */
+  private limitsForMissing = false;
   private globalPx: Decimal | null = null;
   private ageSeconds: number | null = null;
   private finalPx: Decimal | null = null;
@@ -166,6 +196,7 @@ export class RefereeVerifier {
     this.requireSeedBeforeState = options.requireSeedBeforeState ?? false;
     this.maxReferenceAgeSeconds = options.maxReferenceAgeSeconds ?? 60;
     this.staleReferenceMode = options.staleReferenceMode ?? 'no_new_active_trade';
+    this.live = options.live === true;
   }
 
   get state(): {
@@ -178,6 +209,10 @@ export class RefereeVerifier {
     close: Decimal | null;
     limits: { low: Decimal; high: Decimal } | null;
     limitsForSweep: number | null;
+    /** False when the published band may not price a live trade. */
+    limitsUsable: boolean;
+    appliedMissing: boolean;
+    limitsForMissing: boolean;
     globalPx: Decimal | null;
     ageSeconds: number | null;
     finalPx: Decimal | null;
@@ -197,6 +232,9 @@ export class RefereeVerifier {
       close: this.reference,
       limits: this.limits,
       limitsForSweep: this.limitsForSweep,
+      limitsUsable: this.limitsUsable,
+      appliedMissing: this.appliedMissing,
+      limitsForMissing: this.limitsForMissing,
       globalPx: this.globalPx,
       ageSeconds: this.ageSeconds,
       finalPx: this.finalPx,
@@ -223,6 +261,7 @@ export class RefereeVerifier {
       close: this.reference,
       nextLimits: this.limits,
       limitsForSweep: this.limitsForSweep,
+      limitsUsable: this.limitsUsable,
       reference: this.reference,
       limits: this.limits,
       history: [...this.referenceHistory],
@@ -394,6 +433,8 @@ export class RefereeVerifier {
     if (applied.price !== undefined) observation.price = applied.price;
     if (applied.flow !== undefined) observation.flow = applied.flow;
     if (applied.final !== undefined) observation.final = applied.final;
+    if (applied.appliedMissing) observation.appliedMissing = true;
+    if (applied.limitsForMissing) observation.limitsForMissing = true;
     observation.mints = applied.mints;
 
     observation.packageDrift = applied.packageDrift;
@@ -442,7 +483,9 @@ export class RefereeVerifier {
       case 'price': {
         const price = payload as RefereePrice;
         applied.price = price;
-        this.applyPrice(price);
+        const flags = this.applyPrice(price);
+        applied.appliedMissing = flags.appliedMissing;
+        applied.limitsForMissing = flags.limitsForMissing;
         break;
       }
       case 'flow': {
@@ -501,7 +544,7 @@ export class RefereeVerifier {
     return true;
   }
 
-  private applyPrice(price: RefereePrice): void {
+  private applyPrice(price: RefereePrice): { appliedMissing: boolean; limitsForMissing: boolean } {
     const sweep = price.n;
     const ledger = this.sweeps.get(sweep) ?? { priceSeen: false, flowSeen: false, mints: [] };
     ledger.priceSeen = true;
@@ -513,19 +556,40 @@ export class RefereeVerifier {
     const close = Decimal.from(price.ref.px);
     if (!close.isPositive()) {
       this.enterConservative('reference_anomaly', `non-positive close ${price.ref.px}`);
-      return;
+      return { appliedMissing: false, limitsForMissing: false };
     }
 
     // `for` names the sweep the published limits apply to. Normally the next one;
     // any other value means the band we would enforce is not the band the referee
     // announced, so we stop trading rather than guess.
-    if (price.for !== undefined && price.for !== sweep + 1) {
+    let limitsForMissing = false;
+    if (price.for === undefined) {
+      // Live: an unlabelled band cannot be trusted to be the band for the next
+      // sweep, so it is read-only. A dry run keeps the permissive fallback.
+      if (this.live) {
+        limitsForMissing = true;
+        this.limitsForMissing = true;
+        this.limitsUsable = false;
+        this.enterConservative(
+          'limits_for_missing',
+          `price for sweep ${sweep} published no \`for\`; the band cannot price a new live trade`,
+        );
+      } else {
+        this.limitsForMissing = false;
+        this.limitsUsable = true;
+      }
+    } else if (price.for !== sweep + 1) {
+      this.limitsForMissing = false;
+      this.limitsUsable = false;
       this.enterConservative(
         'limits_for_mismatch',
         `price for sweep ${sweep} carries limits for ${price.for}, expected ${sweep + 1}`,
       );
     } else {
+      this.limitsForMissing = false;
+      this.limitsUsable = true;
       this.clearConservative('limits_for_mismatch');
+      this.clearConservative('limits_for_missing');
     }
 
     const previousClose = this.reference;
@@ -543,20 +607,41 @@ export class RefereeVerifier {
 
     // `applied` is the reference this sweep's already-settled trades used. When
     // the post omits it, the previous sweep's close is the only defensible
-    // stand-in — and it is never back-adjusted onto the new close.
-    this.appliedReference = price.applied !== undefined ? Decimal.from(price.applied) : previousClose;
+    // stand-in — it is never back-adjusted onto the new close, and a live post
+    // that omits it is an anomaly that stops new active risk.
+    let appliedMissing = false;
+    if (price.applied !== undefined) {
+      this.appliedReference = Decimal.from(price.applied);
+      this.appliedMissing = false;
+      this.clearConservative('applied_missing');
+    } else {
+      this.appliedReference = previousClose;
+      if (this.live) {
+        appliedMissing = true;
+        this.appliedMissing = true;
+        this.enterConservative(
+          'applied_missing',
+          `price for sweep ${sweep} published no \`applied\`; the settled reference is unknown`,
+        );
+      } else {
+        this.appliedMissing = false;
+      }
+    }
     this.limitsForSweep = price.for ?? null;
 
     this.currentSweep = sweep;
     this.reference = close;
     // The published limits are authoritative: the referee enforces exactly these
     // numbers, and recomputing ±5% locally can disagree with them at the cent.
+    // They are stored verbatim even when unusable, so the report can show what
+    // the referee said; whether they may price a trade is `limitsUsable`.
     this.limits = { low: Decimal.from(price.limits[0]), high: Decimal.from(price.limits[1]) };
     this.globalPx = price.global !== undefined ? Decimal.from(price.global) : this.globalPx;
     // Sticky: a later post that omits `age_s` does not erase the last known one.
     this.ageSeconds = price.age_s ?? this.ageSeconds;
     this.referenceHistory.push(close);
     if (this.referenceHistory.length > 512) this.referenceHistory.shift();
+    return { appliedMissing, limitsForMissing };
   }
 
   /**

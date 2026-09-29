@@ -251,6 +251,15 @@ export interface MarketSnapshot {
   nextLimits: { low: Decimal; high: Decimal } | null;
   /** `price.for`: the sweep `nextLimits` apply to. Null when the post omits it. */
   limitsForSweep: number | null;
+  /**
+   * False when `nextLimits` may not be used to price a live trade.
+   *
+   * Set when `price.for` was missing or named a sweep other than `n + 1`: the
+   * band is still recorded verbatim, but the sweep it applies to is not the one
+   * the referee said it is, so a new trade built from it would be bounded by a
+   * guess. A dry run ignores this (it never posts a trade anyway).
+   */
+  limitsUsable?: boolean;
   /** Alias of `close`: the price a new offer is measured against. */
   reference: Decimal | null;
   /** Alias of `nextLimits`: the band a new offer must sit inside. */
@@ -280,6 +289,8 @@ export function emptySnapshot(): MarketSnapshot {
     close: null,
     nextLimits: null,
     limitsForSweep: null,
+    // No band at all: nothing may be priced from it.
+    limitsUsable: false,
     reference: null,
     limits: null,
     history: [],

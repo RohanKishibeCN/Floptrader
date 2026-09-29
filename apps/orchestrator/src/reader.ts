@@ -19,7 +19,7 @@
  * ever interpreted as an instruction — only as data to be signature-checked,
  * classified and stored.
  */
-import type { Repositories, SqliteDatabase } from '@flop/storage';
+import type { Repositories, RoomRegistryRow, SqliteDatabase } from '@flop/storage';
 import {
   REFEREE_ROOMS,
   REFEREE_STATE_ROOM,
@@ -41,6 +41,7 @@ import {
   RoomReader,
   type RefereeObservation,
   type RoomMessage,
+  type RoomTick,
   type TechnocoreClient,
   type TickSummary,
 } from '@flop/technocore';
@@ -80,6 +81,16 @@ export interface ReaderOptions {
   staleReferenceMode?: 'off' | 'no_new_active_trade';
   /** Cap on listed rooms; beyond it the reader alerts and keeps the fixed set. */
   maxDiscoveredRooms?: number;
+  /**
+   * Concurrency for the dynamic owner-room reader.
+   *
+   * Deliberately its own, small budget (`DYNAMIC_ROOM_READ_CONCURRENCY`, 1 by
+   * default) and its own reader: a discovered owner room must never queue behind
+   * — or in front of — the fixed referee feed.
+   */
+  dynamicReadConcurrency?: number;
+  /** Live mode tightens the `applied`/`for` boundaries in the verifier. */
+  live?: boolean;
   now?: () => Date;
 }
 
@@ -135,9 +146,38 @@ function roomNameOf(entry: unknown): string | null {
   return null;
 }
 
+/** Service rooms that are never owner rooms, so they are never "discovered". */
+const RESERVED_ROOM_NAMES = new Set(['main', 'lobby', 'system', 'referee', 'announcements']);
+
+/**
+ * True for a room we already read unconditionally.
+ *
+ * The five referee rooms and `close1` are excluded from discovery by name, not
+ * by prefix: an owner may legitimately register a room whose name also starts
+ * with `d-`, and dropping it on a naming convention would silently stop reading
+ * a room the referee listed.
+ */
+function isReservedRoom(room: string, rules: Rules): boolean {
+  if (room === rules.tradingRoom || room === TRADING_ROOM) return true;
+  const referee = rules.refereeRooms.length > 0 ? rules.refereeRooms : REFEREE_ROOMS;
+  if (referee.includes(room)) return true;
+  return RESERVED_ROOM_NAMES.has(room);
+}
+
 export class OrchestratorReader {
   readonly verifier: RefereeVerifier;
   readonly roomReader: RoomReader;
+  /**
+   * The bounded owner-room reader, or null when discovery is disabled.
+   *
+   * It has its own verifier on purpose: a gap or a reset in a discovered room is
+   * not a referee finding, and must not put the whole process into conservative
+   * mode. Owner rooms carry no referee posts.
+   */
+  private readonly dynamicReader: RoomReader | null;
+  private readonly fixedRooms: string[];
+  /** The dynamic rooms chosen on the last pass, for the report. */
+  private dynamicSeen: string[] = [];
   /** The highest owner-registration seq already turned into evidence. */
   private lastRegistrationScanSeq = 0;
   private readonly repositories: Repositories;
@@ -154,6 +194,7 @@ export class OrchestratorReader {
     this.now = options.now ?? (() => new Date());
     this.logger = options.logger;
     this.maxDiscoveredRooms = options.maxDiscoveredRooms ?? null;
+    this.fixedRooms = roomsFor(options.rules);
 
     const requirePin = options.requireRefereePin === true;
     this.verifier = new RefereeVerifier({
@@ -165,6 +206,7 @@ export class OrchestratorReader {
       requireSeedBeforeState: requirePin,
       maxReferenceAgeSeconds: options.maxReferenceAgeSeconds,
       staleReferenceMode: options.staleReferenceMode,
+      live: options.live === true,
     });
     this.roomReader = new RoomReader({
       client: options.client,
@@ -172,14 +214,66 @@ export class OrchestratorReader {
       repositories: options.repositories,
       verifier: this.verifier,
       logger: options.logger,
-      rooms: roomsFor(options.rules),
+      rooms: this.fixedRooms,
       ...(options.readConcurrency === undefined ? {} : { readConcurrency: options.readConcurrency }),
       ...(options.waitSeconds === undefined ? {} : { waitSeconds: options.waitSeconds }),
       limit: Math.min(200, Math.max(1, options.readLimit ?? 200)),
       localDids: options.localDids,
       now: this.now,
     });
+
+    this.dynamicReader =
+      this.maxDiscoveredRooms === null || this.maxDiscoveredRooms < 1
+        ? null
+        : new RoomReader({
+            client: options.client,
+            db: options.db,
+            repositories: options.repositories,
+            // A sink verifier: dynamic rooms are owner rooms, so nothing in them
+            // is a referee post, and a cursor gap there must not widen (or
+            // narrow) the fixed reader's view of the contest.
+            verifier: new RefereeVerifier({
+              rules: options.rules,
+              logger: options.logger,
+              expectedPackageHash: options.expectedPackageHash ?? null,
+              expectedRefereeDid: options.expectedRefereeDid ?? null,
+              unpinnedPolicy: 'adopt_first_sender',
+              staleReferenceMode: 'off',
+            }),
+            logger: options.logger,
+            rooms: [],
+            roomsProvider: () => this.dynamicRoomList(),
+            readConcurrency: Math.max(1, options.dynamicReadConcurrency ?? 1),
+            ...(options.waitSeconds === undefined ? {} : { waitSeconds: options.waitSeconds }),
+            limit: Math.min(200, Math.max(1, options.readLimit ?? 200)),
+            localDids: options.localDids,
+            now: this.now,
+          });
+
     this.seedRoomRegistry();
+  }
+
+  /**
+   * The rooms we read unconditionally: five referee rooms plus `close1`.
+   *
+   * `close1` and the referee set are never subject to the discovery cap, and
+   * `close1` is never dropped however the referee's listing changes.
+   */
+  get fixedRoomList(): string[] {
+    return [...this.fixedRooms];
+  }
+
+  /** `close1_only` when discovery is off; otherwise the registered rooms we read. */
+  get roomScope(): 'close1_only' | 'registered_rooms_plus_close1' {
+    return this.dynamicReader === null ? 'close1_only' : 'registered_rooms_plus_close1';
+  }
+
+  get dynamicRoomCount(): number {
+    return this.dynamicSeen.length;
+  }
+
+  get dynamicRooms(): string[] {
+    return [...this.dynamicSeen];
   }
 
   /**
@@ -192,7 +286,7 @@ export class OrchestratorReader {
    */
   private seedRoomRegistry(): void {
     const now = this.now().toISOString();
-    for (const room of roomsFor(this.rules)) {
+    for (const room of this.fixedRooms) {
       const existing = this.repositories.roomRegistry.get(room);
       if (existing) continue;
       this.repositories.roomRegistry.upsert({
@@ -212,18 +306,108 @@ export class OrchestratorReader {
    * inside the same transaction as the messages it covers.
    */
   async tick(): Promise<ReaderTick> {
+    // The fixed feed first, and on its own: a discovered owner room can never
+    // make the referee rooms wait.
     const summary = await this.roomReader.tick();
     for (const observation of summary.observations) {
       this.persistObservation(observation);
     }
+
+    const dynamic = await this.tickDynamicRooms();
+
     const snapshot = this.verifier.snapshot(this.now());
     this.persistSweepState(snapshot);
     this.persistPackagePin();
     return {
       ...summary,
+      inserted: summary.inserted + dynamic.inserted,
+      errors: summary.errors + dynamic.errors,
+      rooms: [...summary.rooms, ...dynamic.rooms],
       snapshot,
       externalOffers: this.externalOffers(),
     };
+  }
+
+  /**
+   * One pass over the bounded set of discovered owner rooms.
+   *
+   * Every failure stays inside this method: the dynamic reader has its own
+   * cursor rows and its own verifier, so an unreachable owner room degrades
+   * exactly one room and nothing else.
+   */
+  private async tickDynamicRooms(): Promise<{
+    inserted: number;
+    errors: number;
+    rooms: RoomTick[];
+  }> {
+    if (this.dynamicReader === null) {
+      this.dynamicSeen = [];
+      return { inserted: 0, errors: 0, rooms: [] };
+    }
+    // The room list is resolved inside `roomsProvider`, so the pass and the
+    // report always agree about what was read.
+    const summary = await this.dynamicReader.tick();
+    return { inserted: summary.inserted, errors: summary.errors, rooms: summary.rooms };
+  }
+
+  /** The discovered owner rooms, ranked, capped at `MAX_DISCOVERED_ROOMS`. */
+  private dynamicRoomList(): string[] {
+    const ranked = this.dynamicCandidates();
+    const capped =
+      this.maxDiscoveredRooms === null ? [] : ranked.slice(0, this.maxDiscoveredRooms);
+    this.dynamicSeen = capped.map((row) => row.room);
+    return this.dynamicSeen;
+  }
+
+  /**
+   * Every listed room that is not one we already read unconditionally.
+   *
+   * The ordering is the documented priority, and each step is a signal we
+   * actually hold rather than a guess:
+   *
+   *   1. a room with a recent signed trade — the one most likely to matter;
+   *   2. a room the referee reported a `missed` in, since a local message there
+   *      is the case the re-post path exists for;
+   *   3. the most recently announced room (`flow.rooms`, then `last_seen_at`);
+   *   4. the most recently read room, so a room already in the rotation keeps its
+   *      cursor moving rather than being dropped mid-stream.
+   *
+   * Steps 3 and 4 read the same `last_activity_sweep` from opposite ends, so the
+   * "closer to unlisting" tie-break is folded into step 3 and the ordering is
+   * deterministic: `room` name last, always.
+   */
+  private dynamicCandidates(): RoomRegistryRow[] {
+    const fixed = new Set(this.fixedRooms);
+    const listed = this.repositories.roomRegistry
+      .listListed()
+      .filter((row) => !fixed.has(row.room) && !isReservedRoom(row.room, this.rules));
+    const missed = this.repositories.refereeAnomalies.roomsWithKind('referee_missed');
+
+    const scored = listed.map((row) => {
+      const trade = this.repositories.messages.lastOfKind(row.room, 'trade', true);
+      return {
+        row,
+        // A trade's own seq orders two rooms that both have one.
+        tradeSeq: trade?.seq ?? -1,
+        hasTrade: trade === undefined ? 0 : 1,
+        hasMissed: missed.has(row.room) ? 1 : 0,
+        activity: row.last_activity_sweep ?? -1,
+        seenAt: row.last_seen_at ?? '',
+        readAt: this.repositories.roomCursors.get(row.room)?.last_ok_at ?? '',
+      };
+    });
+
+    scored.sort((a, b) => {
+      if (a.hasTrade !== b.hasTrade) return b.hasTrade - a.hasTrade;
+      if (a.tradeSeq !== b.tradeSeq) return b.tradeSeq - a.tradeSeq;
+      if (a.hasMissed !== b.hasMissed) return b.hasMissed - a.hasMissed;
+      if (a.activity !== b.activity) return b.activity - a.activity;
+      if (a.seenAt !== b.seenAt) return a.seenAt < b.seenAt ? 1 : -1;
+      if (a.readAt !== b.readAt) return a.readAt < b.readAt ? 1 : -1;
+      return a.row.room < b.row.room ? -1 : a.row.room > b.row.room ? 1 : 0;
+    });
+
+    return scored.map((entry) => entry.row);
   }
 
   /** The current market view without touching the network. */
@@ -385,6 +569,51 @@ export class OrchestratorReader {
       created_at: now,
     });
     if (observation.flow !== undefined) this.recordFlowAnomalies(observation.flow, now);
+    this.recordPriceAnomalies(observation, now);
+  }
+
+  /**
+   * Record the two live-only holes in a price post.
+   *
+   * `applied` is the reference a settled trade was checked against and `for` is
+   * the sweep the published band belongs to. Both are recorded as anomalies when
+   * a live post omits them — the verifier has already entered conservative mode,
+   * so this is the durable half of "we saw this and stopped adding risk".
+   */
+  private recordPriceAnomalies(observation: RefereeObservation, now: string): void {
+    const { record } = observation;
+    if (observation.appliedMissing) {
+      this.repositories.refereeAnomalies.record({
+        sweep: record.sweep,
+        room: record.room,
+        kind: 'applied_missing',
+        rawPayload: { seq: record.seq, sweep: record.sweep },
+        affectedCount: 1,
+      });
+      this.logger.event({
+        level: 'warn',
+        source: 'reader',
+        code: 'applied_missing',
+        message: `sweep ${record.sweep ?? '-'} posted no \`applied\`; conservative mode, no new active risk`,
+        data: { room: record.room, seq: record.seq, sweep: record.sweep, at: now },
+      });
+    }
+    if (observation.limitsForMissing) {
+      this.repositories.refereeAnomalies.record({
+        sweep: record.sweep,
+        room: record.room,
+        kind: 'limits_for_missing',
+        rawPayload: { seq: record.seq, sweep: record.sweep },
+        affectedCount: 1,
+      });
+      this.logger.event({
+        level: 'warn',
+        source: 'reader',
+        code: 'limits_for_missing',
+        message: `sweep ${record.sweep ?? '-'} posted no \`for\`; the band is read-only`,
+        data: { room: record.room, seq: record.seq, sweep: record.sweep, at: now },
+      });
+    }
   }
 
   /**
@@ -503,23 +732,26 @@ export class OrchestratorReader {
     }
 
     if (this.maxDiscoveredRooms !== null) {
-      const listed = this.repositories.roomRegistry.listListed();
-      if (listed.length > this.maxDiscoveredRooms) {
+      // Overflow is about the *discovered* set, not the six rooms we read
+      // unconditionally: those are never dropped, so counting them would make
+      // the alert fire from the first sweep.
+      const discovered = this.dynamicCandidates().length;
+      if (discovered > this.maxDiscoveredRooms) {
         this.repositories.refereeAnomalies.record({
           sweep: flow.n,
           room: null,
           kind: 'room_overflow',
-          rawPayload: { listed: listed.length },
-          affectedCount: listed.length,
+          rawPayload: { discovered, cap: this.maxDiscoveredRooms },
+          affectedCount: discovered,
         });
         this.logger.event({
           level: 'warn',
           source: 'reader',
           code: 'room_overflow',
           message:
-            `${listed.length} rooms are listed, above the cap of ${this.maxDiscoveredRooms}; ` +
-            'the fixed referee set is unchanged',
-          data: { listed: listed.length, cap: this.maxDiscoveredRooms },
+            `${discovered} owner rooms are listed, above the cap of ${this.maxDiscoveredRooms}; ` +
+            'the fixed referee set and close1 are unchanged and the extra rooms are not polled',
+          data: { discovered, cap: this.maxDiscoveredRooms, reading: this.dynamicSeen },
         });
       }
     }

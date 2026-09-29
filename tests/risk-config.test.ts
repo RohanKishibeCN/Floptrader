@@ -61,8 +61,12 @@ describe('the external-offer ceilings', () => {
 
 describe('the room and archive knobs', () => {
   it('carries a discoverable-room cap and refuses a nonsensical one', () => {
-    expect(load().roomDiscovery.maxRooms).toBe(50);
+    // Ten discovered owner rooms, read one at a time: the bounded default the
+    // spec names, not an unbounded long-poll per registered room.
+    expect(load().roomDiscovery.maxRooms).toBe(10);
+    expect(load().roomDiscovery.dynamicReadConcurrency).toBe(1);
     expect(load({ MAX_DISCOVERED_ROOMS: '10' }).roomDiscovery.maxRooms).toBe(10);
+    expect(load({ DYNAMIC_ROOM_READ_CONCURRENCY: '4' }).roomDiscovery.dynamicReadConcurrency).toBe(4);
     expect(() => load({ MAX_DISCOVERED_ROOMS: '0' })).toThrow(ConfigError);
   });
 
@@ -72,5 +76,10 @@ describe('the room and archive knobs', () => {
       'https://example.test/close-1',
     );
     expect(load().archive.checkIntervalMinutes).toBe(15);
+  });
+
+  it('leaves the staging smoke test off unless it is asked for explicitly', () => {
+    expect(load().stagingSmokeTest).toBe(false);
+    expect(load({ STAGING_SMOKE_TEST: 'true' }).stagingSmokeTest).toBe(true);
   });
 });

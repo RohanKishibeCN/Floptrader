@@ -389,6 +389,69 @@ export const MIGRATIONS: Migration[] = [
       `ALTER TABLE trades ADD COLUMN funds_side_confidence TEXT`,
     ],
   },
+  {
+    version: 3,
+    name: 'challenge-archive-and-repost-queue',
+    statements: [
+      // ---- the published sweep archive, per sweep --------------------------
+      // One row per sweep the archive's `index.json` names. `verified` means the
+      // downloaded bytes hashed to what the index claimed (and, for a `full`
+      // record, to the hash the referee's signed post pinned). `unavailable`
+      // records a 404 as a data gap: never a failure, never a mint verdict.
+      `CREATE TABLE IF NOT EXISTS archive_sweeps (
+         sweep INTEGER PRIMARY KEY,
+         status TEXT NOT NULL,
+         path TEXT,
+         expected_sha256 TEXT,
+         actual_sha256 TEXT,
+         verified INTEGER NOT NULL DEFAULT 0,
+         redacted_trades INTEGER,
+         fetched_at TEXT,
+         unavailable INTEGER NOT NULL DEFAULT 0,
+         error TEXT,
+         updated_at TEXT NOT NULL
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_archive_sweeps_verified ON archive_sweeps(verified, status)`,
+      `CREATE INDEX IF NOT EXISTS idx_archive_sweeps_unavailable ON archive_sweeps(unavailable)`,
+
+      // ---- the archive monitor's singleton state ---------------------------
+      `CREATE TABLE IF NOT EXISTS archive_state (
+         id INTEGER PRIMARY KEY CHECK (id = 1),
+         latest_index_sweep INTEGER,
+         latest_verified_sweep INTEGER,
+         lag_sweeps INTEGER,
+         last_check_at TEXT,
+         last_error TEXT,
+         updated_at TEXT NOT NULL
+       )`,
+
+      // ---- the missed-message repost queue ---------------------------------
+      // One row per local message the referee reported as `missed`. A re-post is
+      // the *same business content* re-wrapped in a fresh outer nonce and
+      // signature; the unique key is the original (room, seq, did), so a message
+      // can never be queued twice — across restarts included.
+      `CREATE TABLE IF NOT EXISTS repost_queue (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         original_room TEXT NOT NULL,
+         original_seq INTEGER NOT NULL,
+         agent_id TEXT NOT NULL,
+         did TEXT NOT NULL,
+         message_kind TEXT NOT NULL,
+         trade_id TEXT,
+         original_text TEXT NOT NULL,
+         reason TEXT,
+         status TEXT NOT NULL,
+         attempts INTEGER NOT NULL DEFAULT 0,
+         new_room TEXT,
+         new_nonce TEXT,
+         new_seq INTEGER,
+         created_at TEXT NOT NULL,
+         updated_at TEXT NOT NULL,
+         UNIQUE(original_room, original_seq, did)
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_repost_queue_status ON repost_queue(status, id)`,
+    ],
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;

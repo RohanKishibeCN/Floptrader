@@ -46,6 +46,7 @@ import { openDatabase, createRepositories, type Repositories, type SqliteDatabas
 import { GroupRunner } from '@flop/strategy';
 import { TechnocoreClient, computeLocalPackageManifestHash } from '@flop/technocore';
 import { ArchiveMaintenance } from './archive-maintenance.js';
+import { ChallengeArchiveMonitor } from './challenge-archive-monitor.js';
 import { loadConfig, ConfigError, type Config } from './config.js';
 import { OrchestratorScheduler } from './scheduler.js';
 import { OrchestratorReader } from './reader.js';
@@ -59,6 +60,11 @@ import { UpstreamMonitor } from './upstream-monitor.js';
 
 export interface RuntimeOverrides {
   fetchImpl?: typeof fetch;
+  /**
+   * The archive lives on a different host from technocore, so it gets its own
+   * injected transport. Tests use it to serve a fixed `index.json`.
+   */
+  archiveFetchImpl?: typeof fetch;
   /** Test seams. */
   larkTransport?: Parameters<typeof createLarkStack>[0]['transport'];
   larkNotifierClientFactory?: Parameters<typeof createLarkStack>[0]['notifierClientFactory'];
@@ -81,6 +87,8 @@ export interface Runtime {
   writer: OrchestratorWriter;
   scheduler: OrchestratorScheduler;
   lark: LarkStack;
+  /** The published sweep archive, polled off the trading path. */
+  archiveMonitor: ChallengeArchiveMonitor;
   health: HealthServer | null;
   startedAt: string;
   start(): Promise<void>;
@@ -524,6 +532,8 @@ export async function createRuntime(
     maxReferenceAgeSeconds: config.risk.maxReferenceAgeSeconds,
     staleReferenceMode: config.risk.staleReferenceMode,
     maxDiscoveredRooms: config.roomDiscovery.maxRooms,
+    dynamicReadConcurrency: config.roomDiscovery.dynamicReadConcurrency,
+    live: config.mode === 'live',
     now,
   });
 
@@ -602,6 +612,18 @@ export async function createRuntime(
     now,
   });
 
+  // The archive is an audit source polled on its own timer: it is deliberately
+  // not part of the tick, so a slow or absent archive cannot delay a read, a
+  // trade or a registration.
+  const archiveMonitor = new ChallengeArchiveMonitor({
+    config,
+    logger,
+    repositories,
+    localSweep: () => reader.verifier.state.currentSweep,
+    ...(overrides.archiveFetchImpl ? { fetchImpl: overrides.archiveFetchImpl } : {}),
+    now,
+  });
+
   // Lark needs the report builder and the report builder needs the scheduler, so
   // the stack is handed a late-bound closure. It is only ever called from a
   // scheduled window, long after this function has returned.
@@ -657,6 +679,7 @@ export async function createRuntime(
     writer,
     scheduler,
     lark,
+    archiveMonitor,
     health,
     startedAt: now().toISOString(),
     async start(): Promise<void> {
@@ -687,10 +710,12 @@ export async function createRuntime(
       });
       await lark.start();
       if (health) await health.start();
+      archiveMonitor.start();
       scheduler.start();
     },
     async stop(): Promise<void> {
       await scheduler.stop();
+      archiveMonitor.stop();
       if (health) await health.stop();
       await lark.stop();
       upstream.stop();

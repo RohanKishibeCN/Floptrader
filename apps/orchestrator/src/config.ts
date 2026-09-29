@@ -183,12 +183,30 @@ export const EnvSchema = z.object({
 
   // ---- rooms --------------------------------------------------------------
   /** Cap on dynamically discovered owner rooms; beyond this, alert and stop. */
-  MAX_DISCOVERED_ROOMS: intString(50),
+  MAX_DISCOVERED_ROOMS: intString(10),
+  /**
+   * How many dynamic owner rooms are read at once.
+   *
+   * Deliberately separate from `READ_CONCURRENCY`, and deliberately low: the
+   * fixed referee set must never queue behind a discovered room, so the dynamic
+   * reader gets its own, smaller budget.
+   */
+  DYNAMIC_ROOM_READ_CONCURRENCY: intString(1),
 
   // ---- challenge sweep archive -------------------------------------------
   /** The published sweep-record archive; an audit source, never an authority. */
   CHALLENGE_ARCHIVE_BASE_URL: z.string().default('https://challenges.technocore.chat/close-1'),
   ARCHIVE_CHECK_INTERVAL_MINUTES: intString(15),
+
+  // ---- staging acceptance -------------------------------------------------
+  /**
+   * Opt-in switch for the real-network staging smoke test.
+   *
+   * Defaults to false, and nothing in the runtime reads it: live trading is not
+   * claimed to be safe until a real Technocore staging run has been completed by
+   * a human, and this switch is how that run is requested.
+   */
+  STAGING_SMOKE_TEST: boolish.default(false),
 
   // ---- health -------------------------------------------------------------
   HEALTH_PORT: intString(8_780),
@@ -296,8 +314,10 @@ export interface Config {
     staleReferenceMode: 'off' | 'no_new_active_trade';
     externalOffer: { maxQty: Decimal; maxNotional: Decimal; clawbackBuffer: Decimal };
   };
-  roomDiscovery: { maxRooms: number };
+  roomDiscovery: { maxRooms: number; dynamicReadConcurrency: number };
   archive: { baseUrl: string; checkIntervalMinutes: number };
+  /** Opt-in flag for the real-network staging smoke test; never read at runtime. */
+  stagingSmokeTest: boolean;
   health: { port: number; host: string };
   loadGuard: {
     rssPausePercent: number;
@@ -544,11 +564,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
         clawbackBuffer,
       },
     },
-    roomDiscovery: { maxRooms: raw.MAX_DISCOVERED_ROOMS },
+    roomDiscovery: {
+      maxRooms: raw.MAX_DISCOVERED_ROOMS,
+      dynamicReadConcurrency: Math.max(1, raw.DYNAMIC_ROOM_READ_CONCURRENCY),
+    },
     archive: {
       baseUrl: raw.CHALLENGE_ARCHIVE_BASE_URL.replace(/\/+$/, ''),
       checkIntervalMinutes: raw.ARCHIVE_CHECK_INTERVAL_MINUTES,
     },
+    stagingSmokeTest: raw.STAGING_SMOKE_TEST,
     health: { port: raw.HEALTH_PORT, host: raw.HEALTH_HOST },
     loadGuard: {
       rssPausePercent: raw.RSS_PAUSE_PERCENT,

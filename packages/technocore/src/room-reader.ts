@@ -34,6 +34,15 @@ export interface RoomReaderOptions {
   logger: TechnocoreLogger;
   /** Rooms to read: the five referee rooms and the trading room. */
   rooms: string[];
+  /**
+   * A dynamic room list, re-read on every pass.
+   *
+   * The fixed reader keeps `rooms`; the bounded dynamic reader supplies this so
+   * a discovered owner room can join and leave the set without rebuilding the
+   * reader. It is always evaluated inside the same concurrency cap, so a room
+   * appearing mid-pass can never spawn an extra socket.
+   */
+  roomsProvider?: () => string[];
   /** Max concurrent room reads. Two by default: see the header. */
   readConcurrency?: number;
   /** Long-poll hold, seconds. Clamped to 0..10 by the service. */
@@ -73,6 +82,7 @@ export class RoomReader {
   private readonly logger: TechnocoreLogger;
   private readonly repositories: Repositories;
   private readonly rooms: string[];
+  private readonly roomsProvider: (() => string[]) | null;
   private readonly waitSeconds: number;
   private readonly limit: number;
   private readonly semaphore: Semaphore;
@@ -88,6 +98,7 @@ export class RoomReader {
     this.verifier = options.verifier;
     this.logger = options.logger;
     this.rooms = [...options.rooms];
+    this.roomsProvider = options.roomsProvider ?? null;
     this.waitSeconds = Math.min(10, Math.max(0, options.waitSeconds ?? 10));
     this.limit = Math.min(200, Math.max(1, options.limit ?? 50));
     this.semaphore = new Semaphore(Math.max(1, options.readConcurrency ?? 2));
@@ -136,8 +147,11 @@ export class RoomReader {
   async tick(): Promise<TickSummary> {
     const at = this.now().toISOString();
     const localDids = this.localDids();
+    // The dynamic set is resolved once per pass: every room in it is read inside
+    // the same semaphore, so it cannot widen the socket budget.
+    const rooms = this.roomsProvider ? this.roomsProvider() : this.rooms;
     const results = await Promise.all(
-      this.rooms.map((room) => this.semaphore.run(() => this.readRoom(room, localDids))),
+      rooms.map((room) => this.semaphore.run(() => this.readRoom(room, localDids))),
     );
 
     const observations: RefereeObservation[] = [];

@@ -33,6 +33,7 @@ import {
   RiskAccount,
   buildTerms,
   generateTradeId,
+  parseTradeMessage,
   withinLimits,
   withinPublishedLimits,
   type MarketSnapshot,
@@ -97,6 +98,68 @@ function advanceStatus(
   return PARTICIPATION_RANK[next] > PARTICIPATION_RANK[current] ? next : current;
 }
 
+/** One trade the referee named in a flow post's `settled`/`void` list. */
+interface RefereeOutcomeEntry {
+  id: string;
+  reason: string;
+}
+
+/**
+ * Read a `settled`/`void` list, whatever shape it arrived in.
+ *
+ * The published schema types both as `unknown` and the live referee has been
+ * seen using a bare id list and `{id, reason}` rows, so both — and an id→reason
+ * map — are accepted. An entry without a usable id is dropped rather than
+ * guessed at, and a missing reason becomes the list's default (`settled` or
+ * `void`), never a verdict.
+ */
+function parseOutcomeList(value: unknown, defaultReason: string): RefereeOutcomeEntry[] {
+  const entries: RefereeOutcomeEntry[] = [];
+  const add = (id: unknown, reason: unknown): void => {
+    if (typeof id !== 'string' || id.length === 0) return;
+    entries.push({
+      id,
+      reason: typeof reason === 'string' && reason.length > 0 ? reason : defaultReason,
+    });
+  };
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (typeof item === 'string') {
+        add(item, null);
+        continue;
+      }
+      if (typeof item !== 'object' || item === null) continue;
+      const row = item as Record<string, unknown>;
+      add(row.id ?? row.tid ?? row.trade_id ?? row.trade, row.reason ?? row.why);
+    }
+  } else if (typeof value === 'object' && value !== null) {
+    for (const [id, reason] of Object.entries(value as Record<string, unknown>)) {
+      add(id, typeof reason === 'string' ? reason : null);
+    }
+  }
+  return entries;
+}
+
+/** The trade id inside a stored trade message, or null when it is not one. */
+function tradeIdOf(text: string): string | null {
+  const parsed = parseTradeMessage(text);
+  return parsed === null ? null : parsed.terms.id;
+}
+
+/**
+ * True when the missed entry's trade id agrees with the message we hold.
+ *
+ * A `missed` entry that names no trade id cannot disagree, so it matches; an
+ * entry that names one must name the same one, or the message is not the one the
+ * referee missed and must not be re-posted.
+ */
+function tradeIdMatches(entry: Record<string, unknown>, tradeId: string | null): boolean {
+  const raw = entry.tid ?? entry.trade_id ?? entry.trade ?? entry.id;
+  if (raw === undefined || raw === null) return true;
+  if (tradeId === null) return false;
+  return String(raw) === tradeId;
+}
+
 export interface ParticipationOutcome {
   /** Registrations confirmed present on the room this pass. */
   readback: number;
@@ -123,6 +186,7 @@ export interface TickReport {
   participation: ParticipationOutcome;
   runs: { agents: number; candidates: number; failures: number };
   trades: { dryRun: number; posted: number; refused: number };
+  repost: { queued: number; posted: number; failed: number; skipped: number };
   watchdog: { ran: boolean; backfilled: number };
   lark: { delivered: string[]; maintenance: boolean };
   deepseek: { attempted: string[]; refused: number };
@@ -157,6 +221,32 @@ export interface StatusSnapshot {
   participation: Record<string, number> & { total: number; readback: number };
   runs: { today: number; window: number };
   trades: Record<string, number>;
+  /** The referee's named reasons, and how its `funds` verdicts are labelled. */
+  funds: {
+    officialReasons: Record<string, number>;
+    fundsVerdicts: number;
+    localInferred: number;
+  };
+  /** Missed-message re-posts, by status. */
+  repost: Record<string, number> & { total: number };
+  /** The published sweep archive, as the monitor last saw it. */
+  archive: {
+    latestIndexSweep: number | null;
+    latestVerifiedSweep: number | null;
+    lagSweeps: number | null;
+    fullVerified: number;
+    redactedVerified: number;
+    unavailable: number;
+    hashMismatch: number;
+    lastCheckAt: string | null;
+    lastError: string | null;
+  };
+  rooms: {
+    scope: 'close1_only' | 'registered_rooms_plus_close1';
+    fixed: string[];
+    dynamic: string[];
+    cap: number;
+  };
   cors: { gaps: number; gapRooms: string[]; resets: string[] };
   technocore: Record<string, number>;
   llm: { normal: number; retries: number; total: number; blocked: number; tokens: number };
@@ -216,6 +306,8 @@ export class OrchestratorScheduler {
   private lastTickReport: TickReport | null = null;
   /** Per-agent mirror of cash and open lots; rebuilt from the referee's mints. */
   private readonly riskBook: Map<string, RiskAccount> = new Map();
+  /** DID -> agent id, built once, for matching a missed message back to its agent. */
+  private readonly didIndex: Map<string, string> = new Map();
   private readonly startedAt = Date.now();
 
   constructor(options: SchedulerOptions) {
@@ -330,6 +422,8 @@ export class OrchestratorScheduler {
     const trades = await this.executeActions(runOutcome.outcomes);
 
     const reconciled = this.reconcileMints();
+    this.reconcileRefereeSettlements();
+    const repost = await this.reconcileReposts();
     const watchdog = await this.maybeRunWatchdog(at);
     const lark = await this.maybeReport(at);
 
@@ -376,6 +470,7 @@ export class OrchestratorScheduler {
         failures: runOutcome.failures.length,
       },
       trades,
+      repost,
       watchdog,
       lark,
       deepseek,
@@ -780,6 +875,253 @@ export class OrchestratorScheduler {
   }
 
   // -------------------------------------------------------------------------
+  // referee verdicts, funds side, and the missed-message repost queue
+  // -------------------------------------------------------------------------
+  /**
+   * Apply the referee's own per-trade outcomes.
+   *
+   * `flow.settled` / `flow.void` are the referee naming what happened to trades
+   * it saw, and the shape is not pinned by the published schema, so this parses
+   * defensively: an id list, a list of `{id|tid, reason}` rows, or an id→reason
+   * map. Anything it cannot read is skipped rather than guessed at.
+   *
+   * `reason: funds` is the one verdict that is ambiguous — the referee does not
+   * say which side was short — so `referee_funds_side` is stored as `unknown`
+   * with `funds_side_confidence = 'official'`, and our own inference is kept
+   * separately, labelled `local_inference`.
+   */
+  reconcileRefereeSettlements(): { settled: number; voided: number; funds: number } {
+    const outcome = { settled: 0, voided: 0, funds: 0 };
+    for (const row of this.repositories.referee.snapshotsSince('flow', 0)) {
+      if (row.signature_valid !== 1) continue;
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(row.payload) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      for (const [list, defaultReason] of [
+        [payload.settled, 'settled'],
+        [payload.void, 'void'],
+      ] as const) {
+        for (const entry of parseOutcomeList(list, defaultReason)) {
+          const trade = this.repositories.trades.get(entry.id);
+          if (!trade) continue;
+          if (trade.referee_reason === entry.reason) continue;
+          this.repositories.trades.recordRefereeVerdict(entry.id, {
+            reason: entry.reason,
+            fundsSide: entry.reason === 'funds' ? 'unknown' : null,
+            settleSweep: row.sweep ?? null,
+          });
+          if (trade.status !== 'settled' && trade.status !== 'void') {
+            this.repositories.trades.updateStatus(
+              entry.id,
+              entry.reason === 'settled' ? 'settled' : 'void',
+              entry.reason,
+              row.sweep ?? undefined,
+            );
+          }
+          if (entry.reason === 'settled') outcome.settled += 1;
+          if (entry.reason === 'funds') {
+            outcome.funds += 1;
+            this.logger.event({
+              level: 'warn',
+              source: 'scheduler',
+              code: 'referee_funds_verdict',
+              message:
+                `trade ${entry.id} was voided for funds; the referee did not name a side ` +
+                '(official side: unknown)',
+              data: { tradeId: entry.id, sweep: row.sweep, localInference: trade.local_funds_side },
+            });
+          }
+          if (entry.reason !== 'settled' && entry.reason !== 'funds') outcome.voided += 1;
+        }
+      }
+    }
+    return outcome;
+  }
+
+  /**
+   * Queue the local messages the referee reported as `missed`, and re-post them.
+   *
+   * The rules this holds to, in order:
+   *   - only a message that is genuinely ours, matched on the room, the seq and
+   *     the DID (or, for a trade, the trade id) is queued at all;
+   *   - a message that cannot be matched is recorded and alerted about, never
+   *     re-posted;
+   *   - nothing is re-posted after the lock, and nothing to a room the referee
+   *     has unlisted — such a message goes to `close1` instead, which never
+   *     leaves the list;
+   *   - the business content is byte-for-byte the original; only the outer nonce
+   *     and its signature are regenerated;
+   *   - each original message is queued once (the unique key survives a restart)
+   *     and re-posted at most once.
+   */
+  async reconcileReposts(): Promise<{
+    queued: number;
+    posted: number;
+    failed: number;
+    skipped: number;
+  }> {
+    const queued = this.planReposts();
+    const result = { queued, posted: 0, failed: 0, skipped: 0 };
+    if (this.loadGuard.state.paused.readsOnly) return result;
+    const sweep = this.reader.verifier.state.currentSweep;
+
+    for (const row of this.repositories.reposts.retryable()) {
+      // The lock closes re-posting exactly as it closes registration: past it a
+      // re-post cannot count, so it is noise on a contest room.
+      if (sweep !== null && sweep > this.rules.lockSweep) {
+        this.repositories.reposts.markSkipped(row.id!, 'lock_passed');
+        result.skipped += 1;
+        continue;
+      }
+      if (!this.repostAllowed(row.message_kind)) continue;
+
+      const target = this.repostRoomFor(row.original_room);
+      const posted = await this.writer.postRaw(
+        row.agent_id,
+        target,
+        row.original_text,
+        'repost',
+      );
+      if (posted.ok) {
+        this.repositories.reposts.markPosted(row.id!, {
+          newRoom: target,
+          newNonce: posted.nonce,
+          newSeq: posted.seq ?? null,
+        });
+        result.posted += 1;
+        this.logger.event({
+          level: 'info',
+          source: 'scheduler',
+          code: 'repost_posted',
+          message: `re-posted a missed ${row.message_kind} for ${row.agent_id} into ${target}`,
+          data: {
+            agentId: row.agent_id,
+            originalRoom: row.original_room,
+            originalSeq: row.original_seq,
+            newRoom: target,
+            newSeq: posted.seq ?? null,
+          },
+        });
+      } else {
+        this.repositories.reposts.markFailed(row.id!, posted.reason ?? 'repost_failed');
+        result.failed += 1;
+      }
+    }
+    return result;
+  }
+
+  /** A re-post is a write, so it obeys the same two gates a fresh post does. */
+  private repostAllowed(kind: string): boolean {
+    return kind === 'trade' ? this.config.tradingArmed : this.config.allowRegistration;
+  }
+
+  /**
+   * Where a re-post may go.
+   *
+   * Never into a room the referee has unlisted: it stopped reading it, so the
+   * message would be missed again. `close1` is the fallback, because the rules
+   * say it never leaves the list.
+   */
+  private repostRoomFor(originalRoom: string): string {
+    const safe = this.rules.tradingRoom;
+    if (originalRoom === safe) return safe;
+    const registry = this.repositories.roomRegistry.get(originalRoom);
+    return registry !== undefined && registry.listed === 1 ? originalRoom : safe;
+  }
+
+  /** Turn the recorded `missed` anomalies into queue rows, once each. */
+  private planReposts(): number {
+    const byDid = this.agentIdByDid();
+    let queued = 0;
+    for (const anomaly of this.repositories.refereeAnomalies.byKind('referee_missed')) {
+      let entry: Record<string, unknown>;
+      try {
+        const parsed: unknown = JSON.parse(anomaly.raw_payload ?? 'null');
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) continue;
+        entry = parsed as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+      const room = typeof entry.room === 'string' ? entry.room : anomaly.room;
+      const seq = typeof entry.seq === 'number' ? entry.seq : null;
+      if (room === null || seq === null) continue;
+
+      const message = this.repositories.messages.get(room, seq);
+      const did = message?.sender_did ?? null;
+      if (message === undefined || did === null || !this.keyStore.didSet().has(did)) {
+        // Cannot be matched to one of ours: record it and alert, never re-post.
+        this.repositories.reposts.enqueue({
+          original_room: room,
+          original_seq: seq,
+          agent_id: '',
+          did: typeof entry.did === 'string' ? entry.did : '',
+          message_kind: 'unknown',
+          trade_id: null,
+          original_text: '',
+          reason: 'unmatched_local_message',
+          status: 'skipped',
+        });
+        this.logger.event({
+          level: 'warn',
+          source: 'scheduler',
+          code: 'repost_unmatched',
+          message: `a message the referee missed at ${room}#${seq} could not be matched locally; nothing is re-posted`,
+          data: { room, seq, anomalyId: anomaly.id },
+        });
+        queued += 1;
+        continue;
+      }
+
+      const agentId = byDid.get(did);
+      if (agentId === undefined) continue;
+      if (this.repositories.reposts.has(room, seq, did)) continue;
+
+      const tradeId = message.kind === 'trade' ? (tradeIdOf(message.text) ?? null) : null;
+      if (tradeIdMatches(entry, tradeId) === false) {
+        this.repositories.reposts.enqueue({
+          original_room: room,
+          original_seq: seq,
+          agent_id: agentId,
+          did,
+          message_kind: message.kind,
+          trade_id: tradeId,
+          original_text: message.text,
+          reason: 'trade_id_mismatch',
+          status: 'skipped',
+        });
+        queued += 1;
+        continue;
+      }
+
+      const accepted = this.repositories.reposts.enqueue({
+        original_room: room,
+        original_seq: seq,
+        agent_id: agentId,
+        did,
+        message_kind: message.kind,
+        trade_id: tradeId,
+        original_text: message.text,
+        reason: 'referee_missed',
+        status: 'pending',
+      });
+      if (accepted) queued += 1;
+    }
+    return queued;
+  }
+
+  private agentIdByDid(): Map<string, string> {
+    if (this.didIndex.size === 0) {
+      for (const agentId of this.keyStore.agentIds) {
+        this.didIndex.set(this.keyStore.did(agentId), agentId);
+      }
+    }
+    return this.didIndex;
+  }
+
+  // -------------------------------------------------------------------------
   // local strategy runs
   // -------------------------------------------------------------------------
 
@@ -923,6 +1265,22 @@ export class OrchestratorScheduler {
               : 'load_shed';
         if (refusal !== null) {
           this.recordTrade(agentId, terms, 'refused', refusal, signed.maker_sig, signed.taker_sig);
+          result.refused += 1;
+          continue;
+        }
+        // Live only: a band the referee did not label with `for` (or labelled
+        // with the wrong sweep) cannot price a new trade. Conservative mode has
+        // already stopped the strategy from proposing one; this is the explicit
+        // second lock on the write path itself.
+        if (this.config.liveArmed && snapshot.limitsUsable === false) {
+          this.recordTrade(
+            agentId,
+            terms,
+            'refused',
+            snapshot.limitsForSweep === null ? 'limits_for_missing' : 'limits_for_mismatch',
+            signed.maker_sig,
+            signed.taker_sig,
+          );
           result.refused += 1;
           continue;
         }
@@ -1130,6 +1488,11 @@ export class OrchestratorScheduler {
       seq,
       agent_id: agentId,
       counter_agent_id: null,
+      // The local inference is stored from the first write, labelled for what it
+      // is. It is never the referee's conclusion, and `referee_funds_side` stays
+      // null until the referee itself names a reason.
+      local_funds_side: this.localFundsSide(terms, did),
+      funds_side_confidence: 'local_inference',
     });
     if (!accepted) {
       this.logger.event({
@@ -1140,6 +1503,31 @@ export class OrchestratorScheduler {
         data: { agentId, tradeId: terms.id },
       });
     }
+  }
+
+  /**
+   * Which side of this trade is ours, from what we actually hold.
+   *
+   * This is an inference about *our* exposure, not a claim about which side the
+   * referee found short — the referee never says, and `referee_funds_side` is
+   * always `unknown` for a `funds` verdict. It is stored beside the official
+   * fields under `funds_side_confidence = 'local_inference'` and is never
+   * promoted: `recordRefereeVerdict` writes `official` and the repository refuses
+   * to overwrite it.
+   */
+  private localFundsSide(terms: TradeTerms, did: string): 'maker' | 'taker' | 'both' | 'unknown' {
+    const local = this.keyStore.didSet();
+    const makerIsUs = local.has(terms.maker);
+    const explicitTaker = terms.taker === 'any' ? null : terms.taker;
+    const takerIsUs = explicitTaker !== null && local.has(explicitTaker);
+    if (makerIsUs && takerIsUs) return 'both';
+    if (makerIsUs) return 'maker';
+    if (takerIsUs) return 'taker';
+    // Neither term names a local DID and the offer was open: this is a stranger's
+    // `taker:"any"` offer that our agent countersigned, so the local side is the
+    // taker.
+    if (explicitTaker === null && local.has(did)) return 'taker';
+    return 'unknown';
   }
 
   // -------------------------------------------------------------------------
@@ -1329,6 +1717,17 @@ export class OrchestratorScheduler {
     const uptimeSeconds = Math.max(1, (Date.now() - this.startedAt) / 1000);
     const cursorGaps = this.reader.gaps();
     const wsStatus = this.lark?.websocket.status;
+    const archiveState = this.repositories.archiveState.get();
+    const archiveBySweep = this.repositories.archiveSweeps.all();
+    const fullVerified = archiveBySweep.filter(
+      (row) => row.verified === 1 && row.status === 'full',
+    ).length;
+    const redactedVerified = archiveBySweep.filter(
+      (row) => row.verified === 1 && row.status === 'redacted',
+    ).length;
+    const verdicts = this.repositories.trades.fundsVerdicts();
+    const officialReasons = this.repositories.trades.refereeReasonCounts();
+    const localInferred = this.repositories.trades.countLocalInference();
 
     return {
       at: at.toISOString(),
@@ -1373,6 +1772,32 @@ export class OrchestratorScheduler {
         window: this.repositories.agentRuns.countSince(runWindowStart),
       },
       trades: this.repositories.trades.countByStatus(),
+      funds: {
+        officialReasons,
+        fundsVerdicts: verdicts.length,
+        localInferred,
+      },
+      repost: {
+        ...this.repositories.reposts.countByStatus(),
+        total: this.repositories.reposts.count(),
+      },
+      archive: {
+        latestIndexSweep: archiveState?.latest_index_sweep ?? null,
+        latestVerifiedSweep: archiveState?.latest_verified_sweep ?? null,
+        lagSweeps: archiveState?.lag_sweeps ?? null,
+        fullVerified,
+        redactedVerified,
+        unavailable: this.repositories.archiveSweeps.unavailableSweeps().length,
+        hashMismatch: this.repositories.archiveSweeps.mismatchedSweeps().length,
+        lastCheckAt: archiveState?.last_check_at ?? null,
+        lastError: archiveState?.last_error ?? null,
+      },
+      rooms: {
+        scope: this.reader.roomScope,
+        fixed: this.reader.fixedRoomList,
+        dynamic: this.reader.dynamicRooms,
+        cap: this.config.roomDiscovery.maxRooms,
+      },
       cors: { gaps: cursorGaps.total, gapRooms: cursorGaps.rooms, resets: cursorGaps.resets },
       technocore: this.client.stats() as unknown as Record<string, number>,
       llm: {
@@ -1426,6 +1851,27 @@ export class OrchestratorScheduler {
     if (status.conservative) {
       critical.push(`conservative mode: ${status.conservativeReasons.join('; ')}`);
     }
+    if (
+      status.conservativeReasons.includes('limits_for_mismatch') ||
+      status.conservativeReasons.includes('limits_for_missing')
+    ) {
+      critical.push(
+        'the published limits do not label the next sweep (`for`); no new live trade can be priced from them',
+      );
+    }
+    if (status.archive.hashMismatch > 0) {
+      critical.push(`archive records that did not verify: ${status.archive.hashMismatch}`);
+    }
+    const overflowAnomalies = this.repositories.refereeAnomalies.byKind('room_overflow').length;
+    if (overflowAnomalies > 0) {
+      critical.push(
+        `room_overflow: ${overflowAnomalies} listing(s) above the cap of ${status.rooms.cap}; ` +
+          'the fixed referee set and close1 are unchanged',
+      );
+    }
+    if ((status.repost.failed ?? 0) > 0) {
+      critical.push(`missed-message re-posts that failed: ${status.repost.failed}`);
+    }
     if (status.cors.gaps > 0) critical.push(`cursor gaps: ${status.cors.gaps}`);
     if (status.tier === 'critical' || status.tier === 'readonly') {
       critical.push(`load tier ${status.tier}: ${status.tierReasons.join('; ')}`);
@@ -1461,8 +1907,10 @@ export class OrchestratorScheduler {
           heading: '比赛状态',
           lines: [
             `current_sweep: ${status.sweep ?? '-'}`,
-            `reference price: ${status.reference ?? '-'}`,
+            `price.applied (settled reference): ${this.reader.verifier.state.appliedReference?.toString() ?? '-'}`,
+            `price.ref.px (close): ${status.reference ?? '-'}`,
             `limits: ${status.limits ? `${status.limits.low} .. ${status.limits.high}` : '-'}`,
+            `limits for sweep: ${this.reader.verifier.state.limitsForSweep ?? '-'} (usable: ${this.reader.verifier.state.limitsUsable})`,
             `locked: ${status.locked}`,
             `package hash: ${status.packageHash ?? '-'}`,
             `referee DID: ${status.refereeDid ?? '-'}`,
@@ -1507,6 +1955,52 @@ export class OrchestratorScheduler {
           ],
         },
         {
+          heading: '资金方向 (funds)',
+          lines: [
+            `official reasons: ${Object.entries(status.funds.officialReasons)
+              .map(([key, value]) => `${key}=${value}`)
+              .join(' ') || 'none'}`,
+            `official reason: funds — official side: unknown (the referee names a reason, never a side)`,
+            `local inferred side: ${this.localFundsSideSummary()} — confidence: local_inference`,
+            `funds verdicts (official): ${status.funds.fundsVerdicts}`,
+            `trades carrying a local inference: ${status.funds.localInferred}`,
+          ],
+        },
+        {
+          heading: '房间范围 (room scope)',
+          lines: [
+            `room_scope: ${status.rooms.scope}`,
+            `fixed rooms: ${status.rooms.fixed.join(', ')}`,
+            `dynamic rooms (${status.rooms.dynamic.length}/${status.rooms.cap}): ${
+              status.rooms.dynamic.join(', ') || 'none'
+            }`,
+            `MAX_DISCOVERED_ROOMS: ${status.rooms.cap}`,
+          ],
+        },
+        {
+          heading: '归档 (archive)',
+          lines: [
+            `archive_latest_index_sweep: ${status.archive.latestIndexSweep ?? '-'}`,
+            `archive_latest_verified_sweep: ${status.archive.latestVerifiedSweep ?? '-'}`,
+            `archive_lag_sweeps: ${status.archive.lagSweeps ?? '-'}`,
+            `archive_full_verified: ${status.archive.fullVerified}`,
+            `archive_redacted_verified: ${status.archive.redactedVerified}`,
+            `archive_unavailable: ${status.archive.unavailable}`,
+            `archive_hash_mismatch: ${status.archive.hashMismatch}`,
+            `archive last check: ${status.archive.lastCheckAt ?? 'never'}${status.archive.lastError ? ` (${status.archive.lastError})` : ''}`,
+          ],
+        },
+        {
+          heading: 'missed 重发队列',
+          lines: [
+            `reposts: ${Object.entries(status.repost)
+              .filter(([key]) => key !== 'total')
+              .map(([key, value]) => `${key}=${value}`)
+              .join(' ') || 'none'} (total ${status.repost.total})`,
+            `lock sweep: ${this.rules.lockSweep} — re-posting stops past it`,
+          ],
+        },
+        {
           heading: '模型与平台',
           lines: [
             `deepseek calls today: ${status.llm.normal} normal / ${status.llm.retries} retry / ${status.llm.total} total (hard cap 3)`,
@@ -1534,6 +2028,24 @@ export class OrchestratorScheduler {
   /** The package hash the process was launched against, if a pin exists. */
   private pinnedPackageHash(): string | null {
     return this.repositories.upstream.getPin()?.expected_package_hash ?? null;
+  }
+
+  /**
+   * A compact summary of the local funds-side inferences, for the report.
+   *
+   * Always labelled as an inference where it is printed: the referee's own
+   * `funds_side` is `unknown`, and this must never read as a referee finding.
+   */
+  private localFundsSideSummary(): string {
+    const rows = this.db
+      .prepare(
+        `SELECT COALESCE(local_funds_side, 'unknown') AS side, COUNT(*) AS n FROM trades
+          WHERE funds_side_confidence IS NULL OR funds_side_confidence = 'local_inference'
+          GROUP BY side ORDER BY side`,
+      )
+      .all() as Array<{ side: string; n: number }>;
+    if (rows.length === 0) return 'unknown (no local trades yet)';
+    return rows.map((row) => `${row.side}=${row.n}`).join(' ');
   }
 }
 

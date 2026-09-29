@@ -45,6 +45,11 @@ deliberate so nothing has to be taken on faith.
 | The official fold, ported byte-for-byte | `packages/close-call/src/fold.ts`, `tests/official-fold.test.ts` |
 | Trade protocol: both signatures, limits, lock, duplicate ids | `packages/close-call/src/trade-*.ts`, `tests/trade-protocol.test.ts` |
 | Referee posts verified per room; drift enters conservative mode | `packages/technocore/src/referee-verifier.ts`, `tests/referee-verifier.test.ts` |
+| `applied`/`ref.px`/`limits`/`for` kept apart, and the live boundary on each | `packages/technocore/src/referee-verifier.ts`, `tests/referee-price-semantics.test.ts`, `tests/live-price-boundaries.test.ts` |
+| The published sweep archive is polled, verified and recorded — and decides nothing | `apps/orchestrator/src/challenge-archive-monitor.ts`, `tests/challenge-archive-monitor.test.ts` |
+| Discovered owner rooms are read under a bounded cap, on their own reader | `apps/orchestrator/src/reader.ts`, `packages/technocore/src/room-reader.ts`, `tests/dynamic-rooms.test.ts` |
+| A `missed` local message is re-posted once, with a fresh nonce, only before the lock | `apps/orchestrator/src/scheduler.ts`, `tests/missed-repost.test.ts` |
+| `reason: funds` never becomes a side; the local inference is labelled as such | `packages/storage/src/repositories.ts`, `apps/orchestrator/src/scheduler.ts`, `tests/funds-side.test.ts` |
 | Package pin; a mismatch pauses trading and never auto-switches | `packages/technocore/src/package-pin.ts`, `tests/package-pin.test.ts` |
 | DeepSeek budget: ≤2 normal, ≤1 retry, ≤3 hard, idle windows only | `apps/orchestrator/src/llm.ts`, `tests/llm-budget.test.ts`, `tests/llm-window.test.ts` |
 | The model cannot bypass the risk engine: bounded parameters only, caps live outside its reach | `packages/strategy/src/parameter-validator.ts`, `deterministic-gate.ts`, `packages/close-call/src/risk.ts`, `tests/model-cannot-bypass-risk.test.ts` |
@@ -270,7 +275,10 @@ Three honest caveats about the WebSocket half:
 3. **No real-network staging test has been run.** Every assertion here is driven
    by a fake transport and a fake notifier; the real WebSocket has never been
    dialled from this repository. That is the one claim in this README that rests
-   on the SDK's documented behaviour rather than on a test.
+   on the SDK's documented behaviour rather than on a test. The switch that would
+   change it is `STAGING_SMOKE_TEST` — see "Staging acceptance" below, which is
+   also where the rule lives that live trading is not claimed to be allowed until
+   that run has actually happened.
 
 ## Reading the referee
 
@@ -288,6 +296,22 @@ them is the most expensive mistake available here. Per `docs/close-1-referee.md`
 `ref.px` is never promoted into the historical reference, and the official
 reference is never rewritten or back-adjusted. When a post omits `applied`, the
 previous close is the only stand-in used.
+
+**What changes when the process is armed.** The two fields above are the ones a
+trade is actually priced from, so `FLOP_MODE=live` tightens both — the same code
+in a dry run keeps the permissive fallback, because a dry run never posts a
+trade:
+
+| Live case | What happens |
+| --- | --- |
+| `applied` missing | recorded as an `applied_missing` anomaly, conservative mode, no new active risk; the previous close stands in only as a value |
+| `for` missing | `limitsUsable` is false: the band is still stored verbatim, but nothing may be priced from it (read-only) |
+| `for !== n + 1` | conservative mode, `limits_for_mismatch`, and a Lark critical alert |
+| `age_s` stale | `staleReference`: the official numbers stand, no new active maker trade, external offers refused |
+
+`limitsUsable` is checked twice: the deterministic gate refuses a degraded market
+before a trade is built, and the write path refuses one whose band is not usable
+before anything is posted.
 
 **Stale reference.** When `age_s > MAX_REFERENCE_AGE_SECONDS` (default 60) the
 snapshot is marked `staleReference`: the official reference still stands and the
@@ -308,25 +332,59 @@ listed and when it fell off; `referee_anomalies` records every `unlisted`,
 `omitted` and `missed` the referee reports, with the raw payload. `close1` is
 always listed. Only owner registration, room registration and a signed trade
 count as activity — offers and chatter do not. `omitted` means the referee did
-not see the post; it is not `failed` and not `mint_unknown`. `missed` names a
-message the referee did not read; where it involves a local agent the original
-is kept and re-published with a **new nonce**, never the old signed envelope.
-Dynamic room discovery is bounded by `MAX_DISCOVERED_ROOMS`, and exceeding it is
-a `room_overflow` alert rather than an unbounded number of polls.
+not see the post; it is not `failed` and not `mint_unknown`.
+
+**Reading rooms, bounded.** Six rooms are read unconditionally: the five referee
+rooms and `close1`. On top of that, a **bounded dynamic reader** picks up the
+owner rooms `flow.rooms` announced, ranked by (1) a recent signed trade, (2) a
+`missed` the referee reported in that room, (3) how recently it was announced,
+(4) how recently it was read, and capped at `MAX_DISCOVERED_ROOMS` (10). It runs
+as a **separate reader with its own low concurrency**
+(`DYNAMIC_ROOM_READ_CONCURRENCY`, 1) *after* the fixed pass, so a discovered room
+can never delay the referee feed, and both readers share one `TechnocoreClient`
+whose semaphore is `MAX_INFLIGHT` — the total number of sockets is bounded by the
+same number as before. Exceeding the cap records a `room_overflow` alert and a
+Lark critical line; it never opens more polls. The report prints `room_scope`
+plus the room list it actually read, so "which rooms did we observe" is always
+answerable from the report rather than assumed.
+
+**`missed` means the referee never read the message**, so it does not count. The
+`repost_queue` is the finite, auditable remedy: only a message that is genuinely
+ours — matched on room + seq + DID, or on the trade id — is queued, and only
+before the lock. The re-post carries the **same business content** under a **new
+outer nonce** and a regenerated signature; the trade `terms`, `maker_sig` and
+`taker_sig` are byte-for-byte the originals. A room the referee has unlisted is
+never re-posted into: the message goes to `close1` instead (that is what
+`new_room` records). An entry that cannot be matched, an `omitted` count, and an
+archive gap never queue anything. Each original message is queued once (the
+unique key survives a restart) and re-posted at most once, with bounded retries.
 
 **Sweep archive.** `CHALLENGE_ARCHIVE_BASE_URL` points at the published archive
-(`.../close-1`). `ArchiveClient` reads `index.json`, `ArchiveVerifier` checks a
-`full` record's bytes against the hash the signed post named and a `redacted`
-record against its own `sha256`, and `ArchiveReconciler` compares local mints
-with the archive's. A 404 is `archive_unavailable`, i.e. a recorded gap — never
-a contest failure — and redacted records cannot restore private-room trade text.
-The archive is an audit aid: it never overwrites a verified Technocore message
-and never marks a mint as failed.
+(`.../close-1`). `ChallengeArchiveMonitor` polls `index.json` every
+`ARCHIVE_CHECK_INTERVAL_MINUTES` (15) **on its own timer**, never inside the
+trading path, and is created and started by `main.ts`. `ArchiveClient` reads the
+index and the records; `verifyArchiveRecord` checks a `full` record's bytes
+against the hash the signed post named *and* against the hash `index.json`
+claims, and a `redacted` record against its own `sha256` only. Results land in
+`archive_sweeps` (one row per sweep: `verified`, `unavailable`, `error`,
+`actual_sha256`) and `archive_state` (`latest_index_sweep`,
+`latest_verified_sweep`, `lag_sweeps`, `last_check_at`, `last_error`); the Lark
+report prints `archive_latest_index_sweep`, `archive_latest_verified_sweep`,
+`archive_lag_sweeps`, `archive_full_verified`, `archive_redacted_verified`,
+`archive_unavailable` and `archive_hash_mismatch`. A 404 is
+`archive_unavailable`, i.e. a recorded gap — **never** a contest failure: it
+cannot mark a mint, a trade or an owner registration failed. The monitor writes
+only its own two tables, so it cannot overwrite a verified Technocore message,
+and a broken archive cannot stop the reader, the writer or the scheduler.
 
 **`reason: funds` is ambiguous.** The referee does not say *which* side was
-short, so `referee_funds_side` is always `unknown`. `trades` also stores a
-locally computed `local_funds_side` and `funds_side_confidence`; the Lark report
-labels it as a local inference, not a referee conclusion.
+short, so `referee_funds_side` is always `unknown` and `funds_side_confidence` is
+`official`. `trades` also stores a locally computed `local_funds_side` (`maker`,
+`taker`, `both` or `unknown`) under `funds_side_confidence = 'local_inference'`;
+the repository refuses to overwrite an `official` verdict with a guess, and the
+Lark report prints the two as separate lines —
+`official reason: funds official side: unknown local inferred side: … confidence:
+local_inference`.
 
 ## Degradation ladder
 
@@ -400,15 +458,42 @@ pnpm cost-report
 pnpm disk-report
 ```
 
+## Staging acceptance: the one thing a fake transport cannot prove
+
+Everything above is driven by a fake transport, and that is exactly the limit of
+what it proves. `tests/staging-smoke.test.ts` is the only place that dials real
+endpoints, and it is **off by default**:
+
+```bash
+STAGING_SMOKE_TEST=true \
+TECHNO_CORE_BASE_URL=https://technocore.chat \
+STAGING_ROOM=smoke-<something-unique> \
+CHALLENGE_ARCHIVE_BASE_URL=https://challenges.technocore.chat/close-1 \
+LARK_APP_ID=... LARK_APP_SECRET=... LARK_BOT_ID=... LARK_CHAT_ID=... \
+npx vitest run tests/staging-smoke.test.ts
+```
+
+It posts one throwaway owner registration into `STAGING_ROOM` and reads it back
+(it refuses to use `close1` or any referee room), exercises the timeout and 429
+retry ladders, parses the real `index.json` and the record behind it, and opens
+the real Lark WebSocket while sending a report through the Open API with a
+`report_id` de-duplication check. With `STAGING_SMOKE_TEST=false` — the default —
+every one of its tests is skipped and `pnpm test` is unchanged.
+
+**Live trading is not claimed to be allowed until a run of that file has been
+completed against real endpoints.** That run has not been done, so the honest
+statement is the one above: dry-run is exercised end to end, live is gated at
+four separate points and is not yet accepted.
+
 `pnpm soak-test` prints the resource numbers against their targets. The last
 recorded run of the full 24-hour rehearsal:
 
 | Metric | Target | Observed |
 | --- | --- | --- |
-| RSS average | < 600 MiB | 179 MiB |
-| RSS peak | < 1.2 GiB | 191 MiB |
-| CPU duty cycle at the real 5-minute cadence | < 35% | 0.01% (29 ms per sweep) |
-| event loop lag | < 100 ms | 5.0 ms |
+| RSS average | < 600 MiB | 231 MiB |
+| RSS peak | < 1.2 GiB | 286 MiB |
+| CPU duty cycle at the real 5-minute cadence | < 35% | 0.016% (48 ms per sweep) |
+| event loop lag | < 100 ms | 1.8 ms |
 | participation rows / readback | 150 / 150 | 150 / 150 |
 | cursor sequences lost | 0 | 0 |
 | nonce rollbacks | 0 | 0 |
@@ -439,7 +524,7 @@ recorded run of the full 24-hour rehearsal:
 ```
 apps/orchestrator/src/     main, cli, config, scheduler, reader, writer, lark,
                            llm, health, load-guard, upstream-monitor,
-                           archive-maintenance
+                           archive-maintenance, challenge-archive-monitor
 packages/identity/         did:key, canonical JSON, signing, nonces, key store,
                            control proofs, inventory, age backup
 packages/close-call/       Decimal, clawback fee, risk ledger, trade terms and
@@ -447,9 +532,10 @@ packages/close-call/       Decimal, clawback fee, risk ledger, trade terms and
 packages/strategy/         indicator maths, the five profiles, the deterministic
                            gate, the group runner, parameter bounds
 packages/technocore/       client, protocol, room reader/writer, cursor store,
-                           referee verifier, archive, retry, package pin
+                           referee verifier, archive, challenge archive, retry,
+                           package pin
 packages/storage/          SQLite (WAL) schema, repositories, retention, backup
-tests/                     27 files covering the invariants above
+tests/                     39 files covering the invariants above
 scripts/                   build, verify-all, soak-test, cost-report, disk-report,
                            generate-identities, verify-backup
 reference/                 the vendored, hash-pinned official artifacts
