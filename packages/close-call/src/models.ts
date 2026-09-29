@@ -222,16 +222,49 @@ export function parseRefereeMessage(text: string): { kind: RoomMessageKind; valu
 /**
  * The market view a strategy evaluates against. Built only from verified
  * referee posts; a snapshot with `degraded` set must never widen risk.
+ *
+ * The price post carries five numbers, and they are not interchangeable:
+ *
+ *   - `applied`   the reference *this* sweep's trades were checked against. It
+ *                 was posted by the previous sweep, so it prices history, never
+ *                 a trade we are about to post.
+ *   - `ref.px`    this sweep's closing price. It prices this sweep's fees and
+ *                 clawback, and it is the baseline the *next* sweep's limits are
+ *                 built from.
+ *   - `limits`    the band the referee will enforce on the next sweep.
+ *   - `for`       the sweep those limits apply to, normally `n + 1`.
+ *   - `age_s`     seconds from `ref.time` to this sweep's close.
+ *
+ * `reference` and `limits` are kept as the names the strategy layer already
+ * reads. They deliberately mean `close` and `nextLimits`: a new offer settles in
+ * the *next* sweep, so it is priced around this sweep's close and bounded by the
+ * published next-sweep band. The historical reference is `appliedReference`, and
+ * it is exposed separately so the two are never confused again.
  */
 export interface MarketSnapshot {
   sweep: number;
-  /** The reference the referee posted: prices this sweep's fees, sets next limits. */
+  /** `price.applied`: the reference this sweep's trades used. */
+  appliedReference: Decimal | null;
+  /** `price.ref.px`: this sweep's close. Prices fees/clawback; sets next limits. */
+  close: Decimal | null;
+  /** `price.limits`: the published band for the next sweep. */
+  nextLimits: { low: Decimal; high: Decimal } | null;
+  /** `price.for`: the sweep `nextLimits` apply to. Null when the post omits it. */
+  limitsForSweep: number | null;
+  /** Alias of `close`: the price a new offer is measured against. */
   reference: Decimal | null;
+  /** Alias of `nextLimits`: the band a new offer must sit inside. */
   limits: { low: Decimal; high: Decimal } | null;
-  /** Reference prices oldest-first, most recent last. */
+  /** Closing prices oldest-first, most recent last. */
   history: Decimal[];
   globalPx: Decimal | null;
   ageSeconds: number | null;
+  /**
+   * True when the reference is older than the configured maximum. The official
+   * reference is never rewritten or back-adjusted; a stale feed only stops us
+   * from adding risk.
+   */
+  staleReference: boolean;
   locked: boolean;
   /** True when the reader is in conservative mode (gap, reset, omitted flow). */
   degraded: boolean;
@@ -243,11 +276,16 @@ export interface MarketSnapshot {
 export function emptySnapshot(): MarketSnapshot {
   return {
     sweep: 0,
+    appliedReference: null,
+    close: null,
+    nextLimits: null,
+    limitsForSweep: null,
     reference: null,
     limits: null,
     history: [],
     globalPx: null,
     ageSeconds: null,
+    staleReference: false,
     locked: false,
     degraded: true,
     degradedReason: 'no referee data yet',

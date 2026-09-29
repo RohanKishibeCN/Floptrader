@@ -56,7 +56,14 @@ function pricePayload(patch: Partial<RefereePrice> = {}): RefereePrice {
 }
 
 function priceAt(n: number, px: string, limits: [string, string] = ['211.86', '234.16']): RefereePrice {
-  return pricePayload({ n, ref: { px, tid: 444195233496965, time: '2026-09-28T08:40:00Z' }, limits });
+  // `for` names the sweep the published limits apply to: the next one. The live
+  // referee always sends it, and the verifier refuses a band aimed elsewhere.
+  return pricePayload({
+    n,
+    ref: { px, tid: 444195233496965, time: '2026-09-28T08:40:00Z' },
+    limits,
+    for: n + 1,
+  });
 }
 
 function flowPayload(n: number, dids: string[]): RefereeFlow {

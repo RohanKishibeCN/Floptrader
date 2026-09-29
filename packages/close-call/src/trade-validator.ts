@@ -16,7 +16,7 @@ import { Decimal } from './decimal.js';
 import { TradeTerms } from './models.js';
 import { sideFees, worstCaseSideFee } from './fee.js';
 import { fundsReason, RiskAccount } from './risk.js';
-import { Rules, SEASON, withinLimits } from './rules.js';
+import { Rules, SEASON, withinLimits, withinPublishedLimits } from './rules.js';
 import { checkTermsShape } from './terms.js';
 import { verifyMakerSignature, verifyTakerSignature } from './trade-signing.js';
 
@@ -34,6 +34,8 @@ export type TradeRefusal =
   | 'self_trade'
   | 'local_did'
   | 'conservative'
+  | 'stale_reference'
+  | 'external_cap'
   | 'not_ours';
 
 export interface TradeVerdict {
@@ -52,8 +54,24 @@ export interface TradeValidationContext {
   rules: Rules;
   /** The sweep in which this trade would settle. */
   sweep: number;
-  /** The reference the previous sweep posted; sets this sweep's limits. */
+  /**
+   * The reference a *new* trade is measured against: the previous sweep's close.
+   * Used only to fall back on when the referee has not published a band.
+   */
   reference: Decimal | null;
+  /**
+   * The band the referee published for the sweep this trade would settle in.
+   *
+   * This is authoritative and preferred over recomputing `reference ± 5%`: the
+   * referee enforces exactly the numbers it posted, and a locally rebuilt band
+   * can disagree at the cent.
+   */
+  nextLimits?: { low: Decimal; high: Decimal } | null;
+  /**
+   * The reference this sweep's *already-settled* trades were checked against
+   * (`price.applied`). Historical verification only; a new trade never uses it.
+   */
+  appliedReference?: Decimal | null;
   /**
    * This sweep's closing price, which prices the clawback. Null means "not known
    * yet"; `validateExternalOffer` then bounds the taker's fee by the worst case
@@ -68,6 +86,28 @@ export interface TradeValidationContext {
   accounts: Map<string, RiskAccount>;
   /** True when the reader is degraded; no new active risk. */
   conservative: boolean;
+  /**
+   * True when the official reference is older than the configured maximum.
+   *
+   * The reference is *not* rewritten — it is still what the referee enforces —
+   * but a feed that has gone quiet is no basis for adding risk, so new active
+   * offers stop until a fresh price post arrives. See `stale-reference.ts`.
+   */
+  staleReference?: boolean;
+  /**
+   * The hard bounds on any single external offer we countersign.
+   *
+   * Taking a stranger's offer is the one path where a number we did not choose
+   * becomes our position, so it gets its own ceilings rather than only the local
+   * risk caps. `clawbackBuffer` is the margin kept on top of the *worst case*
+   * fee: the close is unknown when we countersign, so pricing the fee exactly
+   * would leave nothing for the sweep that actually settles it.
+   */
+  externalOfferLimits?: {
+    maxQty: Decimal;
+    maxNotional: Decimal;
+    clawbackBuffer: Decimal;
+  } | null;
   /**
    * Whether a trade between two of our own DIDs should be refused. It is always
    * true for the orchestrator: 150 owners trading with each other moves no value
@@ -84,6 +124,24 @@ export interface TradeCandidate {
   taker: string;
   maker_sig: string;
   taker_sig: string;
+}
+
+/**
+ * Is `px` inside the band the referee will enforce on the settlement sweep?
+ *
+ * The published pair is preferred whenever it exists: it is the number the
+ * referee actually checks, and rebuilding `reference ± 5%` locally can differ by
+ * a cent — always in the direction that gets a trade voided. Only a price post
+ * that carried no band falls back to the local window.
+ */
+function withinSettlementBand(
+  context: TradeValidationContext,
+  px: Decimal,
+  reference: Decimal,
+): boolean {
+  const limits = context.nextLimits ?? null;
+  if (limits !== null) return withinPublishedLimits(px, limits);
+  return withinLimits(context.rules, px, reference);
 }
 
 export function validateTrade(candidate: TradeCandidate, context: TradeValidationContext): TradeVerdict {
@@ -146,10 +204,10 @@ export function validateTrade(candidate: TradeCandidate, context: TradeValidatio
     return refuse('limits', 'no reference price from the previous sweep: cannot price the limits');
   }
   const px = Decimal.from(terms.px);
-  if (!withinLimits(context.rules, px, context.reference)) {
+  if (!withinSettlementBand(context, px, context.reference)) {
     return refuse(
       'limits',
-      `px ${terms.px} is outside ${context.reference} ± ${context.rules.limitWindow.mul(context.reference)}`,
+      `px ${terms.px} is outside the referee's published band for sweep ${context.sweep}`,
     );
   }
   const close = context.close ?? context.reference;
@@ -168,6 +226,9 @@ export function validateTrade(candidate: TradeCandidate, context: TradeValidatio
   });
   if (funds) return refuse('funds', 'a side cannot cover the price of the contracts it opens plus its fee');
 
+  if (context.staleReference) {
+    return refuse('stale_reference', 'the referee reference is stale: no new active risk');
+  }
   if (context.conservative) {
     return refuse('conservative', 'reader is degraded: no new active risk');
   }
@@ -220,10 +281,28 @@ export function validateExternalOffer(
     return refuse('limits', 'no reference price: cannot price the limits');
   }
   const px = Decimal.from(terms.px);
-  if (!withinLimits(context.rules, px, context.reference)) {
-    return refuse('limits', `px ${terms.px} is outside the 5% window around ${context.reference}`);
+  if (!withinSettlementBand(context, px, context.reference)) {
+    return refuse(
+      'limits',
+      `px ${terms.px} is outside the referee's published band for sweep ${context.sweep}`,
+    );
   }
   const qty = Decimal.from(terms.qty);
+  const notional = qty.mul(px);
+
+  // The offer-specific ceilings. A cap violation is a refusal we can see coming,
+  // which is strictly better than a position we only discover when it settles.
+  const limits = context.externalOfferLimits ?? null;
+  if (limits !== null && qty.gt(limits.maxQty)) {
+    return refuse('external_cap', `qty ${terms.qty} exceeds the external-offer cap ${limits.maxQty}`);
+  }
+  if (limits !== null && notional.gt(limits.maxNotional)) {
+    return refuse(
+      'external_cap',
+      `notional ${notional.toString()} exceeds the external-offer cap ${limits.maxNotional}`,
+    );
+  }
+
   // We are the taker, so our side is the opposite of the maker's.
   const ourSide = terms.side === 'buy' ? 'sell' : 'buy';
   // `close` is the sweep's closing price, and the referee publishes it when the
@@ -233,12 +312,19 @@ export function validateExternalOffer(
   // strictly worse than a refusal we can see coming.
   const ourFee =
     context.close === null
-      ? worstCaseSideFee(ourSide, qty, px, context.reference, context.rules.feeRate)
+      ? worstCaseSideFee(ourSide, qty, px, context.nextLimits?.high ?? context.reference, context.rules.feeRate)
       : sideFees(terms.side, qty, px, context.close, context.rules.feeRate).taker;
+  const buffer = limits?.clawbackBuffer ?? Decimal.zero();
   const ourAccount = context.accounts.get(context.takerDid);
   if (!ourAccount) return refuse('funds', 'our account is not funded yet');
-  if (ourAccount.opening(ourSide === 'buy' ? 1 : -1, qty).mul(px).add(ourFee).gt(ourAccount.cash)) {
-    return refuse('funds', 'we cannot cover the contracts this offer opens plus our fee');
+  if (ourAccount.opening(ourSide === 'buy' ? 1 : -1, qty).mul(px).add(ourFee).add(buffer).gt(ourAccount.cash)) {
+    return refuse(
+      'funds',
+      'we cannot cover the contracts this offer opens plus the worst-case fee and its buffer',
+    );
+  }
+  if (context.staleReference) {
+    return refuse('stale_reference', 'the referee reference is stale: no new active risk');
   }
   if (context.conservative) {
     return refuse('conservative', 'reader is degraded: no new active risk');

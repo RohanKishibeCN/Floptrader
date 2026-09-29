@@ -9,6 +9,7 @@
  *     2 vCPU / 4 GB VPS shared with other tenants.
  */
 import { z } from 'zod';
+import { Decimal } from '@flop/close-call';
 import { AGENTS_PER_GROUP, DEFAULT_AGENT_COUNT, STRATEGY_GROUPS } from '@flop/identity';
 
 const boolish = z
@@ -156,6 +157,39 @@ export const EnvSchema = z.object({
   UPSTREAM_BRANCH: z.string().default('main'),
   UPSTREAM_GITHUB_TOKEN: z.string().default(''),
 
+  // ---- stale reference ----------------------------------------------------
+  /**
+   * How old `age_s` may get before the official reference counts as stale.
+   *
+   * The reference is never rewritten when it goes stale — the referee still
+   * enforces it — so crossing this only stops us from *adding* risk.
+   */
+  MAX_REFERENCE_AGE_SECONDS: intString(60),
+  STALE_REFERENCE_MODE: z.enum(['off', 'no_new_active_trade']).default('no_new_active_trade'),
+
+  // ---- external offers ----------------------------------------------------
+  /** The largest quantity we will ever countersign on a stranger's offer. */
+  MAX_EXTERNAL_OFFER_QTY: z.string().default('15'),
+  /** The largest notional (qty * px) we will ever countersign. */
+  MAX_EXTERNAL_OFFER_NOTIONAL: z.string().default('4500'),
+  /**
+   * Margin kept on top of the *worst-case* fee on an external offer.
+   *
+   * The close is unknown when we countersign, so the fee we will actually pay is
+   * only bounded, not known. Reserving a little more than that bound is what
+   * keeps a settled trade from being voided for `funds`.
+   */
+  MAX_CLAWBACK_BUFFER: z.string().default('50'),
+
+  // ---- rooms --------------------------------------------------------------
+  /** Cap on dynamically discovered owner rooms; beyond this, alert and stop. */
+  MAX_DISCOVERED_ROOMS: intString(50),
+
+  // ---- challenge sweep archive -------------------------------------------
+  /** The published sweep-record archive; an audit source, never an authority. */
+  CHALLENGE_ARCHIVE_BASE_URL: z.string().default('https://challenges.technocore.chat/close-1'),
+  ARCHIVE_CHECK_INTERVAL_MINUTES: intString(15),
+
   // ---- health -------------------------------------------------------------
   HEALTH_PORT: intString(8_780),
   HEALTH_HOST: z.string().default('127.0.0.1'),
@@ -256,6 +290,14 @@ export interface Config {
     branch: string;
     githubToken: string;
   };
+  /** Risk knobs that are not part of the frozen contest rules. */
+  risk: {
+    maxReferenceAgeSeconds: number;
+    staleReferenceMode: 'off' | 'no_new_active_trade';
+    externalOffer: { maxQty: Decimal; maxNotional: Decimal; clawbackBuffer: Decimal };
+  };
+  roomDiscovery: { maxRooms: number };
+  archive: { baseUrl: string; checkIntervalMinutes: number };
   health: { port: number; host: string };
   loadGuard: {
     rssPausePercent: number;
@@ -387,6 +429,31 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     (value) => value.trim().length > 0,
   );
 
+  // The external-offer ceilings are numbers, not strings, by the time the trade
+  // path sees them; a typo has to fail at startup rather than at the first offer.
+  const decimal = (name: string, value: string): Decimal => {
+    try {
+      return Decimal.from(value);
+    } catch {
+      throw new ConfigError(`${name} is not a decimal number: ${value}`);
+    }
+  };
+  const externalOfferMaxQty = decimal('MAX_EXTERNAL_OFFER_QTY', raw.MAX_EXTERNAL_OFFER_QTY);
+  const externalOfferMaxNotional = decimal('MAX_EXTERNAL_OFFER_NOTIONAL', raw.MAX_EXTERNAL_OFFER_NOTIONAL);
+  const clawbackBuffer = decimal('MAX_CLAWBACK_BUFFER', raw.MAX_CLAWBACK_BUFFER);
+  if (!externalOfferMaxQty.isPositive()) {
+    throw new ConfigError('MAX_EXTERNAL_OFFER_QTY must be positive');
+  }
+  if (!externalOfferMaxNotional.isPositive()) {
+    throw new ConfigError('MAX_EXTERNAL_OFFER_NOTIONAL must be positive');
+  }
+  if (clawbackBuffer.isNegative()) {
+    throw new ConfigError('MAX_CLAWBACK_BUFFER must not be negative');
+  }
+  if (raw.MAX_DISCOVERED_ROOMS < 1) {
+    throw new ConfigError('MAX_DISCOVERED_ROOMS must be at least 1');
+  }
+
   const dataDir = raw.DATA_DIR.replace(/\/+$/, '');
   return {
     nodeEnv: raw.NODE_ENV,
@@ -467,6 +534,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       repo: raw.UPSTREAM_REPO,
       branch: raw.UPSTREAM_BRANCH,
       githubToken: raw.UPSTREAM_GITHUB_TOKEN,
+    },
+    risk: {
+      maxReferenceAgeSeconds: raw.MAX_REFERENCE_AGE_SECONDS,
+      staleReferenceMode: raw.STALE_REFERENCE_MODE,
+      externalOffer: {
+        maxQty: externalOfferMaxQty,
+        maxNotional: externalOfferMaxNotional,
+        clawbackBuffer,
+      },
+    },
+    roomDiscovery: { maxRooms: raw.MAX_DISCOVERED_ROOMS },
+    archive: {
+      baseUrl: raw.CHALLENGE_ARCHIVE_BASE_URL.replace(/\/+$/, ''),
+      checkIntervalMinutes: raw.ARCHIVE_CHECK_INTERVAL_MINUTES,
     },
     health: { port: raw.HEALTH_PORT, host: raw.HEALTH_HOST },
     loadGuard: {

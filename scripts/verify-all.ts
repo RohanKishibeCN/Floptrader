@@ -396,6 +396,8 @@ await check('a fresh database gets every table the code expects', () => {
       'lark_outbox',
       'upstream_events',
       'archive_manifests',
+      'room_registry',
+      'referee_anomalies',
       'events',
     ];
     const missing = required.filter((table) => !tables.has(table));

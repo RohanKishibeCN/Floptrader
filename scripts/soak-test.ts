@@ -28,7 +28,12 @@
 import { writeFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { join } from 'node:path';
-import { buildHarness, REFERENCE_CONTEST_PATH, type Harness } from '../tests/support/orchestrator.js';
+import {
+  buildHarness,
+  HARNESS_PACKAGE_HASH,
+  REFERENCE_CONTEST_PATH,
+  type Harness,
+} from '../tests/support/orchestrator.js';
 import { FakeTransport } from '../tests/support/fake-transport.js';
 import { cleanup, tempDir } from '../tests/support/harness.js';
 import type { WsFactory, WsTransportOptions } from '../apps/orchestrator/src/lark.js';
@@ -50,7 +55,15 @@ const TICKS = Number.parseInt(flag('ticks') ?? (quick ? '36' : '288'), 10);
 const SWEEP_SECONDS = 300;
 const OUT = flag('out');
 
-const PACKAGE_HASH = 'b'.repeat(64);
+/**
+ * The seed this run agrees with, and the one it later drifts to.
+ *
+ * `PACKAGE_HASH` has to be the hash the harness actually pinned — the real
+ * sha256 of the vendored manifest — or the very first seed reads as drift and the
+ * whole run becomes a test of conservative mode rather than of the trade path.
+ * `DRIFTED_HASH` is deliberately a hash nothing pins, so the drift event is real.
+ */
+const PACKAGE_HASH = HARNESS_PACKAGE_HASH;
 const DRIFTED_HASH = 'c'.repeat(64);
 
 /** Scripted events, as tick indices. */

@@ -1444,6 +1444,137 @@ export class EventRepository {
   }
 }
 
+/**
+ * The room listing the referee maintains (rule 5, as the live service applies it).
+ *
+ * `close1` never leaves the list, so its row is written once and never unlisted.
+ * A dynamically discovered owner room is listed while it carries activity and
+ * unlisted 12 sweeps after the last one — read back from the flow post's
+ * `unlisted` list rather than guessed from silence.
+ */
+export interface RoomRegistryRow {
+  room: string;
+  listed: number;
+  last_activity_sweep: number | null;
+  unlisted_at: string | null;
+  last_seen_at: string | null;
+  source: string;
+  updated_at: string;
+}
+
+export class RoomRegistryRepository {
+  constructor(private readonly db: SqliteDatabase) {}
+
+  upsert(row: {
+    room: string;
+    listed: boolean;
+    lastActivitySweep?: number | null;
+    unlistedAt?: string | null;
+    lastSeenAt?: string | null;
+    source: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO room_registry
+           (room, listed, last_activity_sweep, unlisted_at, last_seen_at, source, updated_at)
+         VALUES (@room, @listed, @lastActivitySweep, @unlistedAt, @lastSeenAt, @source, @updated_at)
+         ON CONFLICT(room) DO UPDATE SET
+           listed = excluded.listed,
+           last_activity_sweep = COALESCE(excluded.last_activity_sweep, room_registry.last_activity_sweep),
+           unlisted_at = excluded.unlisted_at,
+           last_seen_at = excluded.last_seen_at,
+           source = excluded.source,
+           updated_at = excluded.updated_at`,
+      )
+      .run({
+        room: row.room,
+        listed: row.listed ? 1 : 0,
+        lastActivitySweep: row.lastActivitySweep ?? null,
+        unlistedAt: row.unlistedAt ?? null,
+        lastSeenAt: row.lastSeenAt ?? null,
+        source: row.source,
+        updated_at: nowIso(),
+      });
+  }
+
+  markUnlisted(room: string, at: string): void {
+    this.db
+      .prepare('UPDATE room_registry SET listed = 0, unlisted_at = ?, updated_at = ? WHERE room = ?')
+      .run(at, nowIso(), room);
+  }
+
+  get(room: string): RoomRegistryRow | undefined {
+    return this.db.prepare('SELECT * FROM room_registry WHERE room = ?').get(room) as
+      | RoomRegistryRow
+      | undefined;
+  }
+
+  listListed(): RoomRegistryRow[] {
+    return this.db
+      .prepare('SELECT * FROM room_registry WHERE listed = 1 ORDER BY room ASC')
+      .all() as RoomRegistryRow[];
+  }
+
+  count(): number {
+    return (this.db.prepare('SELECT COUNT(*) AS n FROM room_registry').get() as { n: number }).n;
+  }
+}
+
+/**
+ * Everything the referee's flow post says it could not deliver.
+ *
+ * `omitted` (a list was cut for length), `missed` (messages it never read) and
+ * `unlisted` (rooms it stopped reading) are all recorded, never inferred. The
+ * distinction that matters operationally is that none of them is a failure: a
+ * gap in our record is a gap, not a verdict, and the archive is what fills it.
+ */
+export interface RefereeAnomalyRow {
+  id: number;
+  sweep: number | null;
+  room: string | null;
+  kind: string;
+  raw_payload: string | null;
+  affected_count: number;
+  created_at: string;
+}
+
+export class RefereeAnomalyRepository {
+  constructor(private readonly db: SqliteDatabase) {}
+
+  record(row: {
+    sweep: number | null;
+    room: string | null;
+    kind: string;
+    rawPayload?: unknown;
+    affectedCount?: number;
+  }): number {
+    const info = this.db
+      .prepare(
+        `INSERT INTO referee_anomalies (sweep, room, kind, raw_payload, affected_count, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        row.sweep,
+        row.room,
+        row.kind,
+        row.rawPayload === undefined ? null : JSON.stringify(row.rawPayload),
+        row.affectedCount ?? 0,
+        nowIso(),
+      );
+    return Number(info.lastInsertRowid);
+  }
+
+  byKind(kind: string): RefereeAnomalyRow[] {
+    return this.db
+      .prepare('SELECT * FROM referee_anomalies WHERE kind = ? ORDER BY id ASC')
+      .all(kind) as RefereeAnomalyRow[];
+  }
+
+  count(): number {
+    return (this.db.prepare('SELECT COUNT(*) AS n FROM referee_anomalies').get() as { n: number }).n;
+  }
+}
+
 export interface Repositories {
   /**
    * Run `work` inside one SQLite transaction.
@@ -1470,6 +1601,8 @@ export interface Repositories {
   larkOutbox: LarkOutboxRepository;
   upstream: UpstreamRepository;
   archiveManifests: ArchiveManifestRepository;
+  roomRegistry: RoomRegistryRepository;
+  refereeAnomalies: RefereeAnomalyRepository;
   events: EventRepository;
 }
 
@@ -1492,6 +1625,8 @@ export function createRepositories(db: SqliteDatabase): Repositories {
     larkOutbox: new LarkOutboxRepository(db),
     upstream: new UpstreamRepository(db),
     archiveManifests: new ArchiveManifestRepository(db),
+    roomRegistry: new RoomRegistryRepository(db),
+    refereeAnomalies: new RefereeAnomalyRepository(db),
     events: new EventRepository(db),
   };
 }

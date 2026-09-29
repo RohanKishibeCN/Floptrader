@@ -27,7 +27,9 @@ import {
   isLocked,
   parseTradeMessage,
   withinLimits,
+  withinPublishedLimits,
   type MarketSnapshot,
+  type RefereeFlow,
   type Rules,
   type TradeTerms,
 } from '@flop/close-call';
@@ -73,6 +75,11 @@ export interface ReaderOptions {
    * value from config, where the default is `true`.
    */
   requireRefereePin?: boolean;
+  /** How long `age_s` may get before the reference counts as stale. */
+  maxReferenceAgeSeconds?: number;
+  staleReferenceMode?: 'off' | 'no_new_active_trade';
+  /** Cap on listed rooms; beyond it the reader alerts and keeps the fixed set. */
+  maxDiscoveredRooms?: number;
   now?: () => Date;
 }
 
@@ -101,6 +108,33 @@ export function roomsFor(rules: Rules): string[] {
   return [...new Set([...ordered, rules.tradingRoom || TRADING_ROOM])];
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : value === undefined || value === null ? [] : [value];
+}
+
+/**
+ * The room a flow-post list entry names.
+ *
+ * The published post uses bare strings; the live one has been seen wrapping them
+ * in objects. Both are accepted, and anything else is skipped rather than guessed.
+ */
+function roomNameOf(entry: unknown): string | null {
+  if (typeof entry === 'string' && entry.length > 0) return entry;
+  const row = asRecord(entry);
+  if (row === null) return null;
+  for (const key of ['room', 'r', 'name'] as const) {
+    const value = row[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return null;
+}
+
 export class OrchestratorReader {
   readonly verifier: RefereeVerifier;
   readonly roomReader: RoomReader;
@@ -111,6 +145,7 @@ export class OrchestratorReader {
   private readonly localDids: () => Set<string>;
   private readonly now: () => Date;
   private readonly logger: Logger;
+  private readonly maxDiscoveredRooms: number | null;
 
   constructor(options: ReaderOptions) {
     this.rules = options.rules;
@@ -118,6 +153,7 @@ export class OrchestratorReader {
     this.localDids = options.localDids;
     this.now = options.now ?? (() => new Date());
     this.logger = options.logger;
+    this.maxDiscoveredRooms = options.maxDiscoveredRooms ?? null;
 
     const requirePin = options.requireRefereePin === true;
     this.verifier = new RefereeVerifier({
@@ -127,6 +163,8 @@ export class OrchestratorReader {
       expectedRefereeDid: options.expectedRefereeDid ?? null,
       unpinnedPolicy: requirePin ? 'reject' : 'adopt_first_sender',
       requireSeedBeforeState: requirePin,
+      maxReferenceAgeSeconds: options.maxReferenceAgeSeconds,
+      staleReferenceMode: options.staleReferenceMode,
     });
     this.roomReader = new RoomReader({
       client: options.client,
@@ -141,6 +179,29 @@ export class OrchestratorReader {
       localDids: options.localDids,
       now: this.now,
     });
+    this.seedRoomRegistry();
+  }
+
+  /**
+   * Record the rooms we read unconditionally.
+   *
+   * `close1` never leaves the list — the rules say so — and the five referee
+   * rooms are the fixed feed. Seeding them means the registry is a complete view
+   * from the first tick, rather than a list that only knows about rooms the
+   * referee happened to mention.
+   */
+  private seedRoomRegistry(): void {
+    const now = this.now().toISOString();
+    for (const room of roomsFor(this.rules)) {
+      const existing = this.repositories.roomRegistry.get(room);
+      if (existing) continue;
+      this.repositories.roomRegistry.upsert({
+        room,
+        listed: true,
+        lastSeenAt: now,
+        source: room === (this.rules.tradingRoom || TRADING_ROOM) ? 'close1' : 'referee',
+      });
+    }
   }
 
   /**
@@ -203,9 +264,11 @@ export class OrchestratorReader {
       if (local.has(terms.maker)) continue;
       if (local.has(parsed.taker)) continue;
       if (!verifyMakerSignature(terms, parsed.maker_sig)) continue;
-      if (snapshot.reference !== null) {
-        const px = Decimal.from(terms.px);
-        if (!withinLimits(this.rules, px, snapshot.reference)) continue;
+      const px = Decimal.from(terms.px);
+      if (snapshot.nextLimits !== null) {
+        if (!withinPublishedLimits(px, snapshot.nextLimits)) continue;
+      } else if (snapshot.reference !== null && !withinLimits(this.rules, px, snapshot.reference)) {
+        continue;
       }
       if (snapshot.locked) continue;
       if (snapshot.sweep > 0 && snapshot.sweep > terms.until) continue;
@@ -321,6 +384,145 @@ export class OrchestratorReader {
       signature_valid: record.signatureValid ? 1 : 0,
       created_at: now,
     });
+    if (observation.flow !== undefined) this.recordFlowAnomalies(observation.flow, now);
+  }
+
+  /**
+   * Record everything a flow post says the referee could not deliver.
+   *
+   * `unlisted`, `missed` and `omitted` are the referee naming holes in the
+   * record, so they are recorded rather than inferred from silence — and none of
+   * them is a failure. They mean different things: a room to stop reading, a
+   * message that may need re-posting with a fresh nonce, and a list that was cut
+   * for length. An `omitted` id may still exist; a `missed` message may still be
+   * re-posted before the lock.
+   */
+  private recordFlowAnomalies(flow: RefereeFlow, now: string): void {
+    const raw = flow as unknown as Record<string, unknown>;
+
+    // A room registration is activity: the flow post names the rooms it applied.
+    for (const entry of flow.rooms) {
+      const room = roomNameOf(entry);
+      if (room === null) continue;
+      this.repositories.roomRegistry.upsert({
+        room,
+        listed: true,
+        lastActivitySweep: flow.n,
+        lastSeenAt: now,
+        source: 'flow.rooms',
+      });
+    }
+
+    // `unlisted`: the referee stopped reading these rooms at this sweep. Reading
+    // them after this point would collect messages it will never apply.
+    const tradingRoom = this.rules.tradingRoom || TRADING_ROOM;
+    for (const entry of asArray(raw.unlisted)) {
+      const room = roomNameOf(entry);
+      if (room === null) continue;
+      // `close1` never leaves the list. A post that says otherwise is a finding,
+      // and acting on it would drop the owner registrations that live there.
+      if (room === tradingRoom) {
+        this.repositories.refereeAnomalies.record({
+          sweep: flow.n,
+          room,
+          kind: 'room_unlisted',
+          rawPayload: entry,
+          affectedCount: 1,
+        });
+        this.logger.event({
+          level: 'warn',
+          source: 'reader',
+          code: 'room_unlisted',
+          message: `the referee listed ${room} as unlisted at sweep ${flow.n}; ${room} never leaves the list, so it stays`,
+          data: { room, sweep: flow.n, ignored: true },
+        });
+        continue;
+      }
+      this.repositories.roomRegistry.upsert({
+        room,
+        listed: false,
+        unlistedAt: now,
+        lastSeenAt: now,
+        source: 'flow.unlisted',
+      });
+      this.repositories.refereeAnomalies.record({
+        sweep: flow.n,
+        room,
+        kind: 'room_unlisted',
+        rawPayload: entry,
+        affectedCount: 1,
+      });
+      this.logger.event({
+        level: 'info',
+        source: 'reader',
+        code: 'room_unlisted',
+        message: `the referee unlisted ${room} at sweep ${flow.n}`,
+        data: { room, sweep: flow.n },
+      });
+    }
+
+    // `missed`: messages the referee never read. They do not count, so keeping
+    // the payload is what makes a re-post possible with a fresh nonce.
+    const missed = asArray(raw.missed);
+    if (missed.length > 0) {
+      for (const entry of missed) {
+        this.repositories.refereeAnomalies.record({
+          sweep: flow.n,
+          room: roomNameOf(asRecord(entry)?.room ?? entry),
+          kind: 'referee_missed',
+          rawPayload: entry,
+          affectedCount: 1,
+        });
+      }
+      this.logger.event({
+        level: 'warn',
+        source: 'reader',
+        code: 'referee_missed',
+        message: `${missed.length} message(s) went unread by the referee at sweep ${flow.n}`,
+        data: { sweep: flow.n, count: missed.length },
+      });
+    }
+
+    // `omitted`: per-list truncation counts. Never treated as absence.
+    if (raw.omitted !== undefined) {
+      const count = typeof raw.omitted === 'number' ? raw.omitted : asArray(raw.omitted).length;
+      this.repositories.refereeAnomalies.record({
+        sweep: flow.n,
+        room: null,
+        kind: 'referee_omitted',
+        rawPayload: raw.omitted,
+        affectedCount: count,
+      });
+      this.logger.event({
+        level: 'info',
+        source: 'reader',
+        code: 'referee_omitted',
+        message: `the referee omitted ${count} entr(ies) from the sweep ${flow.n} post`,
+        data: { sweep: flow.n, omitted: raw.omitted },
+      });
+    }
+
+    if (this.maxDiscoveredRooms !== null) {
+      const listed = this.repositories.roomRegistry.listListed();
+      if (listed.length > this.maxDiscoveredRooms) {
+        this.repositories.refereeAnomalies.record({
+          sweep: flow.n,
+          room: null,
+          kind: 'room_overflow',
+          rawPayload: { listed: listed.length },
+          affectedCount: listed.length,
+        });
+        this.logger.event({
+          level: 'warn',
+          source: 'reader',
+          code: 'room_overflow',
+          message:
+            `${listed.length} rooms are listed, above the cap of ${this.maxDiscoveredRooms}; ` +
+            'the fixed referee set is unchanged',
+          data: { listed: listed.length, cap: this.maxDiscoveredRooms },
+        });
+      }
+    }
   }
 
   private persistSweepState(snapshot: MarketSnapshot): void {

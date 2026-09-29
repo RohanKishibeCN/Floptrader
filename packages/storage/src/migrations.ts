@@ -346,6 +346,49 @@ export const MIGRATIONS: Migration[] = [
        )`,
     ],
   },
+  {
+    version: 2,
+    name: 'room-registry-anomalies-and-funds-side',
+    statements: [
+      // ---- room listing (rule 5, as the live referee applies it) ----------
+      // A room is listed at the sweep that registers it, kept while owners post
+      // activity into it, and taken off the list 12 sweeps after the last such
+      // activity. `close1` never leaves the list. Offers and chatter are not
+      // activity, so they never extend a room's life here either.
+      `CREATE TABLE IF NOT EXISTS room_registry (
+         room TEXT PRIMARY KEY,
+         listed INTEGER NOT NULL DEFAULT 1,
+         last_activity_sweep INTEGER,
+         unlisted_at TEXT,
+         last_seen_at TEXT,
+         source TEXT NOT NULL,
+         updated_at TEXT NOT NULL
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_room_registry_listed ON room_registry(listed, last_activity_sweep)`,
+
+      // ---- referee anomalies: omitted, missed, unlisted --------------------
+      // `omitted` counts entries a flow post could not fit; `missed` names
+      // messages the referee never read; `unlisted` names rooms it stopped
+      // reading. None of the three is a failure, so they are recorded rather
+      // than inferred from an absence.
+      `CREATE TABLE IF NOT EXISTS referee_anomalies (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         sweep INTEGER,
+         room TEXT,
+         kind TEXT NOT NULL,
+         raw_payload TEXT,
+         affected_count INTEGER NOT NULL DEFAULT 0,
+         created_at TEXT NOT NULL
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_referee_anomalies_kind ON referee_anomalies(kind, sweep)`,
+
+      // ---- funds side: the referee names a reason, never a side ------------
+      `ALTER TABLE trades ADD COLUMN referee_reason TEXT`,
+      `ALTER TABLE trades ADD COLUMN referee_funds_side TEXT`,
+      `ALTER TABLE trades ADD COLUMN local_funds_side TEXT`,
+      `ALTER TABLE trades ADD COLUMN funds_side_confidence TEXT`,
+    ],
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;

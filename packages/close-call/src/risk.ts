@@ -142,6 +142,75 @@ export function fundsReason(params: {
   return maker.cash.lt(makerNeeds) || taker.cash.lt(takerNeeds) ? 'funds' : null;
 }
 
+/**
+ * Which side a `funds` void belongs to, and how much we can trust that answer.
+ *
+ * The referee says only `funds`. It never names the side — one word for "somebody
+ * could not cover it". So `refereeFundsSide` is always `unknown`, and anything
+ * more specific is a *local reconstruction* that the Lark report must label as
+ * such. Getting this wrong in a report is how an operator ends up blaming an
+ * owner who was never short.
+ */
+export type FundsSide = 'maker' | 'taker' | 'both' | 'unknown';
+export type FundsSideConfidence = 'high' | 'medium' | 'unknown';
+
+export interface FundsSideAssessment {
+  /** The one reason the referee gives. Null when it gave none. */
+  refereeReason: 'funds' | null;
+  /** Always `unknown`: the referee's post does not distinguish the two sides. */
+  refereeFundsSide: 'unknown';
+  /** Our own reconstruction from the balances we can see. */
+  localFundsSide: FundsSide;
+  /**
+   * `high` when both sides' balances are known and exactly one (or both) is
+   * short; `medium` when neither we can see is short, which means the referee
+   * saw something we could not; `unknown` when a balance is missing entirely.
+   */
+  fundsSideConfidence: FundsSideConfidence;
+}
+
+/**
+ * Reconstruct which side a `funds` void belonged to, locally.
+ *
+ * This never overrides the referee: it explains the referee's verdict, and the
+ * confidence says how far the explanation can be pushed.
+ */
+export function assessFundsSide(params: {
+  maker: RiskAccount | undefined;
+  taker: RiskAccount | undefined;
+  side: 'buy' | 'sell';
+  qty: Decimal;
+  px: Decimal;
+  makerFee: Decimal;
+  takerFee: Decimal;
+  /** Overrides `authority` when this is a refund of our own assessment. */
+  authority?: 'referee' | 'local';
+}): FundsSideAssessment {
+  const base = {
+    refereeReason: (params.authority === 'local' ? null : 'funds') as 'funds' | null,
+    refereeFundsSide: 'unknown' as const,
+  };
+  if (!params.maker || !params.taker) {
+    return { ...base, localFundsSide: 'unknown', fundsSideConfidence: 'unknown' };
+  }
+  const sign = sideSign(params.side);
+  const makerShort = params.maker.cash.lt(
+    params.maker.opening(sign, params.qty).mul(params.px).add(params.makerFee),
+  );
+  const takerShort = params.taker.cash.lt(
+    params.taker.opening((sign * -1) as 1 | -1, params.qty).mul(params.px).add(params.takerFee),
+  );
+  const localFundsSide: FundsSide =
+    makerShort && takerShort ? 'both' : makerShort ? 'maker' : takerShort ? 'taker' : 'unknown';
+  return {
+    ...base,
+    localFundsSide,
+    // Neither side short locally but the referee voided it: our mirror is behind
+    // the referee's ledger, so the reconstruction is not trustworthy.
+    fundsSideConfidence: localFundsSide === 'unknown' ? 'medium' : 'high',
+  };
+}
+
 /** Local per-agent caps. These are the hard limits; strategies stay inside them. */
 export interface RiskCaps {
   /** Largest single trade quantity. */

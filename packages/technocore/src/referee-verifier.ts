@@ -96,6 +96,16 @@ export interface RefereeVerifierOptions {
    * valid signature establish the reference the strategy layer then trades on.
    */
   requireSeedBeforeState?: boolean;
+  /**
+   * How old `age_s` may get before the reference counts as stale.
+   *
+   * The official reference is never rewritten when it goes stale — it is still
+   * the number the referee will enforce. Staleness only stops us from *adding*
+   * risk: no new maker offers, and external offers only when they stay cheap.
+   */
+  maxReferenceAgeSeconds?: number;
+  /** `off` disables the staleness signal entirely, for fixtures and dry runs. */
+  staleReferenceMode?: 'off' | 'no_new_active_trade';
 }
 
 interface SweepLedger {
@@ -120,6 +130,8 @@ export class RefereeVerifier {
   private readonly maxReferenceJump: Decimal;
   private readonly unpinnedPolicy: 'adopt_first_sender' | 'reject';
   private readonly requireSeedBeforeState: boolean;
+  private readonly maxReferenceAgeSeconds: number;
+  private readonly staleReferenceMode: 'off' | 'no_new_active_trade';
   private refereeDid: string | null;
   private packageHash: string | null = null;
   private expectedPackageHash: string | null;
@@ -127,8 +139,14 @@ export class RefereeVerifier {
   private readonly sweeps = new Map<number, SweepLedger>();
   private readonly referenceHistory: Decimal[] = [];
   private currentSweep: number | null = null;
+  /** `price.applied`: the reference this sweep's trades were checked against. */
+  private appliedReference: Decimal | null = null;
+  /** `price.ref.px`: this sweep's close, and the baseline new offers sit around. */
   private reference: Decimal | null = null;
+  /** `price.limits`: the band published for the next sweep. */
   private limits: { low: Decimal; high: Decimal } | null = null;
+  /** `price.for`: the sweep `limits` apply to. */
+  private limitsForSweep: number | null = null;
   private globalPx: Decimal | null = null;
   private ageSeconds: number | null = null;
   private finalPx: Decimal | null = null;
@@ -136,6 +154,7 @@ export class RefereeVerifier {
   private readonly conservativeReasons = new Set<string>();
   private lastRefereeSeq: number | null = null;
   private lastPostAt: string | null = null;
+  private staleLogged = false;
 
   constructor(options: RefereeVerifierOptions) {
     this.rules = options.rules;
@@ -145,6 +164,8 @@ export class RefereeVerifier {
     this.maxReferenceJump = Decimal.from(String(options.maxReferenceJump ?? MAX_REFERENCE_MOVE));
     this.unpinnedPolicy = options.unpinnedPolicy ?? 'adopt_first_sender';
     this.requireSeedBeforeState = options.requireSeedBeforeState ?? false;
+    this.maxReferenceAgeSeconds = options.maxReferenceAgeSeconds ?? 60;
+    this.staleReferenceMode = options.staleReferenceMode ?? 'no_new_active_trade';
   }
 
   get state(): {
@@ -153,7 +174,10 @@ export class RefereeVerifier {
     expectedPackageHash: string | null;
     currentSweep: number | null;
     reference: Decimal | null;
+    appliedReference: Decimal | null;
+    close: Decimal | null;
     limits: { low: Decimal; high: Decimal } | null;
+    limitsForSweep: number | null;
     globalPx: Decimal | null;
     ageSeconds: number | null;
     finalPx: Decimal | null;
@@ -169,7 +193,10 @@ export class RefereeVerifier {
       expectedPackageHash: this.expectedPackageHash,
       currentSweep: this.currentSweep,
       reference: this.reference,
+      appliedReference: this.appliedReference,
+      close: this.reference,
       limits: this.limits,
+      limitsForSweep: this.limitsForSweep,
       globalPx: this.globalPx,
       ageSeconds: this.ageSeconds,
       finalPx: this.finalPx,
@@ -184,19 +211,57 @@ export class RefereeVerifier {
   /** The snapshot the strategy layer consumes. */
   snapshot(now: Date = new Date()): MarketSnapshot {
     const locked = this.currentSweep !== null && isLocked(this.rules, this.currentSweep);
+    const ageSeconds = this.ageSeconds ?? this.secondsSinceLastPost(now);
+    // Only the referee's own `age_s` decides staleness; the elapsed fallback is
+    // informational. A replay read days later would otherwise look stale the
+    // instant it loaded, and a *quiet feed* is a reader-health signal, not
+    // something a price post can express.
+    const staleReference = this.refreshStale(this.ageSeconds);
     return {
       sweep: this.currentSweep ?? 0,
+      appliedReference: this.appliedReference,
+      close: this.reference,
+      nextLimits: this.limits,
+      limitsForSweep: this.limitsForSweep,
       reference: this.reference,
       limits: this.limits,
       history: [...this.referenceHistory],
       globalPx: this.globalPx,
-      ageSeconds: this.ageSeconds ?? this.secondsSinceLastPost(now),
+      ageSeconds,
+      staleReference,
       locked,
       degraded: this.conservative,
       degradedReason: [...this.conservativeReasons].join('; ') || null,
       packageHash: this.packageHash,
       refereeDid: this.refereeDid,
     };
+  }
+
+  /**
+   * Decide whether the reference is stale, and say so once per transition.
+   *
+   * Staleness is a *signal*, not a rewrite: the official reference stands. It
+   * only gates new risk, so `refreshStale` never touches the price itself.
+   */
+  private refreshStale(ageSeconds: number | null): boolean {
+    const stale =
+      this.staleReferenceMode !== 'off' &&
+      this.currentSweep !== null &&
+      ageSeconds !== null &&
+      ageSeconds > this.maxReferenceAgeSeconds;
+    if (stale && !this.staleLogged) {
+      this.staleLogged = true;
+      this.logger.event({
+        level: 'warn',
+        source: 'referee-verifier',
+        code: 'stale_reference',
+        message: `the reference is ${ageSeconds}s old (limit ${this.maxReferenceAgeSeconds}s); no new active risk`,
+        data: { ageSeconds, maxReferenceAgeSeconds: this.maxReferenceAgeSeconds, sweep: this.currentSweep },
+      });
+    } else if (!stale) {
+      this.staleLogged = false;
+    }
+    return stale;
   }
 
   private secondsSinceLastPost(now: Date): number | null {
@@ -442,32 +507,55 @@ export class RefereeVerifier {
     ledger.priceSeen = true;
     this.sweeps.set(sweep, ledger);
 
-    const reference = Decimal.from(price.ref.px);
-    if (!reference.isPositive()) {
-      this.enterConservative('reference_anomaly', `non-positive reference ${price.ref.px}`);
+    // `ref.px` is this sweep's *closing* price — the number that prices the
+    // sweep's fees and sets the next sweep's limits. It is not the reference this
+    // sweep's trades were checked against; that is `applied`.
+    const close = Decimal.from(price.ref.px);
+    if (!close.isPositive()) {
+      this.enterConservative('reference_anomaly', `non-positive close ${price.ref.px}`);
       return;
     }
-    const previous = this.reference;
-    if (previous !== null) {
-      const jump = reference.sub(previous).abs().div(previous);
+
+    // `for` names the sweep the published limits apply to. Normally the next one;
+    // any other value means the band we would enforce is not the band the referee
+    // announced, so we stop trading rather than guess.
+    if (price.for !== undefined && price.for !== sweep + 1) {
+      this.enterConservative(
+        'limits_for_mismatch',
+        `price for sweep ${sweep} carries limits for ${price.for}, expected ${sweep + 1}`,
+      );
+    } else {
+      this.clearConservative('limits_for_mismatch');
+    }
+
+    const previousClose = this.reference;
+    if (previousClose !== null) {
+      const jump = close.sub(previousClose).abs().div(previousClose);
       if (jump.gt(this.maxReferenceJump)) {
         this.enterConservative(
           'reference_jump',
-          `reference moved ${jump.toString()} in one sweep (${previous.toString()} -> ${reference.toString()})`,
+          `close moved ${jump.toString()} in one sweep (${previousClose.toString()} -> ${close.toString()})`,
         );
       } else {
         this.clearConservative('reference_jump');
       }
     }
 
+    // `applied` is the reference this sweep's already-settled trades used. When
+    // the post omits it, the previous sweep's close is the only defensible
+    // stand-in — and it is never back-adjusted onto the new close.
+    this.appliedReference = price.applied !== undefined ? Decimal.from(price.applied) : previousClose;
+    this.limitsForSweep = price.for ?? null;
+
     this.currentSweep = sweep;
-    this.reference = reference;
+    this.reference = close;
     // The published limits are authoritative: the referee enforces exactly these
     // numbers, and recomputing ±5% locally can disagree with them at the cent.
     this.limits = { low: Decimal.from(price.limits[0]), high: Decimal.from(price.limits[1]) };
     this.globalPx = price.global !== undefined ? Decimal.from(price.global) : this.globalPx;
+    // Sticky: a later post that omits `age_s` does not erase the last known one.
     this.ageSeconds = price.age_s ?? this.ageSeconds;
-    this.referenceHistory.push(reference);
+    this.referenceHistory.push(close);
     if (this.referenceHistory.length > 512) this.referenceHistory.shift();
   }
 

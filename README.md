@@ -272,6 +272,62 @@ Three honest caveats about the WebSocket half:
    dialled from this repository. That is the one claim in this README that rests
    on the SDK's documented behaviour rather than on a test.
 
+## Reading the referee
+
+The referee's `price` post carries **four different numbers**, and conflating
+them is the most expensive mistake available here. Per `docs/close-1-referee.md`:
+
+| Field | Meaning | What we do with it |
+| --- | --- | --- |
+| `applied` | the reference *this* sweep's trades were checked against | verified against existing trades only |
+| `ref.px` | this sweep's **close** — prices fees/clawback, sets the next band | stored as `close`, used as the pricing baseline |
+| `limits` | the band the referee will enforce on the **next** sweep | copied verbatim; a new offer is bounded by this, never by a locally rebuilt ±5% |
+| `for` | the sweep `limits` apply to | must equal `n + 1`; any other value is `limits_for_mismatch` → conservative mode |
+| `age_s` | seconds from `ref.time` to the close | the staleness input, persisted |
+
+`ref.px` is never promoted into the historical reference, and the official
+reference is never rewritten or back-adjusted. When a post omits `applied`, the
+previous close is the only stand-in used.
+
+**Stale reference.** When `age_s > MAX_REFERENCE_AGE_SECONDS` (default 60) the
+snapshot is marked `staleReference`: the official reference still stands and the
+reader keeps reading, but no **new** active maker trade is built and external
+offers are refused. Staleness is derived only from the referee's own `age_s`,
+never from the local clock — a replay read days later is not a stale feed.
+`STALE_REFERENCE_MODE=off` disables the signal for fixtures.
+
+**External offers.** An offer from another owner is refused unless it stays
+inside the published band *and* inside `MAX_EXTERNAL_OFFER_QTY`,
+`MAX_EXTERNAL_OFFER_NOTIONAL`, and a worst-case clawback estimate plus
+`MAX_CLAWBACK_BUFFER`. The future close a new trade settles against is unknown,
+so the estimate is deliberately the pessimistic side; a local estimate passing
+is not a claim that the referee will settle.
+
+**Rooms: unlisted, omitted, missed.** `room_registry` records where a room was
+listed and when it fell off; `referee_anomalies` records every `unlisted`,
+`omitted` and `missed` the referee reports, with the raw payload. `close1` is
+always listed. Only owner registration, room registration and a signed trade
+count as activity — offers and chatter do not. `omitted` means the referee did
+not see the post; it is not `failed` and not `mint_unknown`. `missed` names a
+message the referee did not read; where it involves a local agent the original
+is kept and re-published with a **new nonce**, never the old signed envelope.
+Dynamic room discovery is bounded by `MAX_DISCOVERED_ROOMS`, and exceeding it is
+a `room_overflow` alert rather than an unbounded number of polls.
+
+**Sweep archive.** `CHALLENGE_ARCHIVE_BASE_URL` points at the published archive
+(`.../close-1`). `ArchiveClient` reads `index.json`, `ArchiveVerifier` checks a
+`full` record's bytes against the hash the signed post named and a `redacted`
+record against its own `sha256`, and `ArchiveReconciler` compares local mints
+with the archive's. A 404 is `archive_unavailable`, i.e. a recorded gap — never
+a contest failure — and redacted records cannot restore private-room trade text.
+The archive is an audit aid: it never overwrites a verified Technocore message
+and never marks a mint as failed.
+
+**`reason: funds` is ambiguous.** The referee does not say *which* side was
+short, so `referee_funds_side` is always `unknown`. `trades` also stores a
+locally computed `local_funds_side` and `funds_side_confidence`; the Lark report
+labels it as a local inference, not a referee conclusion.
+
 ## Degradation ladder
 
 The box is shared. Each tier is entered by measurement, and leaving it is

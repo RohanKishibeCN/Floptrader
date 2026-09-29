@@ -58,6 +58,12 @@ export function gateDecision(input: GateInput): GatedAction {
   if (isLocked(rules, context.sweep) || context.market.locked) {
     return { ...base, intent: 'NO_TRADE', side: null, qty: null, px: null, gate: 'locked' };
   }
+  // A stale reference is never rewritten — it is still the number the referee
+  // enforces — but a quiet feed is no basis for adding risk. New offers stop
+  // until a fresh price post arrives; reading continues either way.
+  if (context.market.staleReference) {
+    return { ...base, intent: 'NO_TRADE', side: null, qty: null, px: null, gate: 'stale_reference' };
+  }
   if (context.market.degraded) {
     return {
       ...base,
@@ -166,6 +172,7 @@ export const GATE_REFUSALS = [
   'no_trade',
   'no_reference',
   'locked',
+  'stale_reference',
   'missing_side',
   'missing_offer',
   'qty_below_minimum',

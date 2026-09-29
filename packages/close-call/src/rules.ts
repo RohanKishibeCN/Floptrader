@@ -196,6 +196,22 @@ export function withinLimits(rules: Rules, px: Decimal, reference: Decimal): boo
 }
 
 /**
+ * A price is inside the referee's *published* band when it lies between the two
+ * numbers the post carried.
+ *
+ * This is the authoritative check for a new trade. The referee computes the next
+ * sweep's limits from its own close and publishes them; recomputing `close ± 5%`
+ * locally can disagree with the posted pair at the cent, and the referee enforces
+ * exactly what it published. So the band is compared, never rebuilt.
+ */
+export function withinPublishedLimits(
+  px: Decimal,
+  limits: { low: Decimal; high: Decimal },
+): boolean {
+  return px.gte(limits.low) && px.lte(limits.high);
+}
+
+/**
  * The limits the referee publishes: reference ± 5%, rounded *outward* to the
  * price step so a price the referee accepts is never rejected locally.
  * The posted form is authoritative; this is only used when a price post is

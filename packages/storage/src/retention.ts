@@ -45,6 +45,10 @@ export const PERMANENT_TABLES = [
   'agent_runs',
   'decisions',
   'room_cursors',
+  // Where a room was listed and when it fell off, and every omitted/missed/
+  // unlisted the referee reported: a data gap is evidence about the feed.
+  'room_registry',
+  'referee_anomalies',
 ] as const;
 
 /** Event codes that survive every prune, however old they are. */
@@ -64,6 +68,15 @@ export const PERMANENT_EVENT_CODES = [
   'owner_registration_closed',
   'conservative_mode',
   'human_override',
+  // The live referee's own anomalies. Each one explains a hole in the record, so
+  // losing the row would turn a known gap into an unexplained one.
+  'stale_reference',
+  'limits_for_mismatch',
+  'room_unlisted',
+  'referee_omitted',
+  'referee_missed',
+  'room_overflow',
+  'archive_unavailable',
 ] as const;
 
 /** Message kinds that are evidence and are never candidates for pruning. */
@@ -187,9 +200,22 @@ export function assertEvidenceIntact(db: SqliteDatabase, before: Record<string, 
   }
 }
 
+function tableExists(db: SqliteDatabase, table: string): boolean {
+  const row = db
+    .prepare("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?")
+    .get(table) as { present: number } | undefined;
+  return row !== undefined;
+}
+
 export function snapshotPermanentCounts(db: SqliteDatabase): Record<string, number> {
   const counts: Record<string, number> = {};
   for (const table of PERMANENT_TABLES) {
+    // `disk-report` inspects whatever database is on disk *without* migrating it,
+    // and `assertEvidenceIntact` only checks the tables it was handed. A database
+    // written before a table existed is a diagnostic input, not a startup error,
+    // so an absent table is skipped rather than thrown on. On a migrated database
+    // (the retention path) every table is present and this is a no-op.
+    if (!tableExists(db, table)) continue;
     counts[table] = (db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n;
   }
   return counts;

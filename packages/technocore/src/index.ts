@@ -7,3 +7,4 @@ export * from './room-reader.js';
 export * from './room-writer.js';
 export * from './package-pin.js';
 export * from './archive.js';
+export * from './challenge-archive.js';

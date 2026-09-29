@@ -34,6 +34,7 @@ import {
   buildTerms,
   generateTradeId,
   withinLimits,
+  withinPublishedLimits,
   type MarketSnapshot,
   type Rules,
   type TradeTerms,
@@ -1012,6 +1013,13 @@ export class OrchestratorScheduler {
           rules: this.rules,
           sweep: snapshot.sweep,
           reference: snapshot.reference,
+          nextLimits: snapshot.nextLimits,
+          staleReference: snapshot.staleReference,
+          externalOfferLimits: {
+            maxQty: this.config.risk.externalOffer.maxQty,
+            maxNotional: this.config.risk.externalOffer.maxNotional,
+            clawbackBuffer: this.config.risk.externalOffer.clawbackBuffer,
+          },
           // The clawback is priced by the sweep's closing price, which the referee
           // publishes only when the sweep ends — an offer has to be answered before
           // that. Null says so, and the validator bounds our fee by the worst case
@@ -1071,7 +1079,13 @@ export class OrchestratorScheduler {
     const until = Math.min(snapshot.sweep + DEFAULT_TRADE_HORIZON_SWEEPS, this.rules.lockSweep);
     if (until <= snapshot.sweep) return null;
     const px = action.px;
-    if (snapshot.reference !== null && !withinLimits(this.rules, px, snapshot.reference)) return null;
+    // The referee's published band is authoritative; the local ±5% window is the
+    // fallback for a price post that carried no band at all.
+    if (snapshot.nextLimits !== null) {
+      if (!withinPublishedLimits(px, snapshot.nextLimits)) return null;
+    } else if (snapshot.reference !== null && !withinLimits(this.rules, px, snapshot.reference)) {
+      return null;
+    }
     return buildTerms({
       id: generateTradeId(did, action.side),
       maker: did,

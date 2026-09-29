@@ -521,6 +521,9 @@ export async function createRuntime(
     expectedPackageHash: pin.expected,
     expectedRefereeDid: config.expectedRefereeDid,
     requireRefereePin: config.requireRefereePin,
+    maxReferenceAgeSeconds: config.risk.maxReferenceAgeSeconds,
+    staleReferenceMode: config.risk.staleReferenceMode,
+    maxDiscoveredRooms: config.roomDiscovery.maxRooms,
     now,
   });
 
