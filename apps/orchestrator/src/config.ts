@@ -9,6 +9,7 @@
  *     2 vCPU / 4 GB VPS shared with other tenants.
  */
 import { z } from 'zod';
+import { AGENTS_PER_GROUP, DEFAULT_AGENT_COUNT, STRATEGY_GROUPS } from '@flop/identity';
 
 const boolish = z
   .union([z.boolean(), z.string()])
@@ -46,16 +47,48 @@ export const EnvSchema = z.object({
   FLOP_LIVE_CONFIRM: z.string().default(''),
   /** Explicit gate for posting owner registrations to technocore. */
   FLOP_ALLOW_REGISTRATION: boolish.default(false),
+  /**
+   * Explicit gate for signing and posting trades, separate from registration.
+   *
+   * Live registration and live trading are different commitments: the first
+   * makes the 150 owners real, the second risks collateral. Keeping them apart
+   * lets an operator run `live + registration` until all 150 readbacks are in,
+   * and only then arm trading.
+   */
+  FLOP_ALLOW_TRADING: boolish.default(false),
 
   // ---- close call ---------------------------------------------------------
   SEASON: z.literal('close-1').default('close-1'),
   TRADING_ROOM: z.string().default('close1'),
   CONTEST_JSON_PATH: z.string().default('reference/contest.json'),
+  /** The vendored official package; the source of the package-hash pin. */
+  REFERENCE_DIR: z.string().default('reference'),
+  /**
+   * The package hash the launch record pins, when it is known ahead of the
+   * checkout. Empty means "use the vendored manifest's own sha256".
+   */
+  EXPECTED_PACKAGE_HASH: z.string().default(''),
+  /** The referee's DID, fixed before the first message is read. */
+  EXPECTED_REFEREE_DID: z.string().default(''),
+  /**
+   * Refuse to infer the referee from whoever posts first. On by default: the
+   * permissive behaviour exists for dry-run experiments against a throwaway
+   * room, not for a contest.
+   */
+  REQUIRE_REFEREE_PIN: boolish.default(true),
+  /** The fleet the season is defined as: 150 agents, five groups of thirty. */
+  EXPECTED_AGENT_COUNT: intString(150),
+  REQUIRE_FULL_FLEET: boolish.default(true),
 
   // ---- age identity -------------------------------------------------------
   AGE_IDENTITY_FILE: z.string().default(''),
   AGE_RECIPIENT_VPS: z.string().default(''),
   AGE_RECIPIENT_ADMIN: z.string().default(''),
+  /**
+   * The offline admin key's public half, so the VPS can verify an inventory
+   * signature without ever holding the private key. See `AdminPublicKey`.
+   */
+  ADMIN_PUBLIC_KEY: z.string().default(''),
 
   // ---- technocore ---------------------------------------------------------
   TECHNO_CORE_BASE_URL: z.string().default('https://technocore.chat'),
@@ -92,7 +125,16 @@ export const EnvSchema = z.object({
   LARK_REPORT_TIMES: z.string().default('08:50,18:10'),
   LARK_RECONNECT_MIN_MS: intString(1_000),
   LARK_RECONNECT_MAX_MS: intString(60_000),
-  LARK_HEARTBEAT_TIMEOUT_MS: intString(30_000),
+  /**
+   * How long a connected socket may go without a pong before the health report
+   * calls the heartbeat stale.
+   *
+   * The server owns the ping interval (it is reported in the pong payload), so
+   * this is a generous "the connection has gone quiet" alarm rather than a
+   * precise timer: five minutes sits comfortably above the interval the SDK's own
+   * configuration uses. It never forces a reconnect — a close does that.
+   */
+  LARK_HEARTBEAT_TIMEOUT_MS: intString(300_000),
 
   // ---- concurrency --------------------------------------------------------
   LLM_CONCURRENCY: intString(1),
@@ -143,11 +185,27 @@ export interface Config {
   mode: 'dry-run' | 'live';
   liveArmed: boolean;
   allowRegistration: boolean;
+  allowTrading: boolean;
+  /** Live *and* explicitly allowed to trade. The only flag the trade path reads. */
+  tradingArmed: boolean;
   season: 'close-1';
   tradingRoom: string;
   contestJsonPath: string;
+  referenceDir: string;
+  /** The package hash the process must be launched against, or null if unset. */
+  expectedPackageHash: string | null;
+  /** The referee DID fixed before the first message, or null if unset. */
+  expectedRefereeDid: string | null;
+  requireRefereePin: boolean;
+  expectedAgentCount: number;
+  requireFullFleet: boolean;
+  adminPublicKey: string | null;
   ageIdentityFile: string;
   ageRecipients: string[];
+  /** The VPS runtime key's recipient, when configured. */
+  ageRecipientVps: string;
+  /** The offline admin key's recipient, when configured. */
+  ageRecipientAdmin: string;
   technoCore: {
     baseUrl: string;
     readConcurrency: number;
@@ -232,6 +290,10 @@ export class ConfigError extends Error {
   }
 }
 
+/** The only DID shape this build accepts for a pinned identity. */
+export const DID_KEY_PATTERN = /^did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44}$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const parsed = EnvSchema.safeParse(env);
   if (!parsed.success) {
@@ -248,6 +310,53 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       `FLOP_MODE=live requires FLOP_LIVE_CONFIRM=${raw.SEASON} — refusing to start armed-looking but unconfirmed`,
     );
   }
+
+  // A live process that cannot register is the worst of both worlds: it looks
+  // armed, and every one of the 150 agents trades against a balance the referee
+  // never minted. The failure would surface as 150 `funds` voids, days later.
+  if (liveArmed && !raw.FLOP_ALLOW_REGISTRATION) {
+    throw new ConfigError(
+      'FLOP_MODE=live requires FLOP_ALLOW_REGISTRATION=true — 150 unregistered agents would trade on mintless accounts',
+    );
+  }
+  // Trading is a second, separate commitment; it can never be armed in dry-run.
+  if (raw.FLOP_ALLOW_TRADING && !liveArmed) {
+    throw new ConfigError(
+      'FLOP_ALLOW_TRADING=true requires FLOP_MODE=live and FLOP_LIVE_CONFIRM=close-1',
+    );
+  }
+
+  const expectedRefereeDid = raw.EXPECTED_REFEREE_DID.trim();
+  if (expectedRefereeDid.length > 0 && !DID_KEY_PATTERN.test(expectedRefereeDid)) {
+    throw new ConfigError(`EXPECTED_REFEREE_DID is not a did:key: ${expectedRefereeDid}`);
+  }
+  // Without a pinned referee DID, the first signed post in a `d-` room decides
+  // who the referee is — a stranger can claim it. Live therefore requires the pin.
+  if (liveArmed && expectedRefereeDid.length === 0) {
+    throw new ConfigError(
+      'FLOP_MODE=live requires EXPECTED_REFEREE_DID — the referee must be pinned before the first message is read',
+    );
+  }
+  if (liveArmed && !raw.REQUIRE_REFEREE_PIN) {
+    throw new ConfigError('FLOP_MODE=live requires REQUIRE_REFEREE_PIN=true');
+  }
+
+  const expectedPackageHash = raw.EXPECTED_PACKAGE_HASH.trim().toLowerCase();
+  if (expectedPackageHash.length > 0 && !SHA256_HEX.test(expectedPackageHash)) {
+    throw new ConfigError('EXPECTED_PACKAGE_HASH must be a 64-character sha256 hex digest');
+  }
+
+  if (raw.REQUIRE_FULL_FLEET && raw.EXPECTED_AGENT_COUNT !== DEFAULT_AGENT_COUNT) {
+    throw new ConfigError(
+      `REQUIRE_FULL_FLEET=true requires EXPECTED_AGENT_COUNT=${DEFAULT_AGENT_COUNT} — the season is ${STRATEGY_GROUPS.length} groups of ${AGENTS_PER_GROUP}`,
+    );
+  }
+
+  const adminPublicKey = raw.ADMIN_PUBLIC_KEY.trim();
+  if (adminPublicKey.length > 0 && !DID_KEY_PATTERN.test(adminPublicKey)) {
+    throw new ConfigError(`ADMIN_PUBLIC_KEY is not a did:key: ${adminPublicKey}`);
+  }
+
   if (raw.DEEPSEEK_MAX_NORMAL_CALLS_PER_DAY > raw.DEEPSEEK_HARD_LIMIT_PER_DAY) {
     throw new ConfigError('DEEPSEEK_MAX_NORMAL_CALLS_PER_DAY cannot exceed the hard limit');
   }
@@ -289,11 +398,22 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     mode: raw.FLOP_MODE,
     liveArmed,
     allowRegistration: raw.FLOP_ALLOW_REGISTRATION,
+    allowTrading: raw.FLOP_ALLOW_TRADING,
+    tradingArmed: liveArmed && raw.FLOP_ALLOW_TRADING,
     season: raw.SEASON,
     tradingRoom: raw.TRADING_ROOM,
     contestJsonPath: raw.CONTEST_JSON_PATH,
+    referenceDir: raw.REFERENCE_DIR,
+    expectedPackageHash: expectedPackageHash.length > 0 ? expectedPackageHash : null,
+    expectedRefereeDid: expectedRefereeDid.length > 0 ? expectedRefereeDid : null,
+    requireRefereePin: raw.REQUIRE_REFEREE_PIN,
+    expectedAgentCount: raw.EXPECTED_AGENT_COUNT,
+    requireFullFleet: raw.REQUIRE_FULL_FLEET,
+    adminPublicKey: adminPublicKey.length > 0 ? adminPublicKey : null,
     ageIdentityFile: raw.AGE_IDENTITY_FILE,
     ageRecipients,
+    ageRecipientVps: raw.AGE_RECIPIENT_VPS.trim(),
+    ageRecipientAdmin: raw.AGE_RECIPIENT_ADMIN.trim(),
     technoCore: {
       baseUrl: raw.TECHNO_CORE_BASE_URL.replace(/\/+$/, ''),
       readConcurrency: raw.READ_CONCURRENCY,

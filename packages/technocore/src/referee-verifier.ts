@@ -25,6 +25,7 @@
  */
 import {
   Decimal,
+  MAX_REFERENCE_MOVE,
   isLocked,
   parseRefereeMessage,
   type MarketSnapshot,
@@ -76,6 +77,25 @@ export interface RefereeVerifierOptions {
   expectedRefereeDid?: string | null;
   /** A reference move larger than this fraction is treated as an anomaly. */
   maxReferenceJump?: number;
+  /**
+   * What to do when no referee DID has been pinned.
+   *
+   * `adopt_first_sender` mirrors the service's own "the referee is whoever posts
+   * the seed" convention and is what a dry run against a throwaway room wants.
+   * `reject` refuses every post until an identity is pinned, which is the only
+   * safe behaviour for a contest: the `d-` rooms are readable and writable by
+   * anyone, so an unpinned verifier accepts a forged seed — and with it a forged
+   * package hash, reference price and mint list — from whoever posts first.
+   */
+  unpinnedPolicy?: 'adopt_first_sender' | 'reject';
+  /**
+   * Refuse price/flow/final posts until a seed has been accepted.
+   *
+   * The seed is the post that fixes the season, the package and the referee's
+   * trading baseline. Letting a price land first would let a stranger with a
+   * valid signature establish the reference the strategy layer then trades on.
+   */
+  requireSeedBeforeState?: boolean;
 }
 
 interface SweepLedger {
@@ -84,13 +104,26 @@ interface SweepLedger {
   mints: string[];
 }
 
+/** What applying one authorised payload produced. */
+interface AppliedPayload {
+  seed?: RefereeSeed;
+  price?: RefereePrice;
+  flow?: RefereeFlow;
+  final?: RefereeFinal;
+  mints: string[];
+  packageDrift: boolean;
+}
+
 export class RefereeVerifier {
   private readonly rules: Rules;
   private readonly logger: TechnocoreLogger;
   private readonly maxReferenceJump: Decimal;
+  private readonly unpinnedPolicy: 'adopt_first_sender' | 'reject';
+  private readonly requireSeedBeforeState: boolean;
   private refereeDid: string | null;
   private packageHash: string | null = null;
   private expectedPackageHash: string | null;
+  private seedSeen = false;
   private readonly sweeps = new Map<number, SweepLedger>();
   private readonly referenceHistory: Decimal[] = [];
   private currentSweep: number | null = null;
@@ -109,7 +142,9 @@ export class RefereeVerifier {
     this.logger = options.logger;
     this.expectedPackageHash = options.expectedPackageHash ?? null;
     this.refereeDid = options.expectedRefereeDid ?? null;
-    this.maxReferenceJump = Decimal.from(String(options.maxReferenceJump ?? '0.25'));
+    this.maxReferenceJump = Decimal.from(String(options.maxReferenceJump ?? MAX_REFERENCE_MOVE));
+    this.unpinnedPolicy = options.unpinnedPolicy ?? 'adopt_first_sender';
+    this.requireSeedBeforeState = options.requireSeedBeforeState ?? false;
   }
 
   get state(): {
@@ -126,6 +161,7 @@ export class RefereeVerifier {
     conservative: boolean;
     conservativeReasons: string[];
     historyLength: number;
+    seedSeen: boolean;
   } {
     return {
       refereeDid: this.refereeDid,
@@ -141,6 +177,7 @@ export class RefereeVerifier {
       conservative: this.conservative,
       conservativeReasons: [...this.conservativeReasons],
       historyLength: this.referenceHistory.length,
+      seedSeen: this.seedSeen,
     };
   }
 
@@ -244,6 +281,14 @@ export class RefereeVerifier {
     }
 
     const expected = expectedRefereeDid ?? this.refereeDid;
+    if (expected === null && this.unpinnedPolicy === 'reject') {
+      record.rejectedBecause = 'referee_unpinned';
+      this.enterConservative(
+        'referee_unpinned',
+        `no referee DID is pinned; refusing seq ${message.seq} from ${senderDid} in ${room}`,
+      );
+      return { record, mints: [], enteredConservativeMode: true, packageDrift: false };
+    }
     if (expected !== null && senderDid !== expected) {
       record.rejectedBecause = 'unexpected_referee_did';
       this.enterConservative(
@@ -253,13 +298,25 @@ export class RefereeVerifier {
       return { record, mints: [], enteredConservativeMode: true, packageDrift: false };
     }
 
-    // First verified post fixes the referee identity when nothing pinned it.
+    // Only when nothing pinned the identity *and* the policy allows it does the
+    // first verified post fix who the referee is.
     if (this.refereeDid === null) this.refereeDid = senderDid;
+
+    // The seed carries the season, the package and the referee's baseline. A
+    // price that arrives before it has no authority behind it.
+    if (this.requireSeedBeforeState && !this.seedSeen && kind !== 'seed') {
+      record.rejectedBecause = 'seed_required';
+      this.enterConservative(
+        'seed_required',
+        `refusing a ${kind} post before the seed (seq ${message.seq} in ${room})`,
+      );
+      return { record, mints: [], enteredConservativeMode: true, packageDrift: false };
+    }
+
     this.lastRefereeSeq = Math.max(this.lastRefereeSeq ?? 0, message.seq);
     this.lastPostAt = message.ts;
     record.accepted = true;
 
-    let packageDrift = false;
     const observation: RefereeObservation = {
       record,
       mints: [],
@@ -267,55 +324,116 @@ export class RefereeVerifier {
       packageDrift: false,
     };
 
+    const applied = this.applyPayload(kind, parsed.value);
+    if (applied.seed !== undefined) observation.seed = applied.seed;
+    if (applied.price !== undefined) observation.price = applied.price;
+    if (applied.flow !== undefined) observation.flow = applied.flow;
+    if (applied.final !== undefined) observation.final = applied.final;
+    observation.mints = applied.mints;
+
+    observation.packageDrift = applied.packageDrift;
+    observation.enteredConservativeMode = this.conservative;
+    return observation;
+  }
+
+  /**
+   * Apply an already-authorised referee payload.
+   *
+   * Shared by `observe` (after the signature and the sender have been checked)
+   * and `replay` (for rows this process stored after checking them once). The
+   * authorisation is the caller's job; this only does the state machine.
+   */
+  private applyPayload(kind: RefereeKind, payload: unknown): AppliedPayload {
+    const applied: AppliedPayload = { mints: [], packageDrift: false };
     switch (kind) {
       case 'seed': {
-        const seed = parsed.value as RefereeSeed;
-        observation.seed = seed;
+        const seed = payload as RefereeSeed;
+        applied.seed = seed;
+        this.seedSeen = true;
         if (this.packageHash === null) {
           this.packageHash = seed.package;
         }
         if (this.expectedPackageHash !== null && seed.package !== this.expectedPackageHash) {
-          packageDrift = true;
+          applied.packageDrift = true;
           this.enterConservative(
             'package_hash_drift',
             `seed package ${seed.package} != pinned ${this.expectedPackageHash}`,
           );
         } else if (this.expectedPackageHash === null) {
-          // No launch record available: adopt the seed's hash as the pin.
-          this.expectedPackageHash = seed.package;
+          // Adopting the seed's hash is the same class of hole as adopting the
+          // sender's DID: it lets the first post define what we are running.
+          if (this.unpinnedPolicy === 'reject') {
+            applied.packageDrift = true;
+            this.enterConservative(
+              'package_hash_unpinned',
+              `seed quoted ${seed.package}, but no package hash is pinned`,
+            );
+          } else {
+            this.expectedPackageHash = seed.package;
+          }
         }
         break;
       }
       case 'price': {
-        const price = parsed.value as RefereePrice;
-        observation.price = price;
+        const price = payload as RefereePrice;
+        applied.price = price;
         this.applyPrice(price);
         break;
       }
       case 'flow': {
-        const flow = parsed.value as RefereeFlow;
-        observation.flow = flow;
+        const flow = payload as RefereeFlow;
+        applied.flow = flow;
         const sweep = flow.n;
         const ledger = this.sweeps.get(sweep) ?? { priceSeen: false, flowSeen: false, mints: [] };
         ledger.flowSeen = true;
         ledger.mints = [...flow.mints];
         this.sweeps.set(sweep, ledger);
-        observation.mints = ledger.mints;
+        applied.mints = ledger.mints;
         break;
       }
       case 'final': {
-        const final = parsed.value as RefereeFinal;
-        observation.final = final;
+        const final = payload as RefereeFinal;
+        applied.final = final;
         this.finalPx = Decimal.from(final.price);
         break;
       }
       default:
         break;
     }
+    return applied;
+  }
 
-    observation.packageDrift = packageDrift;
-    observation.enteredConservativeMode = this.conservative;
-    return observation;
+  /**
+   * Rebuild in-memory state from rows this process previously verified.
+   *
+   * A restart reopens the database with the full referee history in it, but the
+   * verifier starts empty: without this, the first tick after a crash has no
+   * reference price, no history, no sweep and no final price until the referee
+   * posts again — and if the season is already over, never. Every row returned by
+   * `orderedForReplay` was signature-checked when it was ingested, and this
+   * re-checks the two things a restart can still get wrong: that the row is one
+   * we accepted, and that the sender is the pinned referee.
+   */
+  replay(record: {
+    seq: number;
+    ts: string;
+    kind: string;
+    senderDid: string;
+    payload: unknown;
+  }): boolean {
+    const kind = record.kind as RefereeKind;
+    if (!['seed', 'price', 'flow', 'positions', 'pnl', 'state', 'final'].includes(kind)) {
+      return false;
+    }
+    if (this.refereeDid === null && this.unpinnedPolicy === 'reject') return false;
+    if (this.refereeDid !== null && record.senderDid !== this.refereeDid) return false;
+    if (this.refereeDid === null) this.refereeDid = record.senderDid;
+    if (this.requireSeedBeforeState && !this.seedSeen && kind !== 'seed') return false;
+
+    this.applyPayload(kind, record.payload);
+    this.lastRefereeSeq = Math.max(this.lastRefereeSeq ?? 0, record.seq);
+    if (this.lastPostAt === null || record.ts > this.lastPostAt) this.lastPostAt = record.ts;
+    return true;
   }
 
   private applyPrice(price: RefereePrice): void {

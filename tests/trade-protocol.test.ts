@@ -17,6 +17,7 @@ import { describe, expect, it } from 'vitest';
 import {
   Decimal,
   LocalRiskBook,
+  MAX_REFERENCE_MOVE,
   RiskAccount,
   buildTerms,
   buildTradeMessage,
@@ -39,6 +40,7 @@ import {
   verifyMakerSignature,
   verifyTakerSignature,
   withinLimits,
+  worstCaseSideFee,
   type TradeTerms,
   type TradeValidationContext,
 } from '@flop/close-call';
@@ -429,6 +431,29 @@ describe('the external offer taker', () => {
       baseContext(),
     ).ok).toBe(true);
   });
+
+  /**
+   * The clawback is priced by the sweep's *close*, which the referee publishes
+   * when the sweep ends — after an offer has to be answered. Pricing it at the
+   * reference assumes the market does not move, and that is wrong precisely when
+   * the move is against us; the referee then voids the trade for funds, which is
+   * worse than a refusal we can see coming.
+   */
+  it('refuses an offer it could only afford if the close did not move', () => {
+    // A 450 account covers a 400 position plus the plain 1% fee, and nothing more.
+    const tight = new Map<string, RiskAccount>([
+      [taker.did, RiskAccount.withMint(taker.did, Decimal.from('450'))],
+    ]);
+    const terms = openOffer({ id: 'ext-tight', maker: externalDid, taker: 'any', side: 'sell', qty: '2', px: '200' });
+    const makerSig = signTermsAsMaker(terms, externalSeed);
+
+    // Priced at the reference the trade looks affordable, which is the assumption
+    // the referee's own close can break.
+    expect(takeOffer(terms, makerSig, { accounts: tight }).ok).toBe(true);
+    // With the close unknown the fee is bounded at the worst case: the close can
+    // land 25% high, so 400 + (250 - 200) * 2 = 500, which this account cannot cover.
+    expect(takeOffer(terms, makerSig, { accounts: tight, close: null }).reason).toBe('funds');
+  });
 });
 
 describe('the clawback fee', () => {
@@ -470,6 +495,22 @@ describe('the clawback fee', () => {
     const band = limitBand(rules, Decimal.from('200'));
     expect(band.low.lte(Decimal.from('190'))).toBe(true);
     expect(band.high.gte(Decimal.from('200'))).toBe(true);
+  });
+
+  it('bounds an unknown close at the far edge of the reference guard', () => {
+    const reference = Decimal.from('200');
+    const priced = sideFees('sell', Decimal.from('2'), Decimal.from('200'), reference, rules.feeRate).taker;
+    const buy = worstCaseSideFee('buy', Decimal.from('2'), Decimal.from('200'), reference, rules.feeRate);
+    const sell = worstCaseSideFee('sell', Decimal.from('2'), Decimal.from('200'), reference, rules.feeRate);
+
+    // The buyer pays most when the close lands high, the seller when it lands low:
+    // 1.25 * 200 - 200 = 50, times 2 = 100, which beats the plain 1% fee of 4.
+    expect(buy.eq(Decimal.from('100'))).toBe(true);
+    expect(sell.eq(Decimal.from('100'))).toBe(true);
+    expect(buy.gte(priced)).toBe(true);
+    expect(sell.gte(priced)).toBe(true);
+    // The bound is exactly the guard the verifier uses, so the two cannot drift.
+    expect(MAX_REFERENCE_MOVE.eq(Decimal.from('0.25'))).toBe(true);
   });
 });
 

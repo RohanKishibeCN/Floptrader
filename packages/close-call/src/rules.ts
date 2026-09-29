@@ -112,6 +112,16 @@ export const REFEREE_ROOMS = [
 ] as const;
 export type RefereeRoom = (typeof REFEREE_ROOMS)[number];
 
+/**
+ * The room the referee posts the seed and the final price to.
+ *
+ * It has to be read before the price and flow rooms: the seed establishes the
+ * package and the baseline, and a price that arrives before it is refused. The
+ * order of `contest.json`'s `rooms.referee` is not the referee's posting order,
+ * so the reader hoists this room to the front of every pass.
+ */
+export const REFEREE_STATE_ROOM = 'd-close1-state';
+
 export interface Rules {
   contestId: string;
   season: string;

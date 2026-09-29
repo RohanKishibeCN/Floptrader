@@ -13,8 +13,9 @@
  *   3. the identity scheme is self-consistent: 150 unique did:key values, five
  *      groups of thirty, a control proof that verifies against a signed
  *      inventory, and a full age encrypt/decrypt round trip;
- *   4. the configuration fails closed: live without confirmation is a startup
- *      error, and the load thresholds cannot be ordered nonsensically;
+ *   4. the configuration fails closed: live without confirmation, without
+ *      registration, or without a pinned referee is a startup error, and the
+ *      load thresholds cannot be ordered nonsensically;
  *   5. the schema the code expects is the schema a fresh database gets, and the
  *      retention policy still names every evidence table as permanent;
  *   6. no plaintext seed is reachable from the on-disk artifacts.
@@ -36,6 +37,7 @@ import {
   createAgeIdentity,
   createChallenge,
   decryptBundle,
+  didFromSeed,
   encryptBundle,
   makeAgentSecretRecord,
   newSeed,
@@ -264,22 +266,51 @@ await check('a control proof verifies against the signed inventory', () => {
 // 4. configuration fails closed
 // ---------------------------------------------------------------------------
 
-await check('live mode without confirmation is a startup error', () => {
-  let threw = false;
-  try {
-    loadConfig({ FLOP_MODE: 'live' } as NodeJS.ProcessEnv);
-  } catch {
-    threw = true;
-  }
-  assert(threw, 'FLOP_MODE=live started without FLOP_LIVE_CONFIRM');
+await check('live mode requires confirmation, registration and a pinned referee', () => {
+  const refereeDid = didFromSeed(newSeed());
+  const mustThrow = (env: NodeJS.ProcessEnv, why: string): void => {
+    let threw = false;
+    try {
+      loadConfig(env);
+    } catch {
+      threw = true;
+    }
+    assert(threw, why);
+  };
 
-  const armed = loadConfig({ FLOP_MODE: 'live', FLOP_LIVE_CONFIRM: 'close-1' } as NodeJS.ProcessEnv);
+  mustThrow({ FLOP_MODE: 'live' }, 'FLOP_MODE=live started without FLOP_LIVE_CONFIRM');
+  mustThrow(
+    { FLOP_MODE: 'live', FLOP_LIVE_CONFIRM: 'close-1' },
+    'FLOP_MODE=live armed without FLOP_ALLOW_REGISTRATION',
+  );
+  mustThrow(
+    { FLOP_MODE: 'live', FLOP_LIVE_CONFIRM: 'close-1', FLOP_ALLOW_REGISTRATION: 'true' },
+    'FLOP_MODE=live armed without a pinned EXPECTED_REFEREE_DID',
+  );
+  mustThrow(
+    {
+      FLOP_MODE: 'live',
+      FLOP_LIVE_CONFIRM: 'close-1',
+      FLOP_ALLOW_REGISTRATION: 'true',
+      EXPECTED_REFEREE_DID: refereeDid,
+      REQUIRE_REFEREE_PIN: 'false',
+    },
+    'FLOP_MODE=live armed with REQUIRE_REFEREE_PIN=false',
+  );
+
+  const armed = loadConfig({
+    FLOP_MODE: 'live',
+    FLOP_LIVE_CONFIRM: 'close-1',
+    FLOP_ALLOW_REGISTRATION: 'true',
+    EXPECTED_REFEREE_DID: refereeDid,
+  } as NodeJS.ProcessEnv);
   assert(armed.liveArmed, 'an explicitly confirmed live config did not arm');
+  assert(!armed.tradingArmed, 'live without FLOP_ALLOW_TRADING armed trading');
 
   const byDefault = loadConfig({} as NodeJS.ProcessEnv);
   assert(!byDefault.liveArmed, 'the default configuration armed live trading');
   assert(byDefault.mode === 'dry-run', `the default mode is ${byDefault.mode}`);
-  return 'default dry-run; live requires both FLOP_MODE and FLOP_LIVE_CONFIRM';
+  return 'default dry-run; live needs FLOP_MODE + FLOP_LIVE_CONFIRM + FLOP_ALLOW_REGISTRATION + a pinned referee';
 });
 
 await check('load thresholds must be ordered', () => {

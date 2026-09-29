@@ -159,6 +159,65 @@ export class AgentKeyStore {
   }
 }
 
+export interface FleetSummary {
+  size: number;
+  /** Agents per strategy group, in `STRATEGY_GROUPS` order. */
+  groups: Record<string, number>;
+}
+
+/** How many agents the store holds, per strategy group. */
+export function fleetSummary(store: AgentKeyStore): FleetSummary {
+  const groups: Record<string, number> = {};
+  for (const group of STRATEGY_GROUPS) groups[group] = 0;
+  for (const record of store.publicRecords()) {
+    groups[record.strategyGroup] = (groups[record.strategyGroup] ?? 0) + 1;
+  }
+  return { size: store.size, groups };
+}
+
+/**
+ * The season is defined as exactly 150 agents in five groups of thirty.
+ *
+ * A bundle generated with `--count 2` is fine for a dry run and fatal for a
+ * contest: the referee counts owners, so a short fleet is a short fleet, and
+ * discovering that from a report after the lock is too late. This asserts the
+ * shape the contest actually requires, including that the ids are the
+ * consecutive `agent-0001..agent-0150` the CLI generates — a store with 150
+ * agents under 150 unexpected ids would satisfy a bare count and nothing else.
+ */
+export function assertFullFleet(
+  store: AgentKeyStore,
+  expectedCount: number = DEFAULT_AGENT_COUNT,
+): FleetSummary {
+  const summary = fleetSummary(store);
+  if (summary.size !== expectedCount) {
+    throw new IdentityError(
+      `fleet size is ${summary.size}, but this season is ${expectedCount} agents — ` +
+        'regenerate with `identities generate` or set REQUIRE_FULL_FLEET=false for a dry run',
+    );
+  }
+  if (store.agentIds.length !== expectedCount) {
+    throw new IdentityError(`fleet lists ${store.agentIds.length} ids for ${expectedCount} agents`);
+  }
+  for (let index = 0; index < expectedCount; index += 1) {
+    const expected = agentIdFor(index);
+    if (store.agentIds[index] !== expected) {
+      throw new IdentityError(
+        `fleet id ${store.agentIds[index]} is not ${expected}; the bundle is not the generated fleet`,
+      );
+    }
+  }
+  for (const group of STRATEGY_GROUPS) {
+    const count = summary.groups[group] ?? 0;
+    if (count !== AGENTS_PER_GROUP) {
+      throw new IdentityError(
+        `strategy group ${group} has ${count} agents, but this season requires ${AGENTS_PER_GROUP}`,
+      );
+    }
+  }
+  return summary;
+}
+
 /** Build a fresh agent record from a generated seed. */
 export function makeAgentSecretRecord(
   index: number,

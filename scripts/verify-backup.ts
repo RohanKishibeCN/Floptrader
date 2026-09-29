@@ -21,6 +21,7 @@ import { createHash } from 'node:crypto';
 import {
   AgentKeyStore,
   decryptBundle,
+  parseAdminPublicKey,
   parseBundle,
   parseInventory,
   verifyInventorySignature,
@@ -129,6 +130,22 @@ if (existsSync(signaturePath)) {
     fail('the inventory signature does not verify against the public manifest');
   } else {
     process.stdout.write(`  signature: valid (admin ${manifest.admin_did})\n`);
+  }
+  // The signature proves the file is self-consistent. Only the pinned admin DID
+  // proves it was signed by the offline key, and this host holds the public half.
+  const adminFile = `${config.secretsDir}/admin-public.key`;
+  const adminDid =
+    config.adminPublicKey ??
+    (existsSync(adminFile) ? parseAdminPublicKey(readFileSync(adminFile, 'utf8')).admin_did : null);
+  if (adminDid === null) {
+    fail(
+      'no ADMIN_PUBLIC_KEY (or secrets/admin-public.key): the inventory is only self-consistent, ' +
+        'not proven to be signed by the offline admin key',
+    );
+  } else if (!verifyInventorySignature(inventory, manifest, adminDid)) {
+    fail(`the inventory does not verify against the pinned admin ${adminDid}`);
+  } else {
+    process.stdout.write(`  attested:  signed by the pinned admin ${adminDid}\n`);
   }
 } else {
   fail(`no inventory signature at ${signaturePath}`);

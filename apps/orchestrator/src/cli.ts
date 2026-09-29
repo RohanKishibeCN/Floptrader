@@ -29,6 +29,7 @@ import {
   AgentKeyStore,
   DEFAULT_AGENT_COUNT,
   ageRecipientFor,
+  buildAdminPublicKey,
   buildInventory,
   challengeHash,
   decryptBundle,
@@ -40,6 +41,7 @@ import {
   parseInventory,
   proveControl,
   serializeAdminKey,
+  serializeAdminPublicKey,
   serializeBundle,
   serializeInventory,
   serializeManifestSignature,
@@ -49,6 +51,7 @@ import {
   type ControlProofRecord,
   type ManifestSignature,
 } from '@flop/identity';
+import { computeLocalPackageManifestHash } from '@flop/technocore';
 import { loadConfig, type Config } from './config.js';
 import { loadAdminSeed, loadAgentKeyStoreAsync, writeIdentityMetadata } from './main.js';
 
@@ -139,6 +142,39 @@ async function resolveRecipients(config: Config): Promise<string[]> {
   return [...recipients].filter((value) => value.length > 0);
 }
 
+/**
+ * The recipients the *admin* key is encrypted to — never the VPS runtime key.
+ *
+ * If the runtime key is among them, taking the host is enough to decrypt the
+ * admin key and re-sign the inventory, and an inventory signed on the same
+ * machine it trades from proves nothing. Falling back to the full set only
+ * happens when no separate admin recipient exists, and it is reported.
+ */
+function adminRecipients(
+  config: Config,
+  all: string[],
+): { recipients: string[]; warning: string | null } {
+  const runtime = config.ageRecipientVps;
+  const adminOnly = runtime.length > 0 ? all.filter((value) => value !== runtime) : [];
+  if (adminOnly.length > 0) return { recipients: adminOnly, warning: null };
+  return {
+    recipients: all,
+    warning:
+      'AGE_RECIPIENT_ADMIN is not set (or equals AGE_RECIPIENT_VPS): the admin key is ' +
+      'encrypted to the VPS key as well, so the host can decrypt it and re-sign the inventory',
+  };
+}
+
+const adminPublicPath = (config: Config): string => `${config.secretsDir}/admin-public.key`;
+
+/** Write the admin public half the VPS keeps, and return the admin DID. */
+function writeAdminPublicKey(config: Config, adminSeed: Uint8Array, createdAt: string): string {
+  const publicKey = buildAdminPublicKey(adminSeed, config.season, createdAt);
+  ensureParent(adminPublicPath(config));
+  writePublic(adminPublicPath(config), serializeAdminPublicKey(publicKey));
+  return publicKey.admin_did;
+}
+
 function readManifest(config: Config) {
   const path = manifestPath(config);
   if (!existsSync(path)) {
@@ -163,6 +199,14 @@ function adminSeedOrThrow(seed: Uint8Array | null): Uint8Array {
 async function commandGenerate(config: Config, flags: Map<string, string>): Promise<void> {
   const count = Number.parseInt(flags.get('count') ?? String(DEFAULT_AGENT_COUNT), 10);
   if (!Number.isInteger(count) || count <= 0) throw new CliError('--count must be a positive integer');
+  // A short fleet is a dry-run convenience, not a contest configuration: the
+  // referee counts owners, so generating 2 of 150 is not a partial success.
+  if (config.requireFullFleet && count !== config.expectedAgentCount) {
+    throw new CliError(
+      `refusing to generate ${count} agents: this season requires ${config.expectedAgentCount} ` +
+        '(set REQUIRE_FULL_FLEET=false for a dry-run fleet)',
+    );
+  }
 
   const recipients = await resolveRecipients(config);
   if (recipients.length === 0) {
@@ -178,6 +222,17 @@ async function commandGenerate(config: Config, flags: Map<string, string>): Prom
     );
   }
 
+  // The pin is the official package manifest's own sha256. Computing it here —
+  // and refusing to proceed without it — is what binds the bundle, the public
+  // inventory and the referee's seed to the same package.
+  const pkg = computeLocalPackageManifestHash(config.referenceDir);
+  if (!pkg.ok || pkg.manifestHash.length === 0) {
+    throw new CliError(
+      `refusing to generate: the vendored package at ${config.referenceDir} does not verify — ` +
+        pkg.problems.join('; '),
+    );
+  }
+
   const agents: AgentSecretRecord[] = [];
   for (let index = 0; index < count; index += 1) {
     agents.push(makeAgentSecretRecord(index, newSeed()));
@@ -186,16 +241,20 @@ async function commandGenerate(config: Config, flags: Map<string, string>): Prom
   const createdAt = new Date().toISOString();
   const inventory = buildInventory(agents, {
     season: config.season,
-    packageHash: await currentPackageHash(config),
+    packageHash: pkg.manifestHash,
     createdAt,
   });
 
-  // The admin key is generated first and encrypted to the same recipients. It is
-  // the authority that signs the inventory, so it must not be one of the 150
-  // agent keys: otherwise a single compromised agent could re-sign the manifest.
+  // The admin key is generated first and encrypted to the *admin* recipients
+  // only. It is the authority that signs the inventory, so it must not be one of
+  // the 150 agent keys — and it must not be decryptable by the trading host.
   const adminSeed = newSeed();
-  const adminCiphertext = await encryptBundle(serializeAdminKey(adminSeed, createdAt), recipients);
-  writePrivate(adminKeyPath(config), adminCiphertext);
+  const adminTargets = adminRecipients(config, recipients);
+  writePrivate(
+    adminKeyPath(config),
+    await encryptBundle(serializeAdminKey(adminSeed, createdAt), adminTargets.recipients),
+  );
+  const adminDid = writeAdminPublicKey(config, adminSeed, createdAt);
 
   const bundlePlaintext = serializeBundle(agents, {
     season: config.season,
@@ -211,17 +270,19 @@ async function commandGenerate(config: Config, flags: Map<string, string>): Prom
   const manifest = signInventory(inventory, adminSeed, createdAt);
   writePublic(manifestSigPath(config), serializeManifestSignature(manifest));
 
-  process.stdout.write(
-    [
-      `generated ${agents.length} agents across ${new Set(agents.map((a) => a.strategyGroup)).size} strategy groups`,
-      `bundle:   ${config.paths.bundle} (${bundleCiphertext.byteLength} bytes, ${recipients.length} recipient(s))`,
-      `admin key: ${adminKeyPath(config)}`,
-      `inventory: ${manifestPath(config)}`,
-      `signature: ${manifestSigPath(config)} (admin ${manifest.admin_did})`,
-      'no plaintext seed was written to disk',
-      '',
-    ].join('\n'),
-  );
+  const lines = [
+    `generated ${agents.length} agents across ${new Set(agents.map((a) => a.strategyGroup)).size} strategy groups`,
+    `package:  ${pkg.manifestHash} (reference/manifest.json; ${pkg.verified.length} vendored files verified)`,
+    `bundle:   ${config.paths.bundle} (${bundleCiphertext.byteLength} bytes, ${recipients.length} recipient(s))`,
+    `admin key: ${adminKeyPath(config)} (encrypted to ${adminTargets.recipients.length} admin recipient(s))`,
+    `admin public: ${adminPublicPath(config)} (${adminDid})`,
+    `inventory: ${manifestPath(config)}`,
+    `signature: ${manifestSigPath(config)} (admin ${manifest.admin_did})`,
+    'no plaintext seed was written to disk',
+  ];
+  if (adminTargets.warning !== null) lines.push(`WARNING: ${adminTargets.warning}`);
+  lines.push('');
+  process.stdout.write(lines.join('\n'));
 }
 
 async function commandListPublic(config: Config): Promise<void> {
@@ -249,9 +310,15 @@ async function commandExportPublic(config: Config, flags: Map<string, string>): 
 async function commandSignInventory(config: Config): Promise<void> {
   const inventory = readManifest(config);
   const adminSeed = adminSeedOrThrow(await loadAdminSeed(config));
-  const manifest = signInventory(inventory, adminSeed, new Date().toISOString());
+  const at = new Date().toISOString();
+  const manifest = signInventory(inventory, adminSeed, at);
   writePublic(manifestSigPath(config), serializeManifestSignature(manifest));
-  process.stdout.write(`signed ${inventory.agent_count} agents as ${manifest.admin_did}\n`);
+  const adminDid = writeAdminPublicKey(config, adminSeed, at);
+  process.stdout.write(
+    `signed ${inventory.agent_count} agents as ${manifest.admin_did}\n` +
+      `admin public: ${adminPublicPath(config)} (${adminDid})\n` +
+      'copy only this file and the signature to the VPS; the private key stays here\n',
+  );
 }
 
 async function commandBackup(config: Config, flags: Map<string, string>): Promise<void> {
@@ -373,17 +440,21 @@ async function commandVerifyControl(config: Config): Promise<void> {
   if (verification.failed.length > 0) process.exitCode = 1;
 }
 
-/** The package hash the bundle is created against: the pin, else the seed's value. */
+/**
+ * The package hash the existing bundle was created against.
+ *
+ * Refuses an empty one: a bundle generated before this was enforced carries no
+ * package binding, and re-encrypting it into a "backup" would preserve that hole
+ * rather than fix it.
+ */
 async function currentPackageHash(config: Config): Promise<string> {
-  if (existsSync(config.paths.bundle)) {
-    try {
-      const { meta } = await loadAgentKeyStoreAsync(config);
-      return meta.packageHash;
-    } catch {
-      /* fall through to the empty pin */
-    }
+  const { meta } = await loadAgentKeyStoreAsync(config);
+  if (meta.packageHash.trim().length === 0) {
+    throw new CliError(
+      'the bundle carries no package hash; regenerate the identities against the vendored reference package',
+    );
   }
-  return '';
+  return meta.packageHash;
 }
 
 // ---------------------------------------------------------------------------

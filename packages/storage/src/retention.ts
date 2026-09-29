@@ -58,6 +58,10 @@ export const PERMANENT_EVENT_CODES = [
   'sqlite_corrupt',
   'lark_report_failed',
   'mint_unknown',
+  // A registration that never got a readback before the lock is a permanent
+  // fact about the season, and the weekly report has to be able to prove it.
+  'registration_closed',
+  'owner_registration_closed',
   'conservative_mode',
   'human_override',
 ] as const;

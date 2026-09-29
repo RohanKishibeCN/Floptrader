@@ -14,7 +14,7 @@
  */
 import { Decimal } from './decimal.js';
 import { TradeTerms } from './models.js';
-import { sideFees } from './fee.js';
+import { sideFees, worstCaseSideFee } from './fee.js';
 import { fundsReason, RiskAccount } from './risk.js';
 import { Rules, SEASON, withinLimits } from './rules.js';
 import { checkTermsShape } from './terms.js';
@@ -54,7 +54,11 @@ export interface TradeValidationContext {
   sweep: number;
   /** The reference the previous sweep posted; sets this sweep's limits. */
   reference: Decimal | null;
-  /** This sweep's closing price, which prices the clawback. */
+  /**
+   * This sweep's closing price, which prices the clawback. Null means "not known
+   * yet"; `validateExternalOffer` then bounds the taker's fee by the worst case
+   * the reference permits instead of assuming the market stands still.
+   */
   close: Decimal | null;
   /** Every DID this process controls; a trade between two of them is refused. */
   localDids: Set<string>;
@@ -219,14 +223,20 @@ export function validateExternalOffer(
   if (!withinLimits(context.rules, px, context.reference)) {
     return refuse('limits', `px ${terms.px} is outside the 5% window around ${context.reference}`);
   }
-  const close = context.close ?? context.reference;
   const qty = Decimal.from(terms.qty);
   // We are the taker, so our side is the opposite of the maker's.
   const ourSide = terms.side === 'buy' ? 'sell' : 'buy';
-  const fees = sideFees(terms.side, qty, px, close, context.rules.feeRate);
+  // `close` is the sweep's closing price, and the referee publishes it when the
+  // sweep ends — an offer answered now cannot know it. Passing null therefore
+  // means "unknown", and the fee is bounded by the worst case rather than priced
+  // at the reference: an understated fee is a trade voided for funds, which is
+  // strictly worse than a refusal we can see coming.
+  const ourFee =
+    context.close === null
+      ? worstCaseSideFee(ourSide, qty, px, context.reference, context.rules.feeRate)
+      : sideFees(terms.side, qty, px, context.close, context.rules.feeRate).taker;
   const ourAccount = context.accounts.get(context.takerDid);
   if (!ourAccount) return refuse('funds', 'our account is not funded yet');
-  const ourFee = fees.taker;
   if (ourAccount.opening(ourSide === 'buy' ? 1 : -1, qty).mul(px).add(ourFee).gt(ourAccount.cash)) {
     return refuse('funds', 'we cannot cover the contracts this offer opens plus our fee');
   }

@@ -31,16 +31,22 @@ import {
 import {
   AgentKeyStore,
   IdentityError,
+  assertFullFleet,
   decryptBundle,
+  fleetSummary,
   parseAdminKey,
+  parseAdminPublicKey,
   parseBundle,
+  parseInventory,
+  verifyInventorySignature,
   type AgentSecretRecord,
+  type ManifestSignature,
 } from '@flop/identity';
 import { openDatabase, createRepositories, type Repositories, type SqliteDatabase } from '@flop/storage';
 import { GroupRunner } from '@flop/strategy';
-import { TechnocoreClient } from '@flop/technocore';
+import { TechnocoreClient, computeLocalPackageManifestHash } from '@flop/technocore';
 import { ArchiveMaintenance } from './archive-maintenance.js';
-import { loadConfig, type Config } from './config.js';
+import { loadConfig, ConfigError, type Config } from './config.js';
 import { OrchestratorScheduler } from './scheduler.js';
 import { OrchestratorReader } from './reader.js';
 import { OrchestratorWriter } from './writer.js';
@@ -108,12 +114,19 @@ function ensureDirectories(config: Config): void {
  * Read the vendored contest config.
  *
  * Never fetched at runtime: the pin is what keeps a mid-contest rule change from
- * silently altering how we price a trade. A missing or unreadable file falls
- * back to the embedded reference copy and says so.
+ * silently altering how we price a trade. A missing or unreadable file falls back
+ * to the embedded reference copy in dry-run and says so — but **not** in live. A
+ * live process running on embedded rules while the referee quotes the vendored
+ * package is a process whose limits are a guess, and the failure would only show
+ * up as voided trades.
  */
 export function loadRules(config: Config, logger?: Logger): Rules {
   const path = config.contestJsonPath;
+  const live = config.mode === 'live';
   if (!existsSync(path)) {
+    if (live) {
+      throw new ConfigError(`FLOP_MODE=live refuses a missing contest.json at ${path}`);
+    }
     logger?.event({
       level: 'warn',
       source: 'main',
@@ -124,15 +137,18 @@ export function loadRules(config: Config, logger?: Logger): Rules {
     return referenceRules();
   }
   try {
-    const rules = rulesFromConfig(parseContestConfig(readFileSync(path, 'utf8')));
-    return rules;
+    return rulesFromConfig(parseContestConfig(readFileSync(path, 'utf8')));
   } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (live) {
+      throw new ConfigError(`FLOP_MODE=live refuses an unusable contest.json at ${path}: ${detail}`);
+    }
     logger?.event({
       level: 'error',
       source: 'main',
       code: 'contest_json_invalid',
       message: `contest.json at ${path} is unusable; using the embedded reference copy`,
-      data: { path, error: error instanceof Error ? error.message : String(error) },
+      data: { path, error: detail },
     });
     return referenceRules();
   }
@@ -193,6 +209,134 @@ export async function loadAdminSeed(config: Config): Promise<Uint8Array | null> 
   const plaintext = await decryptBundle(new Uint8Array(readFileSync(path)), identities);
   return parseAdminKey(plaintext);
 }
+
+// ---------------------------------------------------------------------------
+// pins
+// ---------------------------------------------------------------------------
+
+export interface PackagePin {
+  /** The hash the process must be launched against. */
+  expected: string;
+  /** sha256 of the vendored `reference/manifest.json`. */
+  localManifestHash: string;
+  /** How many vendored files the manifest's record confirmed. */
+  verifiedFiles: number;
+}
+
+/**
+ * Resolve and cross-check the package pin.
+ *
+ * Three values must agree before a bundle is usable: the hash recorded in the
+ * bundle (what these identities were generated against), the sha256 of the
+ * vendored manifest (what this checkout actually contains), and — when the launch
+ * record pins one — `EXPECTED_PACKAGE_HASH`. Any disagreement is a manual-release
+ * problem; papering over it at startup is how a process ends up trading under
+ * rules it never agreed to.
+ */
+export function resolvePackagePin(config: Config, bundlePackageHash: string): PackagePin {
+  const local = computeLocalPackageManifestHash(config.referenceDir);
+  if (!local.ok || local.manifestHash.length === 0) {
+    throw new ConfigError(
+      `the vendored package at ${config.referenceDir} does not verify: ${local.problems.join('; ')}`,
+    );
+  }
+
+  const fromBundle = bundlePackageHash.trim();
+  if (fromBundle.length === 0) {
+    throw new ConfigError(
+      'the bundle records no package hash; regenerate the identities against the vendored reference package',
+    );
+  }
+
+  const expected = config.expectedPackageHash ?? local.manifestHash;
+  if (config.expectedPackageHash !== null && local.manifestHash !== config.expectedPackageHash) {
+    throw new ConfigError(
+      `the vendored package hashes to ${local.manifestHash}, but EXPECTED_PACKAGE_HASH pins ` +
+        `${config.expectedPackageHash}; re-vendor the official package as a deliberate release`,
+    );
+  }
+  if (fromBundle !== expected) {
+    throw new ConfigError(
+      `the bundle was generated against package ${fromBundle}, but this process pins ${expected}; ` +
+        'refusing to start against a different rule set',
+    );
+  }
+  return { expected, localManifestHash: local.manifestHash, verifiedFiles: local.verified.length };
+}
+
+/** The admin DID this host trusts: from the environment, else the public-key file. */
+export function loadAdminPublicDid(config: Config): string | null {
+  if (config.adminPublicKey !== null) return config.adminPublicKey;
+  const path = `${config.secretsDir}/admin-public.key`;
+  if (!existsSync(path)) return null;
+  return parseAdminPublicKey(readFileSync(path, 'utf8')).admin_did;
+}
+
+/**
+ * Verify the published inventory against the pinned admin key.
+ *
+ * This host holds no admin private key, so a signature check against a pinned DID
+ * is the only thing that makes the inventory an attestation rather than a claim.
+ * A present-but-invalid signature is fatal in both modes — it is evidence of
+ * tampering, not of an unfinished setup — while a missing one is only fatal live.
+ */
+export function verifyInventoryPin(
+  config: Config,
+  adminDid: string | null,
+  logger?: Logger,
+): { verified: boolean; adminDid: string | null; agents: number } {
+  const inventoryPath = `${config.paths.public}/agents.manifest.json`;
+  const signaturePath = `${config.paths.public}/agents.manifest.sig`;
+  const live = config.mode === 'live';
+
+  if (!existsSync(inventoryPath) || !existsSync(signaturePath)) {
+    if (live) {
+      throw new ConfigError(
+        `FLOP_MODE=live requires a signed public inventory (${inventoryPath} and ${signaturePath})`,
+      );
+    }
+    logger?.event({
+      level: 'warn',
+      source: 'main',
+      code: 'inventory_missing',
+      message: 'no signed public inventory yet; the manifest pin is not enforced',
+      data: { inventoryPath, signaturePath },
+    });
+    return { verified: false, adminDid, agents: 0 };
+  }
+
+  const inventory = parseInventory(readFileSync(inventoryPath, 'utf8'));
+  const manifest = JSON.parse(readFileSync(signaturePath, 'utf8')) as ManifestSignature;
+
+  if (adminDid === null) {
+    if (live) {
+      throw new ConfigError(
+        'FLOP_MODE=live requires ADMIN_PUBLIC_KEY (or secrets/admin-public.key) so the inventory ' +
+          'signature can be checked against a key this host does not hold',
+      );
+    }
+    logger?.event({
+      level: 'warn',
+      source: 'main',
+      code: 'admin_key_unpinned',
+      message: 'no admin public key configured; the inventory signature is not pinned to a DID',
+      data: { adminDid: manifest.admin_did },
+    });
+    return { verified: false, adminDid: null, agents: inventory.agent_count };
+  }
+
+  if (!verifyInventorySignature(inventory, manifest, adminDid)) {
+    throw new ConfigError(
+      `the public inventory does not verify against the pinned admin ${adminDid} ` +
+        `(the file says ${manifest.admin_did}); it was not signed by the offline key`,
+    );
+  }
+  return { verified: true, adminDid, agents: inventory.agent_count };
+}
+
+// ---------------------------------------------------------------------------
+// key store
+// ---------------------------------------------------------------------------
 
 /** Deterministic per-agent tie-break seed; stable across restarts by design. */
 export function randomSeedFor(agentId: string): number {
@@ -279,12 +423,68 @@ export async function createRuntime(
   });
 
   const { keyStore, meta } = await loadAgentKeyStoreAsync(config, logger);
+
+  // The season is 150 agents in five groups of thirty. A live process must be
+  // exactly that; a dry run may be any size when the operator has said so.
+  const fleet =
+    config.requireFullFleet || config.mode === 'live'
+      ? assertFullFleet(keyStore, config.expectedAgentCount)
+      : fleetSummary(keyStore);
+  logger.event({
+    level: 'info',
+    source: 'main',
+    code: 'fleet_verified',
+    message: `fleet of ${fleet.size} agents`,
+    data: { size: fleet.size, groups: fleet.groups, required: config.requireFullFleet || config.mode === 'live' },
+  });
+
   const rules = loadRules(config, logger);
   if (rules.contestId !== config.season) {
     throw new Error(
       `contest.json declares ${rules.contestId} but this build is pinned to ${config.season}`,
     );
   }
+
+  // The package pin binds the bundle, the public inventory and the referee's
+  // seed to one rule set. Every disagreement here is fatal.
+  const pin = resolvePackagePin(config, meta.packageHash);
+  logger.event({
+    level: 'info',
+    source: 'main',
+    code: 'package_pinned',
+    message: `package ${pin.expected}`,
+    data: { expected: pin.expected, localManifest: pin.localManifestHash, verifiedFiles: pin.verifiedFiles },
+  });
+
+  // The VPS holds the admin key's public half only, so this is the whole of its
+  // ability to vouch for the inventory.
+  const adminDid = loadAdminPublicDid(config);
+  const inventory = verifyInventoryPin(config, adminDid, logger);
+  logger.event({
+    level: 'info',
+    source: 'main',
+    code: 'inventory_checked',
+    message: inventory.verified
+      ? `public inventory verified against ${inventory.adminDid}`
+      : 'public inventory is not pinned (dry run)',
+    data: { verified: inventory.verified, adminDid: inventory.adminDid, agents: inventory.agents },
+  });
+
+  // A pinned referee, and a seed that must arrive before any state. Both are the
+  // default; the permissive behaviour exists for `adopt_first_sender` dry runs.
+  if (config.requireRefereePin && config.expectedRefereeDid === null) {
+    // Live already refuses to start without the pin; a dry run may proceed, but
+    // it is running without the protection, and that must be visible.
+    logger.event({
+      level: 'warn',
+      source: 'main',
+      code: 'referee_unpinned',
+      message:
+        'REQUIRE_REFEREE_PIN is on but EXPECTED_REFEREE_DID is unset: no referee post will be accepted',
+      data: {},
+    });
+  }
+
   seedIdentityRows(repositories, keyStore, config.season);
 
   const now = overrides.now ?? (() => new Date());
@@ -306,9 +506,9 @@ export async function createRuntime(
     now,
   });
 
-  // The pin is whatever the bundle was created against; a seed that quotes a
-  // different package hash puts the process into conservative mode instead of
-  // silently switching rule sets.
+  // The pins are the launch-time authority: a seed that quotes a different
+  // package hash, or a post from a DID other than the pinned referee, puts the
+  // process into conservative mode instead of silently switching rule sets.
   const reader = new OrchestratorReader({
     rules,
     client,
@@ -318,8 +518,27 @@ export async function createRuntime(
     localDids: () => keyStore.didSet(),
     readConcurrency: config.technoCore.readConcurrency,
     waitSeconds: config.technoCore.readWaitSeconds,
-    expectedPackageHash: meta.packageHash,
+    expectedPackageHash: pin.expected,
+    expectedRefereeDid: config.expectedRefereeDid,
+    requireRefereePin: config.requireRefereePin,
     now,
+  });
+
+  // Rebuild the market view from the stored referee history *before* anything
+  // reads or trades, so a restart resumes at the sweep it left off at rather than
+  // at an empty snapshot.
+  const hydrated = reader.hydrateFromSnapshots();
+  logger.event({
+    level: 'info',
+    source: 'main',
+    code: 'verifier_hydrated',
+    message: `replayed ${hydrated.applied} referee posts (${hydrated.skipped} skipped)`,
+    data: {
+      applied: hydrated.applied,
+      skipped: hydrated.skipped,
+      sweep: reader.snapshot().sweep,
+      reference: reader.snapshot().reference?.toString() ?? null,
+    },
   });
 
   const runner = new GroupRunner({

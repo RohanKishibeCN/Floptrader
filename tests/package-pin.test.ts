@@ -38,16 +38,13 @@ import {
 import { didFromSeed } from '@flop/identity';
 import { buildReleasePlan, RELEASE_STEPS, ReleaseManager } from '../apps/orchestrator/src/upstream-monitor.js';
 import { Logger } from '../apps/orchestrator/src/logger.js';
-import { buildHarness, type Harness } from './support/orchestrator.js';
+import { buildHarness, HARNESS_PACKAGE_HASH, type Harness } from './support/orchestrator.js';
 import { FakeTransport } from './support/fake-transport.js';
 
 const REFERENCE_DIR = join(process.cwd(), 'reference');
 const silent = Logger.create({ level: 'fatal' });
 const PIN = 'a'.repeat(64);
 const DRIFTED = 'c'.repeat(64);
-
-/** The hash the harness bundle pins, so the seed has to agree with it. */
-const HARNESS_PACKAGE_HASH = 'b'.repeat(64);
 
 function referenceFile(name: string): string {
   return readFileSync(join(REFERENCE_DIR, name), 'utf8');
@@ -150,7 +147,8 @@ describe('the release procedure is a human decision', () => {
       'official fold',
       'dry-run',
       'human confirmation',
-      'pm2 reload',
+      'move the current symlink',
+      'systemctl restart flop-close-call',
       'health check',
       'rollback to the previous release on failure',
     ]) {

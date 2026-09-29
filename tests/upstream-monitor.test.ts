@@ -305,11 +305,11 @@ describe('release procedure', () => {
   it('lists the full ordered procedure and builds the release paths', () => {
     expect(RELEASE_STEPS).toContain('pnpm install --frozen-lockfile');
     expect(RELEASE_STEPS).toContain('human confirmation');
-    expect(RELEASE_STEPS).toContain('pm2 reload');
+    expect(RELEASE_STEPS).toContain('systemctl restart flop-close-call');
     expect(RELEASE_STEPS.indexOf('lint')).toBeGreaterThan(
       RELEASE_STEPS.indexOf('pnpm install --frozen-lockfile'),
     );
-    expect(RELEASE_STEPS.indexOf('pm2 reload')).toBeGreaterThan(
+    expect(RELEASE_STEPS.indexOf('systemctl restart flop-close-call')).toBeGreaterThan(
       RELEASE_STEPS.indexOf('human confirmation'),
     );
     expect(RELEASE_STEPS[RELEASE_STEPS.length - 1]).toMatch(/rollback/);

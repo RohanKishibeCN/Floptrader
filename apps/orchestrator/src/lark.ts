@@ -36,6 +36,12 @@ export interface WsLike {
 /** Callbacks a transport uses to report connection lifecycle back to the client. */
 export interface LarkTransportHooks {
   onReady(): void;
+  /**
+   * The socket is gone. Required, because the SDK is configured with
+   * `autoReconnect: false`: the client owns the backoff, so nothing else will
+   * notice a dropped connection.
+   */
+  onClose(reason: string): void;
   onError(error: unknown): void;
   onHeartbeat(): void;
 }
@@ -46,6 +52,7 @@ export interface WsTransportOptions {
   appSecret: string;
   botId: string;
   onReady(): void;
+  onClose(reason: string): void;
   onError(error: unknown): void;
   onHeartbeat(): void;
 }
@@ -199,6 +206,9 @@ export class LarkWebSocketClient {
 
     const hooks: LarkTransportHooks = {
       onReady: () => this.handleReady(),
+      // A closed socket is not an error, but it is the same problem: the
+      // connection is gone and the backoff ladder has to take over.
+      onClose: (reason) => this.handleTransportClose(reason),
       onError: (error) => this.handleTransportError(error),
       onHeartbeat: () => {
         this.lastHeartbeatAtMs = Date.now();
@@ -225,10 +235,11 @@ export class LarkWebSocketClient {
         await this.safeStop(transport);
         return;
       }
-      // A transport that resolves without signalling readiness is still usable.
-      if (this.state === 'connecting' || this.state === 'reconnecting') {
-        this.handleReady();
-      }
+      // Readiness is the transport's to report, and only the transport's. A
+      // transport that resolves without signalling it leaves the client in
+      // `connecting`: claiming a connection we cannot observe is the failure this
+      // whole class exists to avoid, and a stuck `connecting` is visible on the
+      // health endpoint, while a false `connected` is not.
     } catch (error) {
       this.handleTransportError(error);
     }
@@ -248,6 +259,10 @@ export class LarkWebSocketClient {
     this.state = 'connected';
     this.consecutiveFailures = 0;
     this.lastConnectedAt = new Date().toISOString();
+    // A freshly connected socket is alive by definition, so the heartbeat clock
+    // starts here. That is what makes `heartbeatStale` an alarm about a socket
+    // that went quiet rather than a permanent "we have never seen a pong".
+    this.lastHeartbeatAtMs = Date.now();
     this.logger.event({
       level: 'info',
       source: 'lark',
@@ -260,9 +275,6 @@ export class LarkWebSocketClient {
   private handleTransportError(error: unknown): void {
     this.lastError = toMessage(error);
     this.lastErrorAt = new Date().toISOString();
-    this.consecutiveFailures += 1;
-    this.openConnections = 0;
-    this.transport = null;
     this.logger.event({
       level: 'warn',
       source: 'lark',
@@ -270,6 +282,31 @@ export class LarkWebSocketClient {
       message: 'Lark WebSocket error',
       data: { attempts: this.attemptCount, error: this.lastError },
     });
+    this.transportDown();
+  }
+
+  private handleTransportClose(reason: string): void {
+    this.lastError = reason;
+    this.lastErrorAt = new Date().toISOString();
+    this.logger.event({
+      level: 'warn',
+      source: 'lark',
+      code: 'lark_ws_closed',
+      message: 'the Lark WebSocket closed',
+      data: { attempts: this.attemptCount, reason },
+    });
+    this.transportDown();
+  }
+
+  /**
+   * Shared teardown for a transport that is gone. The client owns reconnection —
+   * the SDK is started with `autoReconnect: false` — so this is the only path
+   * back to a live connection after a drop.
+   */
+  private transportDown(): void {
+    this.consecutiveFailures += 1;
+    this.openConnections = 0;
+    this.transport = null;
     if (this.stopped) {
       this.state = 'stopped';
       return;
@@ -324,14 +361,25 @@ export class LarkWebSocketClient {
       appId: this.options.appId,
       appSecret: this.options.appSecret,
       autoReconnect: false, // the client owns the backoff and reconnect policy
+      // The SDK's own logger is the only lifecycle channel it exposes, and the
+      // pong arrives as a `trace` line, so the level has to be trace. Injected
+      // loggers are called by the SDK's LoggerProxy, which passes the arguments
+      // as a single array — `sdkLifecycleLogger` flattens that back out.
+      loggerLevel: sdk.LoggerLevel?.trace ?? 5,
+      logger: sdkLifecycleLogger(hooks),
     });
     return {
       start: async () => {
+        // `WSClient.start` resolves as soon as it has *asked* to connect: it does
+        // not await the handshake. Readiness therefore comes from the lifecycle
+        // logger, never from this promise.
         await wsClient.start({ eventDispatcher: dispatcher });
-        hooks.onReady();
       },
       stop: async () => {
-        // 1.48.0 exposes no public close(); terminate the socket best-effort.
+        // The one place the adapter reaches into the SDK. 1.48.0 exposes no public
+        // close(), so the socket is terminated directly; the version is pinned
+        // exactly in package.json and a test asserts the pin, so an upgrade that
+        // changes these fields fails loudly instead of leaking a connection.
         const internal = wsClient as unknown as {
           pingInterval?: ReturnType<typeof setTimeout>;
           wsConfig?: { getWSInstance?: () => { terminate?: () => void } | null };
@@ -341,6 +389,64 @@ export class LarkWebSocketClient {
       },
     };
   }
+}
+
+/** The SDK log lines this adapter treats as connection lifecycle signals. */
+export const SDK_LIFECYCLE_HINTS = {
+  ready: 'ws client ready',
+  connected: 'ws connect success',
+  connectFailed: 'ws connect failed',
+  closed: 'client closed',
+  error: 'ws error',
+  pong: 'receive pong',
+} as const;
+
+/**
+ * Turn the SDK's log lines into transport lifecycle callbacks.
+ *
+ * 1.48.0 exposes no events, no `close()` and no status: `WSClient` has exactly one
+ * public method, `start`. The `logger` constructor parameter is public, though,
+ * and the SDK routes every lifecycle line through it — so this adapter observes
+ * the connection instead of reaching into the client's private fields.
+ *
+ * The lines are part of the pinned version (`@larksuiteoapi/node-sdk` is pinned
+ * exactly in package.json, and a test asserts both the pin and this mapping). If
+ * an upgrade renames them, the signals stop arriving and the client reports
+ * `connecting` rather than claiming a connection it cannot see: a visible
+ * degradation instead of a silent one.
+ *
+ * Everything not recognised is dropped, so none of the SDK's own logging reaches
+ * our log — and neither does anything derived from the app secret.
+ */
+export function sdkLifecycleLogger(hooks: LarkTransportHooks): SdkLogger {
+  const flatten = (parts: unknown[]): string =>
+    parts
+      .flat(4)
+      .map((part) => (typeof part === 'string' ? part : ''))
+      .join(' ');
+
+  const dispatch = (line: string): void => {
+    if (line.includes(SDK_LIFECYCLE_HINTS.pong)) {
+      hooks.onHeartbeat();
+    } else if (
+      line.includes(SDK_LIFECYCLE_HINTS.ready) ||
+      line.includes(SDK_LIFECYCLE_HINTS.connected)
+    ) {
+      hooks.onReady();
+    } else if (line.includes(SDK_LIFECYCLE_HINTS.closed)) {
+      hooks.onClose('the socket closed');
+    } else if (
+      line.includes(SDK_LIFECYCLE_HINTS.connectFailed) ||
+      line.includes(SDK_LIFECYCLE_HINTS.error)
+    ) {
+      hooks.onError(new Error('the Lark WebSocket reported an error'));
+    }
+  };
+
+  const record = (...parts: unknown[]): void => {
+    dispatch(flatten(parts));
+  };
+  return { error: record, warn: record, info: record, debug: record, trace: record };
 }
 
 // ---------------------------------------------------------------------------
@@ -865,6 +971,19 @@ interface SdkEventDispatcher {
 
 interface SdkWebSocketClient {
   start(params: { eventDispatcher: unknown }): Promise<void>;
+}
+
+/**
+ * The SDK's logger contract. A supplied logger is wrapped by the SDK's own
+ * `LoggerProxy`, which filters by level and then calls it with the arguments
+ * packed into a single array.
+ */
+interface SdkLogger {
+  error(...msg: unknown[]): void;
+  warn(...msg: unknown[]): void;
+  info(...msg: unknown[]): void;
+  debug(...msg: unknown[]): void;
+  trace(...msg: unknown[]): void;
 }
 
 interface SdkModule {

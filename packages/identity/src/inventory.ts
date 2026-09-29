@@ -189,3 +189,58 @@ export function verifyInventorySignature(
 export function serializeManifestSignature(manifest: ManifestSignature): string {
   return `${JSON.stringify(manifest, null, 2)}\n`;
 }
+
+export const ADMIN_PUBLIC_SCHEMA = 'flop-close-call-admin-public-v1';
+
+/**
+ * The offline admin key's public half.
+ *
+ * The VPS holds this and the signed inventory, and nothing else: it can verify
+ * that the inventory is the one the admin signed, but it cannot sign a new one.
+ * That is the whole point of separating the two — an inventory signed by the
+ * same key that lives on the trading host is not an attestation of anything.
+ */
+export interface AdminPublicKey {
+  schema: typeof ADMIN_PUBLIC_SCHEMA;
+  season: string;
+  created_at: string;
+  admin_did: string;
+  admin_public_key_multibase: string;
+}
+
+export function buildAdminPublicKey(adminSeed: Uint8Array, season: string, createdAt: string): AdminPublicKey {
+  const adminDid = didFromSeed(adminSeed);
+  return {
+    schema: ADMIN_PUBLIC_SCHEMA,
+    season,
+    created_at: createdAt,
+    admin_did: adminDid,
+    admin_public_key_multibase: publicKeyToMultibase(didToPublicKey(adminDid)),
+  };
+}
+
+export function serializeAdminPublicKey(key: AdminPublicKey): string {
+  return `${JSON.stringify(key, null, 2)}\n`;
+}
+
+export function parseAdminPublicKey(text: string): AdminPublicKey {
+  let parsed: AdminPublicKey;
+  try {
+    parsed = JSON.parse(text) as AdminPublicKey;
+  } catch (error) {
+    throw new IdentityError(`admin public key is not valid JSON: ${String(error)}`);
+  }
+  if (parsed?.schema !== ADMIN_PUBLIC_SCHEMA) {
+    throw new IdentityError(`admin public key schema must be ${ADMIN_PUBLIC_SCHEMA}`);
+  }
+  if (typeof parsed.admin_did !== 'string' || parsed.admin_did.length === 0) {
+    throw new IdentityError('admin public key has no admin_did');
+  }
+  // Round-trip the DID through its public key: a file whose DID and multibase
+  // disagree is not describing a key that exists.
+  const derived = publicKeyToMultibase(didToPublicKey(parsed.admin_did));
+  if (derived !== parsed.admin_public_key_multibase) {
+    throw new IdentityError('admin public key multibase does not match its DID');
+  }
+  return parsed;
+}

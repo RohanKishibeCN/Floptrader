@@ -106,21 +106,28 @@ curl -s localhost:8780/health
 curl -s localhost:8780/status | jq .
 ```
 
-Live trading requires both variables. One alone will not arm it:
+Live takes four separate decisions, and the process refuses to start
+half-armed. `FLOP_MODE=live` alone is a startup error, not a configuration that
+looks armed and is not:
 
 ```bash
-FLOP_MODE=live FLOP_LIVE_CONFIRM=close-1 pnpm start
+FLOP_MODE=live \
+FLOP_LIVE_CONFIRM=close-1 \
+FLOP_ALLOW_REGISTRATION=true \
+EXPECTED_REFEREE_DID=did:key:z6Mk... \
+pnpm start
 ```
 
-`FLOP_MODE=live` without `FLOP_LIVE_CONFIRM=close-1` is a startup error rather
-than a configuration that looks armed and is not.
+| Gate | Why it is separate |
+| --- | --- |
+| `FLOP_LIVE_CONFIRM=close-1` | confirms the contest id, so `live` cannot be armed by one stray variable |
+| `FLOP_ALLOW_REGISTRATION=true` | required in live: 150 unregistered agents would trade on accounts the referee never minted |
+| `EXPECTED_REFEREE_DID` | required in live: without a pin the first signed post on a public room decides who the referee is |
+| `FLOP_ALLOW_TRADING=true` | a second, later decision — run live+registration until all 150 readbacks are in, then arm trading |
 
-Posting owner registrations is separately gated, because it is the one write the
-whole project depends on:
-
-```bash
-FLOP_ALLOW_REGISTRATION=true pnpm start
-```
+`REQUIRE_FULL_FLEET=true` (the default) also holds the fleet to exactly 150
+agents in five groups of thirty at startup; `pnpm cli identities generate` refuses
+to write a short one. `REQUIRE_FULL_FLEET=false` is for dry runs only.
 
 ## Deploying on the VPS (from git)
 
@@ -129,37 +136,73 @@ The VPS runs the code straight out of this repository. `data/`, `secrets/`,
 templates and the vendored reference artifacts — and nothing that identifies an
 agent.
 
+State lives **outside** the release directory, so a rollback moves code and
+nothing else:
+
+```text
+/opt/flop-close-call/
+├── releases/
+│   ├── <version>/          # code, dist, reference/, package.json, lockfile
+│   └── ...
+├── current -> releases/<version>
+├── shared/
+│   ├── flop.env            # the environment file systemd loads
+│   └── data/               # SQLite, archive, backups, participation evidence
+└── secrets/                # agents.bundle.age, runtime.key, admin-public.key
+```
+
+The paths in `shared/flop.env` are absolute for exactly this reason:
+
+```env
+DATA_DIR=/opt/flop-close-call/shared/data
+SECRETS_DIR=/opt/flop-close-call/secrets
+```
+
+Logs are not a file: the unit sends stdout and stderr to the journal, so use
+`journalctl -u flop-close-call`.
+
 ```bash
 # once
-git clone https://github.com/RohanKishibeCN/Floptrader.git /srv/floptrader
-cd /srv/floptrader
-pnpm install --frozen-lockfile
-pnpm build
+sudo mkdir -p /opt/flop-close-call/{releases,shared,secrets}
+sudo chown -R flop:flop /opt/flop-close-call
+sudo chmod 700 /opt/flop-close-call/secrets
 
-cp .env.example .env                     # then fill it in
-# age keygen + `pnpm cli identities generate --count 150` as above, so the
-# secrets bundle is created on this machine and never travels through git
+git clone https://github.com/RohanKishibeCN/Floptrader.git /opt/flop-close-call/releases/0.1.0
+cd /opt/flop-close-call/releases/0.1.0
+pnpm install --frozen-lockfile && pnpm build
+ln -sfn /opt/flop-close-call/releases/0.1.0 /opt/flop-close-call/current
+
+# age keygen + `pnpm cli identities generate --count 150` as above, writing into
+# /opt/flop-close-call/secrets, so the bundle is created here and never travels
+# through git. `identities generate` writes secrets/admin-public.key — only that
+# public half belongs on this host.
+install -m 600 /dev/null /opt/flop-close-call/shared/flop.env
+# fill it in from .env.example, with the absolute paths above
 
 sudo cp systemd/flop-close-call.service /etc/systemd/system/
+sudo systemd-analyze verify /etc/systemd/system/flop-close-call.service
 sudo systemctl daemon-reload && sudo systemctl enable --now flop-close-call
 ```
 
 Updating is a pull plus a rebuild — never a `git push` of runtime state:
 
 ```bash
-cd /srv/floptrader
-git pull --ff-only
-pnpm install --frozen-lockfile
-pnpm build
+cd /opt/flop-close-call/releases/0.1.1    # a fresh clone or a ff-only pull
+pnpm install --frozen-lockfile && pnpm build
+ln -sfn /opt/flop-close-call/releases/0.1.1 /opt/flop-close-call/current
 sudo systemctl restart flop-close-call
+curl -s localhost:8780/health
+# on failure: point `current` back at 0.1.0 and restart
 ```
 
-Two rules make this safe. First, a deployment never regenerates identities: the
-bundle in `secrets/` and the cursor and registration evidence in `data/` are the
-contest record, and they stay on the machine. Second, the official package pin is
-a separate, human decision — see the release procedure below. Pulling a new
-commit of *our* code does not move the pin, and a drift in the *official* package
-still pauses active trading rather than switching anything.
+Three rules make this safe. First, a deployment never regenerates identities:
+the bundle in `secrets/` and the cursor and registration evidence in `shared/`
+are the contest record, and they stay on the machine. Second, the official
+package pin is a separate, human decision — see the release procedure below;
+pulling a new commit of *our* code does not move the pin, and a drift in the
+*official* package still pauses active trading rather than switching anything.
+Third, systemd is the only supervisor; `ecosystem.config.cjs` is a development
+tool and must not be run beside the unit.
 
 ## The five strategy groups
 
@@ -209,6 +252,26 @@ local SQLite and process metrics. They never call DeepSeek, and they never
 contain a seed, a key, a secret, or the full list of 150 DIDs — sender DIDs are
 summarised before they reach the text.
 
+Three honest caveats about the WebSocket half:
+
+1. `@larksuiteoapi/node-sdk` is pinned to **exactly `1.48.0`** in `package.json`
+   (no caret). The adapter reads two things that are version facts, not API:
+   the private field it calls during `stop()` to clear the ping timer and
+   terminate the socket, and the log text it matches on. The pin has no caret,
+   so `pnpm install` cannot resolve a different build behind our back.
+2. That version exposes no lifecycle API — `WSClient` has `start()` and nothing
+   else, and `start()` resolves even when connect fails. The "is the connection
+   alive" signal therefore comes from the SDK's `logger` channel, which is why
+   `loggerLevel` must stay `trace`; `SDK_LIFECYCLE_HINTS` maps the six strings
+   the SDK emits (`ws client ready`, `ws connect success`, `ws connect failed`,
+   `client closed`, `ws error`, `receive pong`). If the pin is ever bumped, the
+   test `finds every lifecycle hint in the installed SDK build` fails first and
+   names what moved.
+3. **No real-network staging test has been run.** Every assertion here is driven
+   by a fake transport and a fake notifier; the real WebSocket has never been
+   dialled from this repository. That is the one claim in this README that rests
+   on the SDK's documented behaviour rather than on a test.
+
 ## Degradation ladder
 
 The box is shared. Each tier is entered by measurement, and leaving it is
@@ -236,7 +299,7 @@ pnpm disk-report           # sizes, retention windows, and what maintenance woul
 official repository every 12 minutes (ETag / `If-Modified-Since`), records the
 commit, the release, and the hashes of `manifest.json`, `contest.json`,
 `close-call-game.md` and `close_call_fold.py`, and stops there. It never runs
-`git pull`, `npm install`, `pnpm update`, or `pm2 reload`, and
+`git pull`, `npm install`, `pnpm update`, or `systemctl restart`, and
 `ReleaseManager.assertNoAutomaticApply()` throws if a future patch tries to wire
 that in.
 
@@ -252,10 +315,15 @@ pnpm lint && pnpm typecheck && pnpm test && pnpm build
 pnpm verify:all
 # official fold comparison, then a dry-run
 # human confirmation
-pm2 reload flop-close-call
+ln -sfn /opt/flop-close-call/releases/<version> /opt/flop-close-call/current
+sudo systemctl restart flop-close-call
 curl -s localhost:8780/health
-# on failure: point `current` back and reload
+# on failure: point `current` back and restart
 ```
+
+The rollback moves a symlink, so it cannot switch the database, the key bundle or
+the environment file: those are absolute paths under `shared/` and `secrets/`,
+outside every release.
 
 If the referee's seed quotes a package hash that disagrees with the pin, active
 trading stops, the reader keeps reading, both hashes are recorded, and a Lark
@@ -325,7 +393,7 @@ packages/strategy/         indicator maths, the five profiles, the deterministic
 packages/technocore/       client, protocol, room reader/writer, cursor store,
                            referee verifier, archive, retry, package pin
 packages/storage/          SQLite (WAL) schema, repositories, retention, backup
-tests/                     26 files covering the invariants above
+tests/                     27 files covering the invariants above
 scripts/                   build, verify-all, soak-test, cost-report, disk-report,
                            generate-identities, verify-backup
 reference/                 the vendored, hash-pinned official artifacts

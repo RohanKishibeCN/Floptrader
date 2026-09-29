@@ -14,17 +14,21 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+  DEFAULT_AGENT_COUNT,
   ageRecipientFor,
+  buildAdminPublicKey,
   buildInventory,
   createAgeIdentity,
   didFromSeed,
   encryptBundle,
   serializeAdminKey,
+  serializeAdminPublicKey,
   serializeBundle,
   serializeInventory,
   serializeManifestSignature,
   signInventory,
 } from '@flop/identity';
+import { computeLocalPackageManifestHash } from '@flop/technocore';
 import { loadConfig, type Config } from '../../apps/orchestrator/src/config.js';
 import { createRuntime, writeIdentityMetadata, type Runtime, type RuntimeOverrides } from '../../apps/orchestrator/src/main.js';
 import type { LarkSendClient, WsFactory } from '../../apps/orchestrator/src/lark.js';
@@ -62,6 +66,17 @@ export function fakeWsFactory(): WsFactory {
   });
 }
 
+/** The referee's deterministic seed, so its DID is stable across the suite. */
+export const HARNESS_REFEREE_SEED = new Uint8Array(32).fill(11);
+/**
+ * The referee DID the harness pins.
+ *
+ * Production refuses to start live without `EXPECTED_REFEREE_DID`, so the
+ * fixture pins the fake referee too: a test that could only ever talk to the
+ * unpinned path would not exercise the wiring that matters.
+ */
+export const HARNESS_REFEREE_DID = didFromSeed(HARNESS_REFEREE_SEED);
+
 /**
  * A referee identity that signs its posts.
  *
@@ -70,8 +85,8 @@ export function fakeWsFactory(): WsFactory {
  * produce genuinely signed posts, not just well-shaped JSON.
  */
 export class FakeReferee {
-  readonly seed = new Uint8Array(32).fill(11);
-  readonly did = didFromSeed(new Uint8Array(32).fill(11));
+  readonly seed = HARNESS_REFEREE_SEED;
+  readonly did = HARNESS_REFEREE_DID;
   private nonce = 0;
 
   constructor(private readonly transport: FakeTransport) {}
@@ -173,6 +188,22 @@ export interface Harness {
 }
 
 export const REFERENCE_CONTEST_PATH = join(process.cwd(), 'reference', 'contest.json');
+export const REFERENCE_DIR = join(process.cwd(), 'reference');
+
+/**
+ * The hash the harness pins into the bundle, the inventory and every seed.
+ *
+ * It is the real sha256 of the vendored `reference/manifest.json`, computed the
+ * same way the CLI and `createRuntime` compute it — a stand-in hash would make
+ * the harness pass while the production pin rejected the same inputs.
+ */
+export const HARNESS_PACKAGE_HASH: string = (() => {
+  const pin = computeLocalPackageManifestHash(REFERENCE_DIR);
+  if (!pin.ok) {
+    throw new Error(`the vendored reference package does not verify: ${pin.problems.join('; ')}`);
+  }
+  return pin.manifestHash;
+})();
 
 /**
  * Build a runnable orchestrator in a temp directory.
@@ -198,7 +229,7 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
 
   const agents = generateAgents(agentCount, true);
   const createdAt = new Date('2026-09-25T12:00:00.000Z').toISOString();
-  const packageHash = 'b'.repeat(64);
+  const packageHash = HARNESS_PACKAGE_HASH;
 
   const bundle = serializeBundle(agents, {
     season: 'close-1',
@@ -225,10 +256,17 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
     DATA_DIR: dataDir,
     SECRETS_DIR: secretsDir,
     CONTEST_JSON_PATH: REFERENCE_CONTEST_PATH,
+    REFERENCE_DIR,
     AGE_IDENTITY_FILE: identityFile,
     AGE_RECIPIENT_VPS: recipient,
     FLOP_MODE: 'dry-run',
     FLOP_ALLOW_REGISTRATION: 'true',
+    // The referee is pinned exactly as production pins it; a fixture that could
+    // only ever exercise the permissive path would not test the wiring.
+    EXPECTED_REFEREE_DID: HARNESS_REFEREE_DID,
+    // The full-fleet rule is enforced for a full-size harness and relaxed for
+    // the small fixtures, so both the assertion and the cheaper tests are live.
+    REQUIRE_FULL_FLEET: agentCount === DEFAULT_AGENT_COUNT ? 'true' : 'false',
     LARK_MODE: 'off',
     LARK_APP_ID: '',
     LARK_APP_SECRET: '',
@@ -249,6 +287,13 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
   writeFileSync(
     join(config.paths.public, 'agents.manifest.sig'),
     serializeManifestSignature(signInventory(inventory, adminSeed, createdAt)),
+    { mode: 0o644 },
+  );
+  // The public half only. Exactly as the CLI writes it: the VPS verifies the
+  // inventory against a DID whose private key never lands on this host.
+  writeFileSync(
+    join(secretsDir, 'admin-public.key'),
+    serializeAdminPublicKey(buildAdminPublicKey(adminSeed, 'close-1', createdAt)),
     { mode: 0o644 },
   );
   writeIdentityMetadata(config, agents);

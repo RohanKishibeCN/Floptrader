@@ -19,7 +19,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { signRoomMessage, verifyRoomSignatureForRoom } from '@flop/identity';
 import { ownerRegistrationText } from '../apps/orchestrator/src/writer.js';
-import { buildHarness, HARNESS_ROOMS, type Harness } from './support/orchestrator.js';
+import { buildHarness, HARNESS_PACKAGE_HASH, HARNESS_ROOMS, type Harness } from './support/orchestrator.js';
 
 describe('owner registration and readback', () => {
   let harness: Harness;
@@ -140,6 +140,9 @@ describe('mint reconciliation', () => {
     harness = await buildHarness({ agentCount: 8 });
     // The referee rooms exist from the start; a real service always has them.
     for (const room of HARNESS_ROOMS) harness.transport.room(room);
+    // The seed comes first: past the pin, the verifier refuses price and flow
+    // posts that arrive before it, which is exactly what production does.
+    harness.referee.seedPost(HARNESS_PACKAGE_HASH);
   }, 120_000);
 
   afterEach(async () => {

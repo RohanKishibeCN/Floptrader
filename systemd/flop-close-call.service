@@ -9,15 +9,18 @@ Wants=network-online.target
 Type=simple
 User=flop
 Group=flop
+# `current` is a symlink to a release. Only code lives there.
 WorkingDirectory=/opt/flop-close-call/current
 
-# The working directory is a symlink to a release; loading `.env` from it means a
-# rollback is a symlink move plus a restart, no config edit.
-EnvironmentFile=/opt/flop-close-call/current/.env
+# The environment file lives OUTSIDE the release. Loading it from `current/`
+# would make a rollback swap the configuration — and the paths in it — at the
+# same moment as the code, which is exactly the thing a rollback must not do.
+EnvironmentFile=/opt/flop-close-call/shared/flop.env
 
 # PM2 is deliberately NOT used here: systemd is the supervisor, so there is one
 # cgroup with one process, and the resource ceilings below are enforced by the
-# kernel rather than promised by a config file.
+# kernel rather than promised by a config file. `ecosystem.config.cjs` exists for
+# development only.
 ExecStart=/usr/bin/node --max-old-space-size=512 /opt/flop-close-call/current/dist/main.mjs
 Restart=always
 RestartSec=5s
@@ -30,7 +33,7 @@ TimeoutStopSec=30s
 
 # ---- resource ceilings (2 vCPU / 4 GB VPS, shared with other tenants) --------
 # 75% of one core; MemoryHigh is a soft throttle, MemoryMax is the hard wall that
-# the process must never reach (PM2's restart line sits at 650M, below both).
+# the process must never reach.
 CPUQuota=75%
 MemoryHigh=640M
 MemoryMax=768M
@@ -46,8 +49,11 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-# Only the release tree, the data directory and the secrets directory are writable.
-ReadWritePaths=/opt/flop-close-call/current/data /opt/flop-close-call/current/secrets /opt/flop-close-call/current/logs
+# Only the shared state tree and the secrets directory are writable — the
+# release tree stays read-only, so a compromised process cannot rewrite its own
+# code or survive a rollback. `shared` holds the database, the archive, the
+# backups and the logs; `secrets` holds the encrypted bundle and the runtime key.
+ReadWritePaths=/opt/flop-close-call/shared /opt/flop-close-call/secrets
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes

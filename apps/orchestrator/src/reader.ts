@@ -22,6 +22,7 @@
 import type { Repositories, SqliteDatabase } from '@flop/storage';
 import {
   REFEREE_ROOMS,
+  REFEREE_STATE_ROOM,
   TRADING_ROOM,
   isLocked,
   parseTradeMessage,
@@ -63,6 +64,15 @@ export interface ReaderOptions {
   /** Package hash and referee DID fixed at launch, before the first seed. */
   expectedPackageHash?: string | null;
   expectedRefereeDid?: string | null;
+  /**
+   * Refuse to infer the referee from the first signed post, and refuse
+   * price/flow/final posts until a seed has been accepted.
+   *
+   * Left unset the reader keeps the permissive behaviour, which is what a unit
+   * test driving a throwaway room wants. The orchestrator always passes the
+   * value from config, where the default is `true`.
+   */
+  requireRefereePin?: boolean;
   now?: () => Date;
 }
 
@@ -73,10 +83,22 @@ export interface ReaderTick extends TickSummary {
   externalOffers: ExternalOffer[];
 }
 
-/** The rooms this process reads: five referee rooms and the trading room. */
+/**
+ * The rooms this process reads: five referee rooms and the trading room.
+ *
+ * The state room is read first in every pass. The seed lives there, and the
+ * verifier refuses a price or flow that arrives before it, so a pass that reads
+ * the price rooms first would reject a perfectly good sweep — the referee posts
+ * the seed and the prices between two of our reads, and `contest.json`'s room
+ * order is not the referee's posting order.
+ */
 export function roomsFor(rules: Rules): string[] {
   const referee = rules.refereeRooms.length > 0 ? [...rules.refereeRooms] : [...REFEREE_ROOMS];
-  return [...new Set([...referee, rules.tradingRoom || TRADING_ROOM])];
+  const ordered = [
+    ...referee.filter((room) => room === REFEREE_STATE_ROOM),
+    ...referee.filter((room) => room !== REFEREE_STATE_ROOM),
+  ];
+  return [...new Set([...ordered, rules.tradingRoom || TRADING_ROOM])];
 }
 
 export class OrchestratorReader {
@@ -97,11 +119,14 @@ export class OrchestratorReader {
     this.now = options.now ?? (() => new Date());
     this.logger = options.logger;
 
+    const requirePin = options.requireRefereePin === true;
     this.verifier = new RefereeVerifier({
       rules: options.rules,
       logger: options.logger,
       expectedPackageHash: options.expectedPackageHash ?? null,
       expectedRefereeDid: options.expectedRefereeDid ?? null,
+      unpinnedPolicy: requirePin ? 'reject' : 'adopt_first_sender',
+      requireSeedBeforeState: requirePin,
     });
     this.roomReader = new RoomReader({
       client: options.client,
@@ -226,6 +251,47 @@ export class OrchestratorReader {
   /** True once the reader has completed a first pass over every room. */
   get warmedUp(): boolean {
     return this.roomReader.warmedUp;
+  }
+
+  /**
+   * Rebuild the verifier from the referee history already in SQLite.
+   *
+   * Called once at startup, before the first network read. The cursor resume
+   * point is *after* these posts, so without a replay the process would come back
+   * with an empty market view — no reference, no limits, no sweep, no final
+   * price — and would stay that way until the referee posted again, which after
+   * the lock it never will.
+   *
+   * `created_at` stands in for the message timestamp (the snapshot table does
+   * not store the room's `ts`); it is our ingest time, so an age derived from it
+   * is if anything slightly younger than the truth. Nothing gates trading on
+   * `ageSeconds`, so that is the conservative direction to be wrong in.
+   */
+  hydrateFromSnapshots(): { applied: number; skipped: number } {
+    let applied = 0;
+    let skipped = 0;
+    for (const row of this.repositories.referee.orderedForReplay()) {
+      let payload: unknown;
+      try {
+        payload = JSON.parse(row.payload);
+      } catch {
+        skipped += 1;
+        continue;
+      }
+      const ok = this.verifier.replay({
+        seq: row.seq,
+        ts: row.created_at,
+        kind: row.kind,
+        senderDid: row.referee_did,
+        payload,
+      });
+      if (ok) applied += 1;
+      else skipped += 1;
+    }
+    if (applied > 0) {
+      this.persistSweepState(this.verifier.snapshot(this.now()));
+    }
+    return { applied, skipped };
   }
 
   gaps(): { total: number; rooms: string[]; resets: string[] } {

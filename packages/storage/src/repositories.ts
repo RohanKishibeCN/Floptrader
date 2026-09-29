@@ -184,6 +184,11 @@ export type ParticipationStatus =
   | 'before_lock_confirmed'
   | 'mint_observed'
   | 'mint_unknown'
+  /**
+   * The lock passed with no readback. Terminal: this agent never became an owner,
+   * and saying so is better than leaving it looking like a registration in flight.
+   */
+  | 'registration_closed'
   | 'failed';
 
 export interface ParticipationRow {
@@ -801,6 +806,27 @@ export class RefereeRepository {
         `SELECT * FROM referee_snapshots WHERE kind = ? AND sweep >= ? ORDER BY sweep ASC, seq ASC`,
       )
       .all(kind, sweep) as RefereeSnapshotRow[];
+  }
+
+  /**
+   * Signature-validated snapshots in the order the verifier must replay them.
+   *
+   * The seed fixes the season, the package and the referee's baseline, so it has
+   * to come first; `final` last; everything else by sweep and seq. Only rows that
+   * verified when they were ingested are returned — a row we rejected is not
+   * evidence and must not be replayed as if it were.
+   */
+  orderedForReplay(limit = 5000): RefereeSnapshotRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM referee_snapshots
+          WHERE signature_valid = 1
+          ORDER BY CASE kind WHEN 'seed' THEN 0 WHEN 'final' THEN 2 ELSE 1 END ASC,
+                   COALESCE(sweep, 0) ASC,
+                   seq ASC
+          LIMIT ?`,
+      )
+      .all(limit) as RefereeSnapshotRow[];
   }
 
   count(): number {

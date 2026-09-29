@@ -6,6 +6,7 @@
  * a stop that actually stops, and heartbeat staleness. The real SDK transport is
  * never exercised here.
  */
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -17,8 +18,10 @@ import {
 } from '@flop/storage';
 import {
   LarkWebSocketClient,
+  SDK_LIFECYCLE_HINTS,
   backoffDelayMs,
   nominalBackoffMs,
+  sdkLifecycleLogger,
   type LarkWebSocketClientOptions,
   type WsFactory,
   type WsLike,
@@ -166,20 +169,60 @@ describe('LarkWebSocketClient connection lifecycle', () => {
 
   it('reports a heartbeat older than the timeout as stale', async () => {
     vi.useFakeTimers();
-    const { factory, transports } = makeFactory();
+    const { factory } = makeFactory();
     const client = new LarkWebSocketClient(options({ wsFactory: factory }));
 
     await client.start();
-    // No heartbeat yet: unknown age, not stale.
-    expect(client.status.sinceLastHeartbeatMs).toBeNull();
-    expect(client.status.heartbeatStale).toBe(false);
-
-    transports[0]!.options.onHeartbeat();
+    // A fresh connection is alive by definition: the clock starts at connect, so
+    // "stale" means the socket went quiet, not "we have never seen a pong".
+    expect(client.status.sinceLastHeartbeatMs).toBe(0);
     expect(client.status.heartbeatStale).toBe(false);
 
     await vi.advanceTimersByTimeAsync(HEARTBEAT_TIMEOUT_MS + 1);
     expect(client.status.sinceLastHeartbeatMs).toBeGreaterThan(HEARTBEAT_TIMEOUT_MS);
     expect(client.status.heartbeatStale).toBe(true);
+  });
+
+  it('reconnects when the transport reports the socket closed', async () => {
+    vi.useFakeTimers();
+    const { factory, transports } = makeFactory();
+    const client = new LarkWebSocketClient(options({ wsFactory: factory }));
+
+    await client.start();
+    expect(client.status.connected).toBe(true);
+
+    // The SDK runs with `autoReconnect: false`, so a close is ours to handle:
+    // without this the process would keep reporting a connection that is gone.
+    transports[0]!.options.onClose('the socket closed');
+    expect(client.status.connected).toBe(false);
+    expect(client.status.state).toBe('reconnecting');
+    expect(client.status.connections).toBe(0);
+
+    await vi.advanceTimersByTimeAsync(RECONNECT_MIN_MS * 2);
+    expect(transports.length).toBeGreaterThanOrEqual(2);
+    expect(client.status.connected).toBe(true);
+  });
+
+  it('stays connecting while no transport has reported readiness', async () => {
+    const { factory } = makeFactory({ ready: false });
+    const client = new LarkWebSocketClient(options({ wsFactory: factory }));
+
+    await client.start();
+
+    // Nothing claims a connection the client cannot observe.
+    expect(client.status.state).toBe('connecting');
+    expect(client.status.connected).toBe(false);
+    expect(client.status.connections).toBe(1);
+  });
+
+  it('keeps the app secret out of every transport error it reports', async () => {
+    const { factory } = makeFactory({ fail: true });
+    const client = new LarkWebSocketClient(options({ wsFactory: factory }));
+
+    await client.start();
+
+    expect(client.status.lastError).toBe('transport failed');
+    expect(client.status.lastError).not.toContain('super-secret-value');
   });
 });
 
@@ -204,5 +247,59 @@ describe('reconnect backoff', () => {
       expect(delay).toBeGreaterThanOrEqual(nominal * 0.8 - 1e-9);
       expect(delay).toBeLessThanOrEqual(nominal * 1.2 + 1e-9);
     }
+  });
+});
+
+/**
+ * The SDK exposes no lifecycle API in the pinned version, so the adapter reads the
+ * connection out of the SDK's own log lines. That coupling is deliberate and it
+ * has to be checked: an upgrade that renames a line would otherwise leave the
+ * client deaf, claiming `connecting` forever with no reconnect.
+ */
+describe('the SDK lifecycle adapter', () => {
+  const sdkPackage = (): { version: string } =>
+    JSON.parse(
+      readFileSync(join(process.cwd(), 'node_modules/@larksuiteoapi/node-sdk/package.json'), 'utf8'),
+    ) as { version: string };
+
+  it('pins the SDK version the adapter was verified against', () => {
+    const declared = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as {
+      dependencies: Record<string, string>;
+    };
+    // Exact, not a range: the private socket teardown and the log lines below are
+    // facts about this version.
+    expect(declared.dependencies['@larksuiteoapi/node-sdk']).toBe('1.48.0');
+    expect(sdkPackage().version).toBe('1.48.0');
+  });
+
+  it('finds every lifecycle hint in the installed SDK build', () => {
+    const source = readFileSync(
+      join(process.cwd(), 'node_modules/@larksuiteoapi/node-sdk/lib/index.js'),
+      'utf8',
+    );
+    for (const [name, hint] of Object.entries(SDK_LIFECYCLE_HINTS)) {
+      expect(source, `the pinned SDK no longer logs "${hint}" (${name})`).toContain(hint);
+    }
+  });
+
+  it('maps those lines onto the transport hooks, in the SDK’s calling shape', () => {
+    const seen: string[] = [];
+    const logger = sdkLifecycleLogger({
+      onReady: () => seen.push('ready'),
+      onClose: (reason) => seen.push(`close:${reason}`),
+      onError: () => seen.push('error'),
+      onHeartbeat: () => seen.push('pong'),
+    });
+
+    // The SDK wraps a supplied logger in its own LoggerProxy, which calls it with
+    // every argument packed into a single array — the shape this has to survive.
+    logger.trace([['[ws]', 'receive pong']]);
+    logger.info([['[ws]', 'ws client ready']]);
+    logger.debug([['[ws]', 'ws connect success']]);
+    logger.error([['[ws]', 'ws connect failed']]);
+    logger.debug([['[ws]', 'client closed']]);
+    logger.info([['[ws]', 'some other line nobody promised']]);
+
+    expect(seen).toEqual(['pong', 'ready', 'ready', 'error', 'close:the socket closed']);
   });
 });

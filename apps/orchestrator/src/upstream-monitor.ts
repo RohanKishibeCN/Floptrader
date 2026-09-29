@@ -341,6 +341,10 @@ export class UpstreamMonitor {
 /**
  * The documented release procedure, expressed as data so the CLI can print it and
  * a test can assert it stays complete. Nothing here is executed by the monitor.
+ *
+ * The steps run *in the candidate release directory*, and the restart is a
+ * systemd one: systemd is the only supervisor on the VPS, so there is one
+ * cgroup, one process and one restart policy. PM2 is not part of a release.
  */
 export const RELEASE_STEPS: readonly string[] = [
   'fetch the candidate release from upstream',
@@ -354,7 +358,8 @@ export const RELEASE_STEPS: readonly string[] = [
   'official fold',
   'dry-run',
   'human confirmation',
-  'pm2 reload',
+  'move the current symlink',
+  'systemctl restart flop-close-call',
   'health check',
   'rollback to the previous release on failure',
 ];

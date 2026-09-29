@@ -74,7 +74,9 @@ export const DEFAULT_TRADE_HORIZON_SWEEPS = 24;
 /**
  * Status precedence. Higher wins, and a status is never replaced by a lower one.
  * `failed` is deliberately below `created`: a permanent refusal is retried on a
- * later tick rather than being final.
+ * later tick rather than being final. `registration_closed` outranks `posted`:
+ * once the lock has passed with no readback, the miss is terminal and must not
+ * be walked back into "still in flight" by a later tick.
  */
 const PARTICIPATION_RANK: Record<ParticipationStatus, number> = {
   failed: -1,
@@ -82,8 +84,9 @@ const PARTICIPATION_RANK: Record<ParticipationStatus, number> = {
   posted: 1,
   readback_confirmed: 2,
   before_lock_confirmed: 3,
-  mint_unknown: 4,
-  mint_observed: 5,
+  registration_closed: 4,
+  mint_unknown: 5,
+  mint_observed: 6,
 };
 
 function advanceStatus(
@@ -467,18 +470,43 @@ export class OrchestratorScheduler {
       const seen = echoed.get(did);
       if (!seen) continue;
       const existing = this.repositories.participation.get(agentId);
-      const next = advanceStatus(
-        existing?.status ?? 'created',
+      const confirmed: ParticipationStatus =
         verifierState.currentSweep === null || verifierState.currentSweep <= this.rules.lockSweep
           ? 'before_lock_confirmed'
-          : 'readback_confirmed',
-      );
+          : 'readback_confirmed';
+      // The room echoing our exact bytes is ground truth: it settles the row even
+      // if a previous tick had already written it off as `registration_closed`.
+      const next =
+        existing?.status === 'registration_closed'
+          ? confirmed
+          : advanceStatus(existing?.status ?? 'created', confirmed);
       if (existing?.status === next && existing.readback_at !== null) continue;
       this.recordReadback(agentId, did, seen, existing, next);
       outcome.readback += 1;
     }
 
-    // 2. Post anything that has not been seen on the room yet.
+    // 2. The lock is a hard stop for owner registrations. Past it a registration
+    // cannot mint, so posting one is pure noise on a contest room — and a row
+    // still waiting for a readback is not "in flight", it is a terminal miss.
+    const sweep = verifierState.currentSweep;
+    if (sweep !== null && sweep > this.rules.lockSweep) {
+      const closed = this.closeUnregistered();
+      outcome.pending = 0;
+      // Only the tick that actually closes rows says anything: past the lock
+      // every tick takes this branch, and a once-a-minute line would be noise.
+      if (closed > 0) {
+        this.logger.event({
+          level: 'warn',
+          source: 'scheduler',
+          code: 'registration_closed',
+          message: `the lock passed at sweep ${this.rules.lockSweep}; ${closed} agent(s) never got a readback`,
+          data: { sweep, lockSweep: this.rules.lockSweep, closed },
+        });
+      }
+      return outcome;
+    }
+
+    // 3. Post anything that has not been seen on the room yet.
     if (!this.config.allowRegistration) {
       this.logger.event({
         level: 'info',
@@ -513,6 +541,38 @@ export class OrchestratorScheduler {
     outcome.pending = this.repositories.participation.all().filter((row) => row.readback_at === null)
       .length;
     return outcome;
+  }
+
+  /**
+   * Write off every row that was attempted but never read back, once the lock
+   * has passed. `registration_closed` is terminal and outranks `posted`, so a
+   * later tick cannot resurrect the row as if it were still in flight.
+   *
+   * Rows with no recorded attempt are left alone: they were never posted, so
+   * "closed" would misreport what happened.
+   */
+  private closeUnregistered(): number {
+    let closed = 0;
+    for (const row of this.repositories.participation.all()) {
+      if (row.readback_at !== null) continue;
+      if (row.attempts === 0) continue;
+      if (row.status === 'registration_closed') continue;
+      this.repositories.participation.upsert({
+        ...row,
+        status: 'registration_closed',
+        last_error: row.last_error ?? 'lock_passed_without_readback',
+        updated_at: this.now().toISOString(),
+      });
+      closed += 1;
+      this.logger.event({
+        level: 'warn',
+        source: 'scheduler',
+        code: 'owner_registration_closed',
+        message: `${row.agent_id} never got a readback before the lock`,
+        data: { agentId: row.agent_id, attempts: row.attempts, previous: row.status },
+      });
+    }
+    return closed;
   }
 
   private async postRegistration(
@@ -870,6 +930,21 @@ export class OrchestratorScheduler {
           result.dryRun += 1;
           continue;
         }
+        // Live registration and live trading are separate commitments. An
+        // operator who has armed registration but not trading is rehearsing the
+        // real fleet, so the trade is recorded as a refusal rather than posted.
+        if (!this.config.allowTrading) {
+          this.recordTrade(
+            agentId,
+            terms,
+            'refused',
+            'trading_not_armed',
+            signed.maker_sig,
+            signed.taker_sig,
+          );
+          result.refused += 1;
+          continue;
+        }
         const write = await this.writer.postTrade(agentId, this.rules.tradingRoom, signed.text);
         if (write.ok) {
           this.recordTrade(
@@ -937,7 +1012,12 @@ export class OrchestratorScheduler {
           rules: this.rules,
           sweep: snapshot.sweep,
           reference: snapshot.reference,
-          close: snapshot.reference,
+          // The clawback is priced by the sweep's closing price, which the referee
+          // publishes only when the sweep ends — an offer has to be answered before
+          // that. Null says so, and the validator bounds our fee by the worst case
+          // instead of pricing it at the reference and understating it on exactly
+          // the move that matters. A void trade is strictly worse than a refusal.
+          close: null,
           localDids: this.keyStore.didSet(),
           settledIds: new Set(this.repositories.trades.settledIds()),
           accounts: new Map(this.riskBook),
