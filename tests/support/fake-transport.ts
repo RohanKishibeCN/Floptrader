@@ -152,12 +152,23 @@ export class FakeTransport {
   maxInFlight = 0;
   /** Injectable clock for the duplicate-window arithmetic. */
   now: () => number;
+  /**
+   * How long a GET read is held before it answers, in milliseconds.
+   *
+   * Zero by default: every existing test drives reads with explicit `tick()`
+   * calls, so a read must return as fast as it always has. The continuous reader
+   * re-reads the instant a read returns, which against an instant-returning
+   * double becomes a spin; a test that runs the continuous loops sets a small
+   * hold so the loops pace and stay observable.
+   */
+  readDelayMs: number;
 
   private readonly forced: ForcedAction[] = [];
   private readonly dupeFilters = new Map<string, DuplicateFilter>();
 
-  constructor(options: { now?: () => number } = {}) {
+  constructor(options: { now?: () => number; readDelayMs?: number } = {}) {
     this.now = options.now ?? (() => Date.now());
+    this.readDelayMs = options.readDelayMs ?? 0;
   }
 
   /** Get-or-create a room. */
@@ -301,6 +312,9 @@ export class FakeTransport {
       // a concurrency high-water mark would always read 1, and the "bounded
       // sockets" behaviour would be untestable.
       await new Promise<void>((resolve) => setImmediate(resolve));
+      if (method === 'GET' && this.readDelayMs > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, this.readDelayMs));
+      }
 
       const forced = this.forced.shift();
       if (forced?.kind === 'network') throw new TypeError('fetch failed: socket error');

@@ -47,6 +47,7 @@ deliberate so nothing has to be taken on faith.
 | Referee posts verified per room; drift enters conservative mode | `packages/technocore/src/referee-verifier.ts`, `tests/referee-verifier.test.ts` |
 | `applied`/`ref.px`/`limits`/`for` kept apart, and the live boundary on each | `packages/technocore/src/referee-verifier.ts`, `tests/referee-price-semantics.test.ts`, `tests/live-price-boundaries.test.ts` |
 | The published sweep archive is polled, verified and recorded — and decides nothing | `apps/orchestrator/src/challenge-archive-monitor.ts`, `tests/challenge-archive-monitor.test.ts` |
+| The six fixed rooms are read by their own continuous loops, decoupled from the agent tick | `packages/technocore/src/room-reader.ts`, `apps/orchestrator/src/main.ts`, `tests/reader-continuous.test.ts` |
 | Discovered owner rooms are read under a bounded cap, on their own reader | `apps/orchestrator/src/reader.ts`, `packages/technocore/src/room-reader.ts`, `tests/dynamic-rooms.test.ts` |
 | A `missed` local message is re-posted once, with a fresh nonce, only before the lock | `apps/orchestrator/src/scheduler.ts`, `tests/missed-repost.test.ts` |
 | `reason: funds` never becomes a side; the local inference is labelled as such | `packages/storage/src/repositories.ts`, `apps/orchestrator/src/scheduler.ts`, `tests/funds-side.test.ts` |
@@ -209,6 +210,16 @@ pulling a new commit of *our* code does not move the pin, and a drift in the
 Third, systemd is the only supervisor; `ecosystem.config.cjs` is a development
 tool and must not be run beside the unit.
 
+The reader's continuous loops are a second lifecycle inside the same process.
+They are started **before** the scheduler and stopped **first** on shutdown:
+`SIGTERM` aborts every in-flight long poll instead of waiting one out, which is
+what keeps a restart inside the unit's `TimeoutStopSec=30s`. The six fixed rooms
+are read continuously regardless of `TICK_SECONDS`; only the agent work runs on
+that cadence. `READER_ENABLED=false` is the one supported fallback to the old
+tick-driven read, and it is not a free option: with it off the referee gate
+refuses to arm live registration or trading, because a tick-driven reader cannot
+hold a busy `close1` inside the retained window.
+
 ## The five strategy groups
 
 Exactly five, exactly thirty agents each, assigned deterministically by index so
@@ -334,19 +345,38 @@ always listed. Only owner registration, room registration and a signed trade
 count as activity — offers and chatter do not. `omitted` means the referee did
 not see the post; it is not `failed` and not `mint_unknown`.
 
-**Reading rooms, bounded.** Six rooms are read unconditionally: the five referee
-rooms and `close1`. On top of that, a **bounded dynamic reader** picks up the
-owner rooms `flow.rooms` announced, ranked by (1) a recent signed trade, (2) a
-`missed` the referee reported in that room, (3) how recently it was announced,
-(4) how recently it was read, and capped at `MAX_DISCOVERED_ROOMS` (10). It runs
+**Reading rooms: decoupled from the agent tick.** Six rooms are read
+unconditionally: the five referee rooms and `close1`. They are **not** read by
+the 60-second agent scheduler. Each fixed room gets its **own long-lived loop**
+(`RoomReader.startContinuous()`, started by `main.ts` before the scheduler), and
+a loop re-reads the instant its previous read returns — the `wait=10` long poll
+is the pacing, not a sleep between reads. That keeps a room readable even when it
+grows faster than one page per tick: at the old cadence, every page boundary was
+a real, recorded cursor gap that grew without bound.
+
+The loops are bounded twice over. A room never has more than one request in
+flight, the six of them share `READ_CONCURRENCY` (one slot per fixed room — 6 —
+under the lite profile; an explicit value always wins), and every request in the
+process — the fixed-room polls, the writer, the bounded dynamic pass — goes
+through one `TechnocoreClient` whose semaphore is `MAX_INFLIGHT`. A shutdown
+aborts the in-flight long polls rather than waiting them out, so a systemd
+`TimeoutStopSec` is never reached. `startContinuous()`/`stopContinuous()`/
+`waitForStopped()` are the lifecycle; the scheduler never owns the fixed rooms.
+
+On top of that, a **bounded dynamic reader** picks up the owner rooms `flow.rooms`
+announced, ranked by (1) a recent signed trade, (2) a `missed` the referee
+reported in that room, (3) how recently it was announced, (4) how recently it was
+read, and capped at `MAX_DISCOVERED_ROOMS` (10; forced to 0 under lite). It runs
 as a **separate reader with its own low concurrency**
-(`DYNAMIC_ROOM_READ_CONCURRENCY`, 1) *after* the fixed pass, so a discovered room
-can never delay the referee feed, and both readers share one `TechnocoreClient`
-whose semaphore is `MAX_INFLIGHT` — the total number of sockets is bounded by the
-same number as before. Exceeding the cap records a `room_overflow` alert and a
-Lark critical line; it never opens more polls. The report prints `room_scope`
-plus the room list it actually read, so "which rooms did we observe" is always
-answerable from the report rather than assumed.
+(`DYNAMIC_ROOM_READ_CONCURRENCY`, 1) on the scheduler's bounded pass — the one
+pass the scheduler still drives — so a discovered room can never delay the
+referee feed. Exceeding the cap records a `room_overflow` alert and a Lark
+critical line; it never opens more polls. The report prints `room_scope`, the
+reader's own throughput (mode, fixed rooms, in-flight reads, reads/min,
+messages/min, per-room last success) and its cursor gap/health view, so "which
+rooms did we observe, and is the reader keeping up" is always answerable from
+the report rather than assumed. A saturated page is reported as **backlog**, never
+as a gap — and a gap is never reported as backlog.
 
 **`missed` means the referee never read the message**, so it does not count. The
 `repost_queue` is the finite, auditable remedy: only a message that is genuinely

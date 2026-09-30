@@ -179,13 +179,23 @@ export function advanceCursor(
   const generation = read.generation ?? fallbackGeneration;
   const firstSeq = read.first_seq ?? (read.messages[0]?.seq ?? null);
   const lastSeq = read.last_seq ?? (read.messages[read.messages.length - 1]?.seq ?? null);
+  // Where the cursor may resume from.
+  //
+  // `last_seq` describes the *retained ring*, not the page: a service whose
+  // reply window is capped at `limit` still reports the newest seq it holds. The
+  // cursor must therefore point at the newest message we actually stored — the
+  // last one in the page — or a truncated page would advance it to the newest
+  // retained seq and silently skip everything the page did not carry, which is
+  // precisely the loss this reader exists to make impossible. Only when the page
+  // is empty (nothing was read) does `last_seq` stand in.
+  const resumeFrom = read.messages[read.messages.length - 1]?.seq ?? lastSeq;
 
   if (previous === null) {
     // No stored row at all: a first read. If the room's retained history does not
     // start at seq 1, that is the bootstrap case, not a lost-cursor incident.
     const truncated = firstSeq !== null && firstSeq > 1;
     return {
-      cursor: lastSeq ?? 0,
+      cursor: resumeFrom ?? 0,
       generation,
       firstSeq,
       lastSeq,
@@ -206,7 +216,7 @@ export function advanceCursor(
       // happens to be numbered.
       const truncated = firstSeq !== null && firstSeq > 1;
       return {
-        cursor: lastSeq ?? 0,
+        cursor: resumeFrom ?? 0,
         generation,
         firstSeq,
         lastSeq,
@@ -217,7 +227,7 @@ export function advanceCursor(
       };
     }
     return {
-      cursor: lastSeq ?? 0,
+      cursor: resumeFrom ?? 0,
       generation,
       firstSeq,
       lastSeq,
@@ -250,7 +260,7 @@ export function advanceCursor(
       // nothing was lost by this process. Recorded, but `gap` stays 0 — otherwise
       // every fresh VPS would go conservative on its first read and stay there.
       return {
-        cursor: lastSeq ?? previous.cursor,
+        cursor: resumeFrom ?? previous.cursor,
         generation,
         firstSeq,
         lastSeq,
@@ -262,7 +272,7 @@ export function advanceCursor(
       };
     }
     return {
-      cursor: lastSeq ?? previous.cursor,
+      cursor: resumeFrom ?? previous.cursor,
       generation,
       firstSeq,
       lastSeq,
@@ -275,7 +285,7 @@ export function advanceCursor(
   }
 
   return {
-    cursor: lastSeq ?? previous.cursor,
+    cursor: resumeFrom ?? previous.cursor,
     generation,
     firstSeq,
     lastSeq,

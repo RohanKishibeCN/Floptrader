@@ -129,6 +129,30 @@ describe('RuntimeEventNotifier: recording and alerting', () => {
     expect(repositories.runtimeEvents.countByCode('mint_unknown')).toBe(1);
   });
 
+  it('de-duplicates a repeated gap by room, range and generation, and alerts only a new range', () => {
+    const { notifier } = makeStack();
+
+    // A gap observed by every poll is one loss, not one loss per poll. The
+    // reader stamps each event with the room, the missed range and the
+    // generation precisely so that this is decidable.
+    const gap = { sweep: 7, dedupKey: 'close1:4-5:g1' };
+    expect(notifier.alert('critical', 'cursor_gap', 'gap 4..5', gap)).toBe(true);
+    expect(notifier.alert('critical', 'cursor_gap', 'gap 4..5', { ...gap })).toBe(false);
+    // Not even at a later sweep: the range is the identity, not the sweep.
+    expect(notifier.alert('critical', 'cursor_gap', 'gap 4..5', { sweep: 8, dedupKey: 'close1:4-5:g1' })).toBe(
+      false,
+    );
+    // A new range is a new loss, and so is a new generation for the same range.
+    expect(notifier.alert('critical', 'cursor_gap', 'gap 6..7', { sweep: 8, dedupKey: 'close1:6-7:g1' })).toBe(
+      true,
+    );
+    expect(notifier.alert('critical', 'cursor_gap', 'gap 4..5', { sweep: 9, dedupKey: 'close1:4-5:g2' })).toBe(
+      true,
+    );
+
+    expect(repositories.runtimeEvents.countByCode('cursor_gap')).toBe(3);
+  });
+
   it('keeps the local record when the queue itself fails, and retries on the next flush', async () => {
     const { notifier, sent, setFailure } = makeStack();
 

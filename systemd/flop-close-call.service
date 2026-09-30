@@ -33,6 +33,11 @@ RestartSec=5s
 # The crash-loop bound is `StartLimitIntervalSec`/`StartLimitBurst` in [Unit]
 # above; systemd only reads them there.
 # Give an in-flight room write time to finish before SIGKILL.
+#
+# Shutdown is quick by construction: the reader's continuous fixed-room loops are
+# stopped first and their in-flight long polls are aborted, so a `restart` does
+# not wait out a `wait=10` hold on each of the six rooms. This timeout is the
+# backstop, not the mechanism.
 KillSignal=SIGTERM
 TimeoutStopSec=30s
 

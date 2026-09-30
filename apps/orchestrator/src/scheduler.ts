@@ -74,7 +74,7 @@ import { localDateKey } from './llm.js';
 import type { LarkStack } from './lark.js';
 import type { LoadGuard, LoadTier } from './load-guard.js';
 import type { Logger } from './logger.js';
-import type { OrchestratorReader } from './reader.js';
+import type { OrchestratorReader, ReaderStatus } from './reader.js';
 import { refereeReadiness, tradingReadiness, type Readiness } from './readiness.js';
 import { runtimeEventSummary, type RuntimeEventNotifier } from './runtime-events.js';
 import { ownerRegistrationText, type OrchestratorWriter } from './writer.js';
@@ -342,6 +342,14 @@ export interface StatusSnapshot {
     tradingReasons: string[];
   };
   cors: { gaps: number; gapRooms: string[]; resets: string[]; bootstrap: string[] };
+  /**
+   * The reader's own throughput and health.
+   *
+   * Reported separately from the agent scheduler on purpose: the reader is no
+   * longer paced by `TICK_SECONDS`, so "how fast are we draining `close1`" is a
+   * question about this block, not about the tick rate.
+   */
+  reader: ReaderStatus;
   technocore: Record<string, number>;
   llm: { normal: number; retries: number; total: number; blocked: number; tokens: number };
   lark: { connected: boolean; state: string; heartbeatStale: boolean; outbox: Record<string, number> };
@@ -622,7 +630,11 @@ export class OrchestratorScheduler {
     const state = this.loadGuard.poll();
 
     // read → verify: never shed, because reading is how we learn the problem is over.
-    const tick = await this.reader.tick();
+    //
+    // Under the continuous reader the fixed rooms are read by their own loops the
+    // whole time, so this pass is not what makes the process keep up with `close1`
+    // — it only reads the bounded dynamic set and republishes the derived state.
+    const tick = await this.reader.schedulerPass();
     this.seedRiskBook();
 
     // reconcile participation (ParticipationService)
@@ -2092,14 +2104,21 @@ export class OrchestratorScheduler {
    */
   private readiness(): { referee: Readiness; trading: Readiness } {
     const verifier = this.reader.verifier.state;
+    const readerStatus = this.reader.readerStatus();
+    const gaps = this.reader.gaps();
     const referee = refereeReadiness({
+      readerContinuous: readerStatus.continuousMode,
+      readerRunning: readerStatus.running,
+      fixedRoomCount: readerStatus.fixedRoomCount,
+      expectedFixedRoomCount: this.reader.fixedRoomList.length,
+      roomsWithGap: gaps.rooms,
+      roomsReset: gaps.resets,
       seedSeen: verifier.seedSeen,
       refereeDid: verifier.refereeDid,
       expectedRefereeDid: this.config.expectedRefereeDid,
       packageHash: verifier.packageHash,
       expectedPackageHash: verifier.expectedPackageHash,
       hydrated: this.reader.isHydrated,
-      refereeRoomsReset: this.reader.refereeRoomsReset(),
       requirePin: this.config.requireRefereePin,
     });
 
@@ -2149,6 +2168,7 @@ export class OrchestratorScheduler {
     const memory = process.memoryUsage();
     const uptimeSeconds = Math.max(1, (Date.now() - this.startedAt) / 1000);
     const cursorGaps = this.reader.gaps();
+    const readerStatus = this.reader.readerStatus();
     const wsStatus = this.lark?.websocket.status;
     const archiveState = this.repositories.archiveState.get();
     const archiveBySweep = this.repositories.archiveSweeps.all();
@@ -2270,6 +2290,7 @@ export class OrchestratorScheduler {
         resets: cursorGaps.resets,
         bootstrap: cursorGaps.bootstrap,
       },
+      reader: readerStatus,
       technocore: this.client.stats() as unknown as Record<string, number>,
       llm: {
         normal: usage.normal,
@@ -2366,6 +2387,15 @@ export class OrchestratorScheduler {
         `bootstrap_truncated (history before first_seq was never retrievable): ${status.cors.bootstrap.join(', ')} — recorded permanently, not counted as a gap`,
       );
     }
+    // The reader is off the scheduler's cadence now, so "is it actually running"
+    // is a finding in its own right. It is already carried by the referee gate
+    // above — a reader that is not continuous makes `refereeReady` false with
+    // that exact reason — so it is not repeated here as a separate warning.
+    if (status.reader.backlogObserved) {
+      warning.push(
+        'reader page came back saturated: the service had more than one page of messages waiting, so the reader is behind but catching up',
+      );
+    }
     if (status.tier === 'critical' || status.tier === 'readonly') {
       critical.push(`load tier ${status.tier}: ${status.tierReasons.join('; ')}`);
     }
@@ -2385,22 +2415,29 @@ export class OrchestratorScheduler {
     }
 
     // The two readiness gates, banded by what they actually mean here.
+    //
+    // Only the BLOCKING band carries the reason list. The non-blocking bands
+    // name the finding and nothing else, because the reasons are already printed
+    // in full by the `referee_ready` / `trading_ready` lines of the state
+    // section: repeating a multi-clause list here is what pushes a rendered
+    // message past its character budget and buries the sections an operator
+    // reads first.
     if (!status.readiness.refereeReady) {
       const detail = status.readiness.refereeReasons.join('; ') || 'reason unlabelled';
       if (this.config.liveArmed) {
         blocking.push(`referee not ready — registration and trading are held: ${detail}`);
       } else if (this.config.expectedRefereeDid === null) {
-        info.push(`dry-run: referee DID not pinned (${detail}); observation only, not a live gate`);
+        info.push('dry-run: referee DID not pinned; observation only, not a live gate');
       } else {
-        warning.push(`referee seed not verified: ${detail}`);
+        warning.push('referee seed not verified');
       }
     }
     if (!status.readiness.tradingReady) {
-      const detail = status.readiness.tradingReasons.join('; ') || 'awaiting seed';
       if (this.config.liveArmed) {
+        const detail = status.readiness.tradingReasons.join('; ') || 'awaiting seed';
         blocking.push(`trading not ready — no live trade can be written: ${detail}`);
       } else {
-        info.push(`dry-run only: trading not ready (${detail})`);
+        info.push('dry-run only: trading not ready');
       }
     }
 
@@ -2452,6 +2489,25 @@ export class OrchestratorScheduler {
                 : `${status.system.cpuPercent}% of one core over the last tick`
             }`,
             `event loop: rss ${(status.system.rssBytes / 1024 / 1024).toFixed(1)}MB heap ${(status.system.heapUsedBytes / 1024 / 1024).toFixed(1)}MB lag ${status.system.eventLoopLagMs}ms`,
+          ],
+        },
+        {
+          heading: '读取器 (reader)',
+          lines: [
+            // Deliberately compact: the rendered message has a hard character
+            // budget, so the section carries exactly the fields an operator needs
+            // to judge throughput — mode, room count, in-flight reads, the two
+            // rates, per-room liveness and the gap/health view. The rest of the
+            // reader's throughput lives in `status()`.
+            `reader mode: ${status.reader.continuousMode ? 'continuous' : 'scheduler tick'} · fixed rooms: ${status.reader.fixedRoomCount} · active reads: ${status.reader.activeRequests}`,
+            `reads/min: ${status.reader.readsPerMinute} · messages/min: ${status.reader.messagesPerMinute} · per-room last success: ${
+              Object.entries(status.reader.lastSuccessByRoom)
+                .map(([room, at]) => `${room}=${at.slice(11, 19)}Z`)
+                .join(' ') || 'none'
+            }`,
+            `cursor health: ${status.reader.healthy ? 'healthy' : status.reader.healthReasons.join('; ')} · cursor gaps: ${status.reader.gaps.total}${
+              status.reader.gaps.rooms.length ? ` (${status.reader.gaps.rooms.join(', ')})` : ''
+            } · backlog observed: ${status.reader.backlogObserved} · last error: ${status.reader.lastError ?? 'none'}`,
           ],
         },
         {

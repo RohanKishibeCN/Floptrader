@@ -9,15 +9,22 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { refereeReadiness, tradingReadiness, type RefereeReadinessInputs } from '../apps/orchestrator/src/readiness.js';
 import { buildHarness, HARNESS_PACKAGE_HASH, type Harness } from './support/orchestrator.js';
+import { FakeTransport } from './support/fake-transport.js';
+import { waitFor } from './support/harness.js';
 
 const READY_REFEREE: RefereeReadinessInputs = {
+  readerContinuous: true,
+  readerRunning: true,
+  fixedRoomCount: 6,
+  expectedFixedRoomCount: 6,
+  roomsWithGap: [],
+  roomsReset: [],
   seedSeen: true,
   refereeDid: 'did:key:z6Mkreferee',
   expectedRefereeDid: 'did:key:z6Mkreferee',
   packageHash: 'a'.repeat(64),
   expectedPackageHash: 'a'.repeat(64),
   hydrated: true,
-  refereeRoomsReset: [],
   requirePin: true,
 };
 
@@ -54,10 +61,32 @@ describe('refereeReadiness', () => {
     expect(result.reasons.join(' ')).toContain('not hydrated');
   });
 
-  it('is not ready when a referee room was recreated underneath us', () => {
-    const result = referee({ refereeRoomsReset: ['d-close1-state'] });
+  it('is not ready when a room was recreated underneath us', () => {
+    const result = referee({ roomsReset: ['d-close1-state'] });
     expect(result.ready).toBe(false);
     expect(result.reasons.join(' ')).toContain('d-close1-state');
+  });
+
+  it('is not ready while the reader is off, stopping, or missing fixed rooms', () => {
+    const off = referee({ readerContinuous: false });
+    expect(off.ready).toBe(false);
+    expect(off.reasons.join(' ')).toContain('continuous reader is off');
+
+    const stopping = referee({ readerRunning: false });
+    expect(stopping.ready).toBe(false);
+    expect(stopping.reasons.join(' ')).toContain('not running');
+
+    const short = referee({ fixedRoomCount: 5 });
+    expect(short.ready).toBe(false);
+    expect(short.reasons.join(' ')).toContain('reader owns 5 fixed rooms, expected 6');
+  });
+
+  it('stays not-ready while any fixed room carries a cursor gap', () => {
+    const result = referee({ roomsWithGap: ['close1'] });
+    expect(result.ready).toBe(false);
+    expect(result.reasons.join(' ')).toContain('cursor gap in close1');
+    // An empty list is the only acceptable value: a gap is never silently cleared.
+    expect(referee({ roomsWithGap: [] }).ready).toBe(true);
   });
 
   it('refuses to call an unpinned referee established when a pin is required', () => {
@@ -143,6 +172,9 @@ describe('the live gates are wired', () => {
   function liveHarness(agentCount: number): Promise<Harness> {
     return buildHarness({
       agentCount,
+      // A read is paced so the continuous loops the live gate requires can be
+      // started and observed without spinning against an instant-returning double.
+      transport: new FakeTransport({ readDelayMs: 1 }),
       env: {
         FLOP_MODE: 'live',
         FLOP_LIVE_CONFIRM: 'close-1',
@@ -156,6 +188,14 @@ describe('the live gates are wired', () => {
     // Live requires the full 150-agent fleet, so this is the real shape.
     harness = await liveHarness(150);
     const h = harness;
+
+    // Live registration also requires the reader to own the fixed rooms
+    // continuously, so the loops production runs are the loops this test runs.
+    h.runtime.reader.startContinuous();
+    await waitFor(
+      () => h.runtime.reader.readerStatus().lastSuccessByRoom['d-close1-state'] !== undefined,
+      'the reader to complete its first pass',
+    );
 
     const held = await h.runtime.scheduler.ensureParticipation();
     expect(held.posted).toBe(0);
@@ -171,7 +211,10 @@ describe('the live gates are wired', () => {
     // The seed establishes the referee; registrations may now proceed even
     // though no price exists yet, because the two gates are separate.
     h.referee.seedPost(HARNESS_PACKAGE_HASH);
-    await h.runtime.reader.tick();
+    await waitFor(
+      () => h.runtime.scheduler.status().readiness.refereeReady,
+      'the continuous reader to read the seed',
+    );
 
     const after = h.runtime.scheduler.status();
     expect(after.readiness.refereeReady).toBe(true);

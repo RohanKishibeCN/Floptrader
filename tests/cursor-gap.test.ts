@@ -90,6 +90,23 @@ describe('advanceCursor', () => {
     expect(advance.cursor).toBe(5);
     expect(advance.gap).toBe(0);
   });
+
+  it('stops at the last message returned, never at the ring newest', () => {
+    // `last_seq` is the retained ring's newest, not the page's: a reply capped at
+    // `limit` reports seq 500 while carrying only up to 200. Trusting `last_seq`
+    // as the cursor would skip 201..500 without recording a gap — a silent loss.
+    const firstPage = read([message(1), message(200)], { first_seq: 1, last_seq: 500 });
+    const first = advanceCursor(null, firstPage, 1);
+    expect(first.cursor).toBe(200);
+    expect(first.lastSeq).toBe(500);
+    expect(first.reason).toBe('first_read');
+
+    const secondPage = read([message(201), message(400)], { first_seq: 1, last_seq: 500 });
+    const second = advanceCursor(view({ cursor: 200 }), secondPage, 1);
+    expect(second.cursor).toBe(400);
+    expect(second.reason).toBe('ok');
+    expect(second.gap).toBe(0);
+  });
 });
 
 describe('SqliteCursorStore', () => {

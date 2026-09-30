@@ -105,8 +105,27 @@ export const EnvSchema = z.object({
 
   // ---- technocore ---------------------------------------------------------
   TECHNO_CORE_BASE_URL: z.string().default('https://technocore.chat'),
+  /**
+   * Concurrent room reads.
+   *
+   * The fixed six rooms are read by the reader's own continuous loops, so under
+   * the lite profile the default is one slot per room. `MAX_INFLIGHT` still caps
+   * real requests, and an explicit value here always wins.
+   */
   READ_CONCURRENCY: intString(2),
   READ_WAIT_SECONDS: intString(10),
+  /**
+   * Whether the fixed rooms are read by the reader's own continuous loops.
+   *
+   * On by default, and the reason is throughput: a room that grows faster than
+   * one `limit`-sized page per scheduler tick would otherwise be read with a
+   * permanent gap between pages, and every gap is a real, recorded loss. Turning
+   * it off falls back to the scheduler driving `tick()`, which is what a unit
+   * test wants and what the agent scheduler is no longer responsible for.
+   */
+  READER_ENABLED: boolish.default(true),
+  /** How long a room loop waits after a failed read before retrying. */
+  READER_RETRY_DELAY_MS: intString(2_000),
   WRITE_RATE_PER_MINUTE: intString(180),
   WRITER_CONCURRENCY: intString(1),
   REQUEST_TIMEOUT_MS: intString(15_000),
@@ -328,6 +347,9 @@ export interface Config {
     baseUrl: string;
     readConcurrency: number;
     readWaitSeconds: number;
+    /** Whether the reader's own continuous loops own the fixed rooms. */
+    readerEnabled: boolean;
+    readerRetryDelayMs: number;
     writeRatePerMinute: number;
     writerConcurrency: number;
     requestTimeoutMs: number;
@@ -485,6 +507,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   const maxDiscoveredRooms = lite ? 0 : raw.MAX_DISCOVERED_ROOMS;
 
+  // The fixed six rooms are read by their own continuous loops, so under the lite
+  // profile the default is one read slot per room. An explicitly configured value
+  // always wins, and `MAX_INFLIGHT` stays the hard cap on real requests: a
+  // concurrency above it would only queue callers on the client's semaphore.
+  const maxInflight = Math.max(1, raw.MAX_INFLIGHT);
+  const askedForReadConcurrency = env.READ_CONCURRENCY !== undefined && env.READ_CONCURRENCY !== '';
+  const requestedReadConcurrency = lite && !askedForReadConcurrency ? 6 : raw.READ_CONCURRENCY;
+  const readConcurrency = Math.max(1, Math.min(requestedReadConcurrency, maxInflight));
+
   const liveArmed = raw.FLOP_MODE === 'live' && raw.FLOP_LIVE_CONFIRM === raw.SEASON;
   if (raw.FLOP_MODE === 'live' && !liveArmed) {
     throw new ConfigError(
@@ -637,14 +668,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ageRecipientAdmin: raw.AGE_RECIPIENT_ADMIN.trim(),
     technoCore: {
       baseUrl: raw.TECHNO_CORE_BASE_URL.replace(/\/+$/, ''),
-      readConcurrency: raw.READ_CONCURRENCY,
+      readConcurrency,
       readWaitSeconds: Math.min(10, Math.max(0, raw.READ_WAIT_SECONDS)),
+      readerEnabled: raw.READER_ENABLED,
+      readerRetryDelayMs: Math.max(250, raw.READER_RETRY_DELAY_MS),
       writeRatePerMinute: raw.WRITE_RATE_PER_MINUTE,
       writerConcurrency: raw.WRITER_CONCURRENCY,
       requestTimeoutMs: raw.REQUEST_TIMEOUT_MS,
       readMaxRetries: raw.READ_MAX_RETRIES,
       writeMaxRetries: raw.WRITE_MAX_RETRIES,
-      maxInflight: Math.max(1, raw.MAX_INFLIGHT),
+      maxInflight,
     },
     deepseek: {
       enabled: deepseekEnabled,

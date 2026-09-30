@@ -96,6 +96,14 @@ export interface RuntimeEventNotifierOptions {
 export interface AlertContext {
   sweep?: number | null;
   agentId?: string | null;
+  /**
+   * Replaces the sweep as the identity segment of the event id.
+   *
+   * Used where "the same fact" is not "the same sweep". A cursor gap is one fact
+   * per *range*: a polling loop that re-observes the same missing range must not
+   * queue a second alert, while a different range is a different loss and must.
+   */
+  dedupKey?: string | null;
 }
 
 export class RuntimeEventNotifier {
@@ -119,9 +127,15 @@ export class RuntimeEventNotifier {
    * sweep (a stale reference, an unreachable archive) would otherwise produce a
    * message every five minutes, and an operator who mutes the channel has lost
    * the criticals too.
+   *
+   * An explicit `dedupKey` overrides both: it names what makes two reports of the
+   * same code "the same fact", so a gap is deduped by its range and generation
+   * rather than by the sweep the reader happened to be on.
    */
   static eventIdFor(severity: RuntimeSeverity, code: string, context: AlertContext): string {
     const agent = context.agentId ?? '-';
+    const dedup = context.dedupKey;
+    if (typeof dedup === 'string' && dedup.length > 0) return `${code}:${agent}:${dedup}`;
     if (severity === 'critical') return `${code}:${agent}:${context.sweep ?? '-'}`;
     return `${code}:${agent}`;
   }
@@ -143,6 +157,7 @@ export class RuntimeEventNotifier {
     this.alert(severity, record.code, record.message, {
       sweep: typeof data.sweep === 'number' ? data.sweep : null,
       agentId: typeof data.agentId === 'string' ? data.agentId : null,
+      dedupKey: typeof data.dedupKey === 'string' ? data.dedupKey : null,
     });
   }
 

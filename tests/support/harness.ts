@@ -85,3 +85,24 @@ export function fakeClock(startMs: number): { now: () => number; advance: (ms: n
     },
   };
 }
+
+/**
+ * Poll until `predicate` holds, or fail.
+ *
+ * For the tests that run the reader's own continuous loops there is no tick to
+ * await: the loops advance on their own schedule, driven by the double's
+ * (paced) reads. Polling a fact the loop publishes — a per-room last success, a
+ * verifier state — is how such a test stays deterministic without reaching into
+ * the loop's internals.
+ */
+export async function waitFor(
+  predicate: () => boolean,
+  label = 'condition',
+  timeoutMs = 5_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+}

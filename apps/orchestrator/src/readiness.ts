@@ -20,6 +20,16 @@ export interface Readiness {
 }
 
 export interface RefereeReadinessInputs {
+  /** The reader's own continuous loops are on, i.e. reading is decoupled. */
+  readerContinuous: boolean;
+  /** Those loops are actually running (not stopping, not failed to start). */
+  readerRunning: boolean;
+  fixedRoomCount: number;
+  expectedFixedRoomCount: number;
+  /** Fixed rooms carrying a recorded cursor gap: a real mid-run loss. */
+  roomsWithGap: string[];
+  /** Fixed rooms whose generation was reset. */
+  roomsReset: string[];
   /** A seed post was read, signature-checked and accepted. */
   seedSeen: boolean;
   refereeDid: string | null;
@@ -30,8 +40,6 @@ export interface RefereeReadinessInputs {
   expectedPackageHash: string | null;
   /** `hydrateFromSnapshots()` has run, so the stored referee history is loaded. */
   hydrated: boolean;
-  /** Referee rooms whose cursor generation was reset. */
-  refereeRoomsReset: string[];
   /** Whether a referee DID was required to be pinned at launch. */
   requirePin: boolean;
 }
@@ -40,13 +48,35 @@ export interface RefereeReadinessInputs {
  * May this process treat the referee as established?
  *
  * Every clause is a fact, never an inference: a seed we accepted, a sender that
- * matches the pin, a package that matches the pin, a verifier that has been
- * rebuilt from durable history, and no referee room that was recreated underneath
- * it. Nothing here "adopts the first sender" — an unpinned process fails the
- * gate, which is the point.
+ * matches the pin, a package that matches the pin, a verifier rebuilt from
+ * durable history, and no fixed room carrying a recorded loss. Nothing here
+ * "adopts the first sender" — an unpinned process fails the gate, which is the
+ * point.
+ *
+ * The reader clauses are part of the same gate because they are the same
+ * question. A process that cannot read `close1` fast enough to stay inside the
+ * retained window is losing messages it will trade on, so "the reader is
+ * continuous, it owns all six rooms, and none of them carries a gap" has to hold
+ * before a live registration is posted.
  */
 export function refereeReadiness(input: RefereeReadinessInputs): Readiness {
   const reasons: string[] = [];
+  if (!input.readerContinuous) {
+    reasons.push('continuous reader is off; the fixed rooms are not being read');
+  } else if (!input.readerRunning) {
+    reasons.push('continuous reader is not running');
+  }
+  if (input.fixedRoomCount !== input.expectedFixedRoomCount) {
+    reasons.push(
+      `reader owns ${input.fixedRoomCount} fixed rooms, expected ${input.expectedFixedRoomCount}`,
+    );
+  }
+  if (input.roomsWithGap.length > 0) {
+    reasons.push(`cursor gap in ${input.roomsWithGap.join(', ')}`);
+  }
+  if (input.roomsReset.length > 0) {
+    reasons.push(`room recreated: ${input.roomsReset.join(', ')}`);
+  }
   if (!input.seedSeen) reasons.push('referee seed not read');
   if (input.refereeDid === null) {
     reasons.push('referee DID unknown');
@@ -61,9 +91,6 @@ export function refereeReadiness(input: RefereeReadinessInputs): Readiness {
     reasons.push('seed package hash differs from the pinned package');
   }
   if (!input.hydrated) reasons.push('verifier not hydrated from stored referee history');
-  if (input.refereeRoomsReset.length > 0) {
-    reasons.push(`referee room recreated: ${input.refereeRoomsReset.join(', ')}`);
-  }
   return { ready: reasons.length === 0, reasons };
 }
 

@@ -39,8 +39,10 @@ import type { ExternalOffer } from '@flop/strategy';
 import {
   RefereeVerifier,
   RoomReader,
+  type ReaderThroughputStats,
   type RefereeObservation,
   type RoomMessage,
+  type RoomReadOutcome,
   type RoomTick,
   type TechnocoreClient,
   type TickSummary,
@@ -64,6 +66,11 @@ export interface ReaderOptions {
    * registration that is not yet echoed back is not yet evidence.
    */
   readLimit?: number;
+  /**
+   * How long a continuous room loop waits after a failed read before retrying.
+   * A successful read never waits: the long poll is the pacing.
+   */
+  retryDelayMs?: number;
   /** Package hash and referee DID fixed at launch, before the first seed. */
   expectedPackageHash?: string | null;
   expectedRefereeDid?: string | null;
@@ -108,6 +115,25 @@ export interface ReaderTick extends TickSummary {
   snapshot: MarketSnapshot;
   /** Open external offers found in `close1`, newest first. */
   externalOffers: ExternalOffer[];
+}
+
+/**
+ * The reader as the status report sees it.
+ *
+ * `gaps` is deliberately reported next to the throughput figures rather than
+ * replaced by them: a reader that is keeping up right now can still carry a
+ * recorded gap from earlier, and hiding that would be exactly the "pretend the
+ * backlog cleared" failure this report exists to avoid.
+ */
+export interface ReaderStatus extends ReaderThroughputStats {
+  healthy: boolean;
+  healthReasons: string[];
+  gaps: {
+    total: number;
+    rooms: string[];
+    resets: string[];
+    bootstrap: string[];
+  };
 }
 
 /**
@@ -158,6 +184,9 @@ function roomNameOf(entry: unknown): string | null {
 /** Service rooms that are never owner rooms, so they are never "discovered". */
 const RESERVED_ROOM_NAMES = new Set(['main', 'lobby', 'system', 'referee', 'announcements']);
 
+/** Cap on the continuous reader's local-message buffer; it is a view, not a ledger. */
+const LOCAL_MESSAGE_BUFFER = 512;
+
 /**
  * True for a room we already read unconditionally.
  *
@@ -189,6 +218,14 @@ export class OrchestratorReader {
   private dynamicSeen: string[] = [];
   /** The highest owner-registration seq already turned into evidence. */
   private lastRegistrationScanSeq = 0;
+  /**
+   * Messages from our own DIDs seen by the continuous room loops.
+   *
+   * The fixed rooms are no longer read by a scheduler-driven pass, so their
+   * local messages cannot be collected from a tick summary: the loops append
+   * them here as they are read, and the trade ledger drains this.
+   */
+  private readonly pendingLocalMessages: Array<{ room: string; message: RoomMessage }> = [];
   private readonly repositories: Repositories;
   private readonly rules: Rules;
   private readonly localDids: () => Set<string>;
@@ -230,8 +267,14 @@ export class OrchestratorReader {
       rooms: this.fixedRooms,
       ...(options.readConcurrency === undefined ? {} : { readConcurrency: options.readConcurrency }),
       ...(options.waitSeconds === undefined ? {} : { waitSeconds: options.waitSeconds }),
+      ...(options.retryDelayMs === undefined ? {} : { retryDelayMs: options.retryDelayMs }),
       limit: Math.min(200, Math.max(1, options.readLimit ?? 200)),
       localDids: options.localDids,
+      // The continuous loops own the fixed rooms, so the durable evidence a read
+      // produces — referee snapshots, flow/price anomalies and our own messages —
+      // is written here, the moment the read returns, rather than waiting for a
+      // scheduler tick that no longer reads these rooms.
+      onRead: (outcome) => this.handleContinuousRead(outcome),
       now: this.now,
     });
 
@@ -318,6 +361,75 @@ export class OrchestratorReader {
         source: room === (this.rules.tradingRoom || TRADING_ROOM) ? 'close1' : 'referee',
       });
     }
+  }
+
+  /**
+   * Start the reader's own continuous loops over the fixed rooms.
+   *
+   * This is what decouples reading from the agent scheduler: the six fixed rooms
+   * are read back-to-back by their own long polls, so a room that grows faster
+   * than one page per scheduler tick is no longer read with a gap between every
+   * page. The dynamic reader is untouched — it stays on the scheduler's bounded
+   * pass, and stays disabled under the lite profile.
+   */
+  startContinuous(): void {
+    this.roomReader.startContinuous();
+  }
+
+  /** Abort every in-flight long poll and wait for the loops to exit. */
+  async stopContinuous(): Promise<void> {
+    await this.roomReader.stopContinuous();
+  }
+
+  get continuousMode(): boolean {
+    return this.roomReader.continuousMode;
+  }
+
+  /**
+   * One scheduler-driven pass.
+   *
+   * When the continuous loops own the fixed rooms, this only reads the dynamic
+   * set (a bounded pass over discovered owner rooms) and republishes the derived
+   * state; the fixed rooms are being read the whole time by their own loops.
+   * When they do not — a unit test, or an operator who turned the loop off — it
+   * is the original full pass, so `tick()` keeps meaning what it always meant.
+   */
+  async schedulerPass(): Promise<ReaderTick> {
+    if (!this.roomReader.continuousMode) return this.tick();
+
+    const dynamic = await this.tickDynamicRooms();
+    const snapshot = this.verifier.snapshot(this.now());
+    this.persistSweepState(snapshot);
+    this.persistPackagePin();
+    return {
+      at: this.now().toISOString(),
+      rooms: dynamic.rooms,
+      inserted: dynamic.inserted,
+      observations: [],
+      localMessages: this.localMessages(),
+      health: this.roomReader.health(),
+      errors: dynamic.errors,
+      snapshot,
+      externalOffers: this.externalOffers(),
+    };
+  }
+
+  /** The reader's throughput, health and gap view, for `status()` and the report. */
+  readerStatus(): ReaderStatus {
+    const throughput = this.roomReader.throughputStats();
+    const health = this.roomReader.health();
+    const gaps = this.roomReader.gaps();
+    return {
+      ...throughput,
+      healthy: health.healthy,
+      healthReasons: health.reasons,
+      gaps: {
+        total: gaps.total,
+        rooms: gaps.rooms,
+        resets: gaps.resets,
+        bootstrap: gaps.bootstrap,
+      },
+    };
   }
 
   /**
@@ -599,21 +711,34 @@ export class OrchestratorReader {
     return this.hydrated;
   }
 
-  /**
-   * The rooms recreated underneath us (a generation change), for the readiness
-   * gate. A referee room in this list means the referee's own state was
-   * invalidated and must not be treated as established.
-   */
-  refereeRoomsReset(): string[] {
-    const referee = new Set(this.fixedRooms.filter((room) => room !== (this.rules.tradingRoom || TRADING_ROOM)));
-    return this.gaps()
-      .states.filter((entry) => entry.state === 'cursor_reset' && referee.has(entry.room))
-      .map((entry) => entry.room);
-  }
-
   /** Messages from our own DIDs seen on the last tick, for the trade ledger. */
   localMessages(): Array<{ room: string; message: RoomMessage }> {
+    // Under the continuous reader the fixed rooms are read by their own loops,
+    // so the local messages come from the buffer those loops fill rather than
+    // from a tick summary that is never produced for them.
+    if (this.roomReader.continuousMode) return [...this.pendingLocalMessages];
     return this.roomReader.summary?.localMessages ?? [];
+  }
+
+  /**
+   * Persist what a continuous room loop just read.
+   *
+   * This is the durable half of a read: the cursor and the messages are already
+   * committed by the reader, inside the transaction that covers them, but the
+   * derived evidence — the referee snapshot, the flow/price anomalies and the
+   * local-message ledger — is orchestrator knowledge and would otherwise only be
+   * written when the scheduler happened to tick over these rooms, which under the
+   * continuous reader it never does.
+   */
+  private handleContinuousRead(outcome: RoomReadOutcome): void {
+    for (const observation of outcome.observations) this.persistObservation(observation);
+    if (outcome.localMessages.length === 0) return;
+    this.pendingLocalMessages.push(...outcome.localMessages);
+    // Bounded: nothing here may grow without limit on a process that runs for
+    // days. The buffer is a convenience view, not a durable ledger — the durable
+    // copy of every message is already in the messages table.
+    const overflow = this.pendingLocalMessages.length - LOCAL_MESSAGE_BUFFER;
+    if (overflow > 0) this.pendingLocalMessages.splice(0, overflow);
   }
 
   private persistObservation(observation: RefereeObservation): void {

@@ -575,6 +575,7 @@ export async function createRuntime(
     localDids: () => keyStore.didSet(),
     readConcurrency: config.technoCore.readConcurrency,
     waitSeconds: config.technoCore.readWaitSeconds,
+    retryDelayMs: config.technoCore.readerRetryDelayMs,
     expectedPackageHash: pin.expected,
     expectedRefereeDid: config.expectedRefereeDid,
     requireRefereePin: config.requireRefereePin,
@@ -795,9 +796,16 @@ export async function createRuntime(
       }
       if (health) await health.start();
       archiveMonitor.start();
+      // The reader's own loops start before the scheduler: the agent path reads
+      // whatever the reader has stored, and a room that grows faster than one
+      // page per scheduler tick must be drained by the reader, not by the tick.
+      if (config.technoCore.readerEnabled) reader.startContinuous();
       scheduler.start();
     },
     async stop(): Promise<void> {
+      // Abort the reader's long polls first: the scheduler's tick joins whatever
+      // read is in flight, and a shutdown must never wait out a `wait` hold.
+      await reader.stopContinuous();
       await scheduler.stop();
       archiveMonitor.stop();
       if (health) await health.stop();
