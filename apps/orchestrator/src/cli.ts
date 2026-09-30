@@ -40,6 +40,7 @@ import {
   parseBundle,
   parseInventory,
   proveControl,
+  readAgeIdentityFile,
   serializeAdminKey,
   serializeAdminPublicKey,
   serializeBundle,
@@ -136,8 +137,9 @@ async function resolveRecipients(config: Config): Promise<string[]> {
   const recipients = new Set<string>();
   for (const value of config.ageRecipients) recipients.add(value.trim());
   if (config.ageIdentityFile.length > 0 && existsSync(config.ageIdentityFile)) {
-    const identity = readFileSync(config.ageIdentityFile, 'utf8').trim();
-    if (identity.length > 0) recipients.add(await ageRecipientFor(identity));
+    // The same strict reader every other path uses: exactly one secret key, and
+    // a failure that never echoes the key.
+    recipients.add(await ageRecipientFor(readAgeIdentityFile(config.ageIdentityFile)));
   }
   return [...recipients].filter((value) => value.length > 0);
 }
@@ -344,10 +346,10 @@ async function commandBackup(config: Config, flags: Map<string, string>): Promis
 async function commandRestore(config: Config, flags: Map<string, string>): Promise<void> {
   const input = requireFlag(flags, 'input');
   if (!existsSync(input)) throw new CliError(`no such file: ${input}`);
-  const identities = config.ageIdentityFile.length > 0 ? [readFileSync(config.ageIdentityFile, 'utf8').trim()] : [];
-  if (identities.length === 0) {
+  if (config.ageIdentityFile.length === 0) {
     throw new CliError('AGE_IDENTITY_FILE must point at the recovery key to restore a bundle');
   }
+  const identities = [readAgeIdentityFile(config.ageIdentityFile)];
   const plaintext = await decryptBundle(new Uint8Array(readFileSync(input)), identities);
   const { agents, meta } = parseBundle(plaintext);
   // Constructing the store is the check: it throws on any seed, DID or multibase

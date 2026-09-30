@@ -667,12 +667,29 @@ export interface LarkReportSection {
   lines: string[];
 }
 
+/**
+ * The report's findings, banded by what an operator must do about them.
+ *
+ * `blocking` is reserved for "live cannot proceed", which is a stronger claim
+ * than "something is wrong": it is what stops registration or trading. The four
+ * bands are rendered in that order, and an empty band prints nothing — a dry-run
+ * report must not carry a "severe" heading it never earned.
+ */
+export interface LarkReportAlerts {
+  blocking: string[];
+  critical: string[];
+  warning: string[];
+  info: string[];
+}
+
 export interface LarkReportContent {
   reportId: string;
   title: string;
   summary: string;
   sections: LarkReportSection[];
+  /** Legacy flat list; used only when `alerts` is absent. */
   critical?: string[];
+  alerts?: LarkReportAlerts;
 }
 
 export interface LarkReportSchedulerOptions {
@@ -734,9 +751,7 @@ export class LarkReportScheduler {
   render(content: LarkReportContent): string {
     const header = [summarizeDids(content.title), summarizeDids(content.summary)];
     const blocks = content.sections.map((section) => this.renderSection(section));
-    const critical = content.critical ?? [];
-    const criticalBlock =
-      critical.length > 0 ? ['⚠ 严重', ...critical.map((item) => `- ${summarizeDids(item)}`)] : [];
+    const criticalBlock = this.renderAlerts(content);
     const assemble = (sectionBlocks: string[]): string =>
       [...header, ...sectionBlocks, ...criticalBlock].join('\n');
 
@@ -764,6 +779,29 @@ export class LarkReportScheduler {
       result = `${result.slice(0, target - REPORT_TRUNCATION_NOTE.length - 2)}…\n${REPORT_TRUNCATION_NOTE}`;
     }
     return result;
+  }
+
+  /**
+   * The finding block at the foot of the report.
+   *
+   * Banded so that a dry-run's "registration disabled" note never appears under
+   * the same heading as a real live blocker. When a caller supplies only the
+   * legacy flat list, it renders as one critical band — unchanged behaviour.
+   */
+  private renderAlerts(content: LarkReportContent): string[] {
+    if (content.alerts) {
+      const bands: Array<[string, string[]]> = [
+        ['⛔ BLOCKING', content.alerts.blocking],
+        ['⚠ CRITICAL', content.alerts.critical],
+        ['△ WARNING', content.alerts.warning],
+        ['· INFO', content.alerts.info],
+      ];
+      return bands.flatMap(([label, items]) =>
+        items.length > 0 ? [label, ...items.map((item) => `- ${summarizeDids(item)}`)] : [],
+      );
+    }
+    const critical = content.critical ?? [];
+    return critical.length > 0 ? ['⚠ 严重', ...critical.map((item) => `- ${summarizeDids(item)}`)] : [];
   }
 
   /**

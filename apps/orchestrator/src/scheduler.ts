@@ -75,6 +75,7 @@ import type { LarkStack } from './lark.js';
 import type { LoadGuard, LoadTier } from './load-guard.js';
 import type { Logger } from './logger.js';
 import type { OrchestratorReader } from './reader.js';
+import { refereeReadiness, tradingReadiness, type Readiness } from './readiness.js';
 import { runtimeEventSummary, type RuntimeEventNotifier } from './runtime-events.js';
 import { ownerRegistrationText, type OrchestratorWriter } from './writer.js';
 import type { UpstreamMonitor } from './upstream-monitor.js';
@@ -261,7 +262,26 @@ export interface StatusSnapshot {
     failures: number;
   };
   participation: Record<string, number> & { total: number; readback: number };
-  runs: { today: number; window: number };
+  runs: {
+    /** Durable agent-run rows since local midnight; spans restarts. */
+    today: number;
+    /** Durable agent-run rows inside the rolling 7x24h window; spans restarts. */
+    window: number;
+    /** Agent strategy evaluations this process has performed since startup. */
+    sinceStartup: number;
+    /** Scheduler ticks this process has completed. */
+    schedulerTicks: number;
+    /** Distinct agents this process has evaluated since startup. */
+    uniqueAgents: number;
+    /** Times the whole fleet has been evaluated once since startup. */
+    fullFleetCycles: number;
+    /** Weekly watchdog passes this process has actually run. */
+    watchdogRuns: number;
+    /** Agents evaluated in the most recent tick. */
+    agentsInCurrentTick: number;
+    lastTickAt: string | null;
+    nextTickAt: string | null;
+  };
   trades: Record<string, number>;
   /**
    * Trades counted by the sweep they were written at, plus the duplicate-id
@@ -303,8 +323,25 @@ export interface StatusSnapshot {
     fixed: string[];
     dynamic: string[];
     cap: number;
+    /** Rooms whose retained history did not reach back to our first read. */
+    bootstrap: string[];
+    /** Rooms with a genuine mid-run cursor gap. */
+    gaps: string[];
+    refereeReady: boolean;
+    tradingReady: boolean;
   };
-  cors: { gaps: number; gapRooms: string[]; resets: string[] };
+  /**
+   * The two readiness gates. `refereeReady` gates live registration,
+   * `tradingReady` gates live trading; both carry the reasons they failed so a
+   * report never has to guess why a trade was refused.
+   */
+  readiness: {
+    refereeReady: boolean;
+    tradingReady: boolean;
+    refereeReasons: string[];
+    tradingReasons: string[];
+  };
+  cors: { gaps: number; gapRooms: string[]; resets: string[]; bootstrap: string[] };
   technocore: Record<string, number>;
   llm: { normal: number; retries: number; total: number; blocked: number; tokens: number };
   lark: { connected: boolean; state: string; heartbeatStale: boolean; outbox: Record<string, number> };
@@ -312,7 +349,15 @@ export interface StatusSnapshot {
   system: {
     rssBytes: number;
     heapUsedBytes: number;
-    cpuPercent: number;
+    /**
+     * Process CPU over the last tick interval, as a percentage of one core.
+     *
+     * `null` until two samples exist: a figure derived from the process's
+     * cumulative CPU time divided by its uptime is not a rate and must never be
+     * presented as one.
+     */
+    cpuPercent: number | null;
+    cpuState: 'warming_up' | 'ok';
     uptimeSeconds: number;
     diskUsedPercent: number;
     /** Last zero-delay timer reading, off the trade path. */
@@ -350,6 +395,31 @@ export interface SchedulerOptions {
   now?: () => Date;
 }
 
+/** One CPU reading: cumulative CPU microseconds plus the wall clock. */
+export interface CpuSample {
+  cpuUs: number;
+  wallMs: number;
+}
+
+/**
+ * Process CPU over the interval between two samples, as a percentage of one
+ * core.
+ *
+ * `process.cpuUsage()` counts microseconds and the wall clock counts
+ * milliseconds, so the rate is `(cpuUsDelta / 1000) / wallDeltaMs * 100`. Either
+ * half of that being wrong is what turns a 2% process into a 2182% report, which
+ * is why this is a named, tested function rather than an inline expression.
+ *
+ * Returns null when the interval cannot support a rate: no wall time passed, or
+ * the CPU counter went backwards (which only happens if it was reset).
+ */
+export function processCpuPercent(previous: CpuSample, current: CpuSample): number | null {
+  const wallDeltaMs = current.wallMs - previous.wallMs;
+  const cpuDeltaMs = (current.cpuUs - previous.cpuUs) / 1000;
+  if (wallDeltaMs <= 0 || cpuDeltaMs < 0) return null;
+  return Number(((cpuDeltaMs / wallDeltaMs) * 100).toFixed(2));
+}
+
 export class OrchestratorScheduler {
   private readonly config: Config;
   private readonly logger: Logger;
@@ -380,6 +450,27 @@ export class OrchestratorScheduler {
   private lastTickReport: TickReport | null = null;
   /** The last event-loop lag the background step measured, in milliseconds. */
   private lastEventLoopLagMs = 0;
+  /**
+   * The CPU sampler: cumulative CPU microseconds and the wall clock at the last
+   * tick. A rate needs two points in time, so the first tick can only seed this.
+   */
+  private cpuSample: { cpuUs: number; wallMs: number; percent: number | null } | null = null;
+  /**
+   * What *this process* has done, as opposed to what the durable tables hold.
+   *
+   * `agent_runs` survives restarts, so a raw "runs today" mixes every process
+   * that ran today; a 151-second-old process reporting thousands of runs is the
+   * confusion this accounting exists to prevent. Both numbers are now printed,
+   * and they are never conflated.
+   */
+  private readonly runStats = {
+    evaluated: 0,
+    uniqueAgents: new Set<string>(),
+    cycleSeen: new Set<string>(),
+    fleetCycles: 0,
+    watchdogRuns: 0,
+    agentsInCurrentTick: 0,
+  };
   /** Per-agent mirror of cash and open lots; rebuilt from the referee's mints. */
   private readonly riskBook: Map<string, RiskAccount> = new Map();
   /** DID -> agent id, built once, for matching a missed message back to its agent. */
@@ -420,7 +511,32 @@ export class OrchestratorScheduler {
   /** Start the single interval that drives everything. */
   start(): void {
     if (this.timer) return;
-    const periodMs = Math.max(5, this.config.scheduling.tickSeconds) * 1000;
+    const configured = this.config.scheduling.tickSeconds;
+    const effectiveSeconds = Math.max(5, configured);
+    if (configured < 5) {
+      // The floor is real and silent: a TICK_SECONDS below it would otherwise
+      // look configured while the process ran at 5s, which is exactly the kind of
+      // mismatch that makes a run-rate figure impossible to reason about.
+      this.logger.event({
+        level: 'warn',
+        source: 'scheduler',
+        code: 'tick_interval_clamped',
+        message: `TICK_SECONDS=${configured} is below the 5s floor; running at ${effectiveSeconds}s`,
+        data: { configured, effectiveSeconds },
+      });
+    }
+    this.logger.event({
+      level: 'info',
+      source: 'scheduler',
+      code: 'scheduler_cadence',
+      message: `ticking every ${effectiveSeconds}s, up to ${this.config.scheduling.agentsPerTick} agents per group per tick`,
+      data: {
+        tickSeconds: effectiveSeconds,
+        agentsPerTick: this.config.scheduling.agentsPerTick,
+        groups: STRATEGY_GROUPS.length,
+      },
+    });
+    const periodMs = effectiveSeconds * 1000;
     this.timer = setInterval(() => {
       void this.runTick().catch((error: unknown) => {
         // An unhandled rejection here would take the process down. One failed
@@ -500,6 +616,9 @@ export class OrchestratorScheduler {
    */
   private async tickOnce(): Promise<TickReport> {
     const at = this.now();
+    // One CPU sample per tick, before any work: the reading the report prints is
+    // the load of the interval that just ended, not a lifetime average.
+    this.sampleProcessCpu();
     const state = this.loadGuard.poll();
 
     // read → verify: never shed, because reading is how we learn the problem is over.
@@ -515,6 +634,7 @@ export class OrchestratorScheduler {
 
     // run local strategies → validate risk → post trades (TradingService)
     const runOutcome = this.runAgentSlices();
+    this.recordRunStats(runOutcome.outcomes.map((outcome) => outcome.agentId));
     const trades = await this.executeActions(runOutcome.outcomes);
 
     // reconcile repost queue (RecoveryService)
@@ -600,6 +720,10 @@ export class OrchestratorScheduler {
 
     try {
       watchdog = await withTimeout(this.maybeRunWatchdog(at), BACKGROUND_TIMEOUT_MS, 'watchdog');
+      // A watchdog pass is not an ordinary tick: it backfills the agents a tick
+      // slice skipped, and its runs are recorded under their own source. Counting
+      // it here keeps the two out of each other's totals.
+      if (watchdog.ran) this.runStats.watchdogRuns += 1;
     } catch (error) {
       this.backgroundFailure('watchdog_failed', error);
     }
@@ -639,6 +763,63 @@ export class OrchestratorScheduler {
     }
 
     return { watchdog, lark, deepseek, upstream };
+  }
+
+  /**
+   * Sample process CPU over the interval since the previous tick.
+   *
+   * `process.cpuUsage()` is microseconds and `Date.now()` is milliseconds, so
+   * the rate is `(cpuUsDelta / 1000) / wallMsDelta * 100`. The earlier version
+   * divided the process's *lifetime* CPU time by its uptime and multiplied by
+   * 100 without the `/1000`, which is a unit error, not a clamp problem: a
+   * mostly-idle process reported 2182%.
+   *
+   * The first sample can only seed the baseline, so `percent` stays null until
+   * the second tick. Nothing here clamps the result: a process genuinely using
+   * more than one core may legitimately exceed 100%, and hiding that would be
+   * the same class of mistake in the other direction.
+   */
+  private sampleProcessCpu(): void {
+    const wallMs = Date.now();
+    const cpu = process.cpuUsage();
+    const cpuUs = cpu.user + cpu.system;
+    const previous = this.cpuSample;
+    const percent = previous === null ? null : processCpuPercent(previous, { cpuUs, wallMs });
+    this.cpuSample = { cpuUs, wallMs, percent };
+  }
+
+  /** The last tick's process CPU percentage, or null while warming up. */
+  private get processCpuPercent(): number | null {
+    return this.cpuSample?.percent ?? null;
+  }
+
+  /**
+   * Account for the agents this process actually evaluated.
+   *
+   * A "full fleet cycle" is every agent evaluated once; the cycle set is cleared
+   * when it reaches the fleet size, so a restart at a different slice offset
+   * still counts cycles rather than accumulating a partial one forever.
+   */
+  private recordRunStats(agentIds: string[]): void {
+    this.runStats.agentsInCurrentTick = agentIds.length;
+    this.runStats.evaluated += agentIds.length;
+    const fleetSize = Math.max(1, this.keyStore.size);
+    for (const agentId of agentIds) {
+      this.runStats.uniqueAgents.add(agentId);
+      this.runStats.cycleSeen.add(agentId);
+    }
+    if (this.runStats.cycleSeen.size >= fleetSize) {
+      this.runStats.fleetCycles += 1;
+      this.runStats.cycleSeen.clear();
+    }
+  }
+
+  /** The predicted wall clock of the next tick, from the last one and the period. */
+  private nextTickAt(): string | null {
+    const last = this.lastTickReport?.at;
+    if (last === undefined || last === null) return null;
+    const periodMs = Math.max(5, this.config.scheduling.tickSeconds) * 1000;
+    return new Date(Date.parse(last) + periodMs).toISOString();
   }
 
   /** Time a zero-delay timer: how long the loop took to come back to us. */
@@ -802,6 +983,22 @@ export class OrchestratorScheduler {
         data: {},
       });
       return outcome;
+    }
+    // Live only: a registration is a signed commitment to a referee we have not
+    // yet proven. Until the seed, the pin and the stored history all agree,
+    // posting one is noise at best and a forged-referee exposure at worst.
+    if (this.config.liveArmed) {
+      const refereeReadinessNow = this.readiness().referee;
+      if (!refereeReadinessNow.ready) {
+        this.logger.event({
+          level: 'error',
+          source: 'scheduler',
+          code: 'registration_blocked_referee_not_ready',
+          message: `referee is not ready; owner registrations are held: ${refereeReadinessNow.reasons.join('; ')}`,
+          data: { reasons: refereeReadinessNow.reasons },
+        });
+        return outcome;
+      }
     }
 
     for (const agentId of this.keyStore.agentIds) {
@@ -1425,6 +1622,10 @@ export class OrchestratorScheduler {
     const drift = Number(pin?.drift ?? 0) === 1;
     const tradingAllowed =
       this.loadGuard.allow('new_offer') && !snapshot.locked && !drift;
+    // Live only: the readiness gate is the single answer to "may a trade be
+    // written right now", and lite cannot bypass it. Dry-run still rehearses the
+    // whole path and records a `dry_run` row.
+    const readinessBlock = this.config.liveArmed && !this.readiness().trading.ready;
 
     for (const outcome of candidates) {
       const agentId = outcome.agentId;
@@ -1440,13 +1641,15 @@ export class OrchestratorScheduler {
           continue;
         }
         const { terms, signed } = built;
-        const refusal = tradingAllowed
-          ? null
-          : snapshot.locked
+        const refusal = !tradingAllowed
+          ? snapshot.locked
             ? 'locked'
             : drift
               ? 'package_drift'
-              : 'load_shed';
+              : 'load_shed'
+          : readinessBlock
+            ? 'not_trading_ready'
+            : null;
         if (refusal !== null) {
           this.recordTrade(agentId, terms, 'refused', refusal, signed.maker_sig, signed.taker_sig);
           result.refused += 1;
@@ -1880,9 +2083,56 @@ export class OrchestratorScheduler {
   // OperationsService — status and health
   // -------------------------------------------------------------------------
 
+  /**
+   * The two readiness gates, derived from facts the process already holds.
+   *
+   * Deliberately computed on demand rather than cached: a cached gate is exactly
+   * how a trade slips through after the referee room was recreated. `status()`
+   * computes it once and shares the answer with the trade and registration paths.
+   */
+  private readiness(): { referee: Readiness; trading: Readiness } {
+    const verifier = this.reader.verifier.state;
+    const referee = refereeReadiness({
+      seedSeen: verifier.seedSeen,
+      refereeDid: verifier.refereeDid,
+      expectedRefereeDid: this.config.expectedRefereeDid,
+      packageHash: verifier.packageHash,
+      expectedPackageHash: verifier.expectedPackageHash,
+      hydrated: this.reader.isHydrated,
+      refereeRoomsReset: this.reader.refereeRoomsReset(),
+      requirePin: this.config.requireRefereePin,
+    });
+
+    const identities = this.repositories.identities.all();
+    const enabled = identities.filter((row) => row.enabled === 1).length;
+    const total = this.keyStore.size;
+    const trading = tradingReadiness({
+      referee,
+      conservative: verifier.conservative,
+      conservativeReasons: verifier.conservativeReasons,
+      sweep: verifier.currentSweep,
+      hasReference: verifier.reference !== null,
+      limits:
+        verifier.limits === null
+          ? null
+          : { low: verifier.limits.low.toString(), high: verifier.limits.high.toString() },
+      limitsUsable: verifier.limitsUsable,
+      limitsForSweep: verifier.limitsForSweep,
+      staleReference: this.reader.snapshot().staleReference,
+      locked: verifier.locked,
+      loadAllowsNewOffer: this.loadGuard.allow('new_offer'),
+      packageDrift: Number(this.repositories.upstream.getPin()?.drift ?? 0) === 1,
+      fleetComplete: total > 0 && enabled === total,
+      registrationRequired: this.config.liveArmed,
+      registrationReadbackComplete: this.repositories.participation.countWithReadback() >= total,
+    });
+    return { referee, trading };
+  }
+
   status(): StatusSnapshot {
     const at = this.now();
     const verifier = this.reader.verifier.state;
+    const readiness = this.readiness();
     const identities = this.repositories.identities.all();
     const stale = this.runner.staleAgents();
     const byGroup: Record<string, number> = {};
@@ -1897,7 +2147,6 @@ export class OrchestratorScheduler {
     const usage = this.budget.usage();
     const pin = this.repositories.upstream.getPin();
     const memory = process.memoryUsage();
-    const cpu = process.cpuUsage();
     const uptimeSeconds = Math.max(1, (Date.now() - this.startedAt) / 1000);
     const cursorGaps = this.reader.gaps();
     const wsStatus = this.lark?.websocket.status;
@@ -1956,8 +2205,18 @@ export class OrchestratorScheduler {
         readback: this.repositories.participation.countWithReadback(),
       },
       runs: {
+        // Durable rows: they survive restarts, so they can exceed anything this
+        // process did. The `sinceStartup` figure below is the process's own.
         today: this.repositories.agentRuns.countSince(dayStart),
         window: this.repositories.agentRuns.countSince(runWindowStart),
+        sinceStartup: this.runStats.evaluated,
+        schedulerTicks: this.tickCount,
+        uniqueAgents: this.runStats.uniqueAgents.size,
+        fullFleetCycles: this.runStats.fleetCycles,
+        watchdogRuns: this.runStats.watchdogRuns,
+        agentsInCurrentTick: this.runStats.agentsInCurrentTick,
+        lastTickAt: this.lastTickReport?.at ?? null,
+        nextTickAt: this.nextTickAt(),
       },
       trades: {
         ...this.repositories.trades.countByStatus(),
@@ -1994,8 +2253,23 @@ export class OrchestratorScheduler {
         fixed: this.reader.fixedRoomList,
         dynamic: this.reader.dynamicRooms,
         cap: this.config.roomDiscovery.maxRooms,
+        bootstrap: cursorGaps.bootstrap,
+        gaps: cursorGaps.rooms,
+        refereeReady: readiness.referee.ready,
+        tradingReady: readiness.trading.ready,
       },
-      cors: { gaps: cursorGaps.total, gapRooms: cursorGaps.rooms, resets: cursorGaps.resets },
+      readiness: {
+        refereeReady: readiness.referee.ready,
+        tradingReady: readiness.trading.ready,
+        refereeReasons: readiness.referee.reasons,
+        tradingReasons: readiness.trading.reasons,
+      },
+      cors: {
+        gaps: cursorGaps.total,
+        gapRooms: cursorGaps.rooms,
+        resets: cursorGaps.resets,
+        bootstrap: cursorGaps.bootstrap,
+      },
       technocore: this.client.stats() as unknown as Record<string, number>,
       llm: {
         normal: usage.normal,
@@ -2014,7 +2288,10 @@ export class OrchestratorScheduler {
       system: {
         rssBytes: memory.rss,
         heapUsedBytes: memory.heapUsed,
-        cpuPercent: Number((((cpu.user + cpu.system) / 1000 / uptimeSeconds) * 100).toFixed(2)),
+        // Process CPU over the last tick interval — never the lifetime average
+        // that produced 2182% from a mostly-idle process.
+        cpuPercent: this.processCpuPercent,
+        cpuState: this.processCpuPercent === null ? 'warming_up' : 'ok',
         uptimeSeconds: Number(uptimeSeconds.toFixed(0)),
         diskUsedPercent: Number(this.loadGuard.diskUsedPercent(this.config.dataDir).toFixed(2)),
         eventLoopLagMs: this.lastEventLoopLagMs,
@@ -2039,9 +2316,13 @@ export class OrchestratorScheduler {
     summary: string;
     sections: Array<{ heading: string; lines: string[] }>;
     critical: string[];
+    alerts: { blocking: string[]; critical: string[]; warning: string[]; info: string[] };
   }> {
     const status = this.status();
+    const blocking: string[] = [];
     const critical: string[] = [];
+    const warning: string[] = [];
+    const info: string[] = [];
     if (status.packageDrift) {
       critical.push(
         `package hash drift: expected ${status.expectedPackageHash ?? '<unset>'}, seed says ${status.packageHash ?? '<none>'} — active trading is paused`,
@@ -2071,14 +2352,56 @@ export class OrchestratorScheduler {
     if ((status.repost.failed ?? 0) > 0) {
       critical.push(`missed-message re-posts that failed: ${status.repost.failed}`);
     }
-    if (status.cors.gaps > 0) critical.push(`cursor gaps: ${status.cors.gaps}`);
+    // A mid-run gap is a real loss of messages: critical. A first start against a
+    // room whose history no longer reaches back to seq 1 is a permanent fact
+    // about the room, not a loss this process suffered, so it is a warning — and
+    // it must never be dressed up as a complete history.
+    if (status.cors.gaps > 0) {
+      critical.push(
+        `cursor gaps (mid-run loss): ${status.cors.gaps}${status.cors.gapRooms.length ? ` in ${status.cors.gapRooms.join(', ')}` : ''}`,
+      );
+    }
+    if (status.cors.bootstrap.length > 0) {
+      warning.push(
+        `bootstrap_truncated (history before first_seq was never retrievable): ${status.cors.bootstrap.join(', ')} — recorded permanently, not counted as a gap`,
+      );
+    }
     if (status.tier === 'critical' || status.tier === 'readonly') {
       critical.push(`load tier ${status.tier}: ${status.tierReasons.join('; ')}`);
     }
+    // Registration readback is only a live commitment. In dry-run, or with
+    // registration disabled, missing readbacks are expected and are information.
     if (status.participation.readback < status.agents.total) {
-      critical.push(
-        `owner registrations without readback: ${status.agents.total - status.participation.readback}`,
-      );
+      const missing = status.agents.total - status.participation.readback;
+      if (this.config.liveArmed) {
+        critical.push(`owner registrations without readback: ${missing}`);
+      } else if (this.config.allowRegistration) {
+        info.push(`owner registrations without readback: ${missing} (dry-run, registration enabled)`);
+      } else {
+        info.push(
+          `registration disabled / not expected: ${missing} agent(s) have no readback (dry-run, registration off)`,
+        );
+      }
+    }
+
+    // The two readiness gates, banded by what they actually mean here.
+    if (!status.readiness.refereeReady) {
+      const detail = status.readiness.refereeReasons.join('; ') || 'reason unlabelled';
+      if (this.config.liveArmed) {
+        blocking.push(`referee not ready — registration and trading are held: ${detail}`);
+      } else if (this.config.expectedRefereeDid === null) {
+        info.push(`dry-run: referee DID not pinned (${detail}); observation only, not a live gate`);
+      } else {
+        warning.push(`referee seed not verified: ${detail}`);
+      }
+    }
+    if (!status.readiness.tradingReady) {
+      const detail = status.readiness.tradingReasons.join('; ') || 'awaiting seed';
+      if (this.config.liveArmed) {
+        blocking.push(`trading not ready — no live trade can be written: ${detail}`);
+      } else {
+        info.push(`dry-run only: trading not ready (${detail})`);
+      }
     }
 
     const groupStats = this.runner.groupStats();
@@ -2091,6 +2414,7 @@ export class OrchestratorScheduler {
       reportId: '',
       title: `FLOP Close Call (close-1) 运行报告 ${status.at}`,
       summary: `${status.profile} · ${status.mode}${status.liveArmed ? ' (armed)' : ''} · tier ${status.tier} · sweep ${status.sweep ?? '-'} · agents ${status.agents.total}`,
+      alerts: { blocking, critical, warning, info },
       sections: [
         {
           heading: '运行状态',
@@ -2108,9 +2432,26 @@ export class OrchestratorScheduler {
             }`,
             `package_hash: ${status.packageHash ?? '-'}`,
             `referee_did: ${status.refereeDid ?? '-'}`,
+            `referee_ready: ${status.readiness.refereeReady}${
+              status.readiness.refereeReady ? '' : ` (${status.readiness.refereeReasons.join('; ') || 'reason unlabelled'})`
+            }`,
+            `trading_ready: ${status.readiness.tradingReady}${
+              status.readiness.tradingReady ? '' : ` (${status.readiness.tradingReasons.join('; ') || 'awaiting seed'})`
+            }`,
+            `bootstrap state: ${
+              status.cors.bootstrap.length > 0
+                ? `bootstrap_truncated in ${status.cors.bootstrap.join(', ')}`
+                : 'ready (no room opened with truncated history)'
+            }`,
+            `cursor gaps: ${status.cors.gaps}${status.cors.gapRooms.length ? ` (${status.cors.gapRooms.join(', ')})` : ''}`,
             `room_scope: ${status.rooms.scope}`,
             `load tier: ${status.tier}${status.tierReasons.length ? ` (${status.tierReasons.join('; ')})` : ''}`,
-            `event loop: rss ${(status.system.rssBytes / 1024 / 1024).toFixed(1)}MB heap ${(status.system.heapUsedBytes / 1024 / 1024).toFixed(1)}MB cpu ${status.system.cpuPercent}% lag ${status.system.eventLoopLagMs}ms`,
+            `process CPU: ${
+              status.system.cpuPercent === null
+                ? 'warming_up (needs two tick samples)'
+                : `${status.system.cpuPercent}% of one core over the last tick`
+            }`,
+            `event loop: rss ${(status.system.rssBytes / 1024 / 1024).toFixed(1)}MB heap ${(status.system.heapUsedBytes / 1024 / 1024).toFixed(1)}MB lag ${status.system.eventLoopLagMs}ms`,
           ],
         },
         {
@@ -2144,7 +2485,18 @@ export class OrchestratorScheduler {
         {
           heading: '运行覆盖 (7x24h)',
           lines: [
-            `runs today: ${status.runs.today}`,
+            `runs since startup (this process): ${status.runs.sinceStartup}`,
+            `scheduler ticks (this process): ${status.runs.schedulerTicks}`,
+            `unique agents evaluated (this process): ${status.runs.uniqueAgents}/${status.agents.total}`,
+            `full fleet cycles: ${status.runs.fullFleetCycles}`,
+            `agents run in current tick: ${status.runs.agentsInCurrentTick}`,
+            `watchdog passes: ${status.runs.watchdogRuns}`,
+            `last tick: ${status.runs.lastTickAt ?? 'never'}`,
+            `next tick: ${status.runs.nextTickAt ?? '-'}`,
+            // The durable count spans every process that ran today, so it sits
+            // next to the process's own figures rather than replacing them.
+            `agent_runs rows today (durable, spans restarts): ${status.runs.today}`,
+            `agent_runs rows in window (durable): ${status.runs.window}`,
             `agents_run_in_last_window: ${status.agents.total - status.agents.staleCount}`,
             `agents_not_run_in_last_window: ${status.agents.staleCount}`,
             `last_agent_run_at: ${status.agents.lastRunAt ?? 'never'}`,
@@ -2170,7 +2522,9 @@ export class OrchestratorScheduler {
               .map(([key, value]) => `${key}=${value}`)
               .join(' ') || 'none'}`,
             `cursor gap: ${status.cors.gaps}${status.cors.gapRooms.length ? ` (${status.cors.gapRooms.join(', ')})` : ''}`,
+            `bootstrap_truncated rooms: ${status.cors.bootstrap.join(', ') || 'none'}`,
             `room resets: ${status.cors.resets.join(', ') || 'none'}`,
+            `referee_ready: ${status.readiness.refereeReady} trading_ready: ${status.readiness.tradingReady}`,
           ],
         },
         {

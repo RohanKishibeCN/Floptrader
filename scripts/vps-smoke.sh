@@ -105,6 +105,12 @@ trap cleanup EXIT
 # The environment every child process runs under. The deployable profile, in
 # dry-run, with nothing armed, no model, no dynamic rooms and no external offers
 # — a rehearsal must not be able to trade by accident.
+#
+# The two base URLs point at port 9 (discard), which refuses instantly, so the
+# rehearsal is offline by construction. Without that the process would read the
+# real service with the 15s request timeout; a tick could still be inside it when
+# SIGTERM lands, and the graceful-stop check would flake on the retry ladder
+# instead of testing the shutdown path.
 runtime_env() {
   exec env \
     NODE_ENV=production \
@@ -134,6 +140,9 @@ runtime_env() {
     LARK_APP_ID= LARK_APP_SECRET= LARK_CHAT_ID= \
     HEALTH_PORT="$HEALTH_PORT" HEALTH_HOST="$HEALTH_HOST" \
     TICK_SECONDS="${TICK_SECONDS:-5}" \
+    TECHNO_CORE_BASE_URL="${TECHNO_CORE_BASE_URL:-http://127.0.0.1:9}" \
+    CHALLENGE_ARCHIVE_BASE_URL="${CHALLENGE_ARCHIVE_BASE_URL:-http://127.0.0.1:9}" \
+    REQUEST_TIMEOUT_MS="${REQUEST_TIMEOUT_MS:-1000}" \
     "$@"
 }
 

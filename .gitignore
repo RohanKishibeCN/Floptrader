@@ -1,10 +1,18 @@
 # Runtime state: the SQLite database, WAL sidecars, archives, public inventory.
 # Never commit — it holds live participation and trade evidence.
 data/
+# Belt and braces: a database that lands outside `data/` (a smoke run, a manual
+# copy) must still never be staged.
+*.db
+*.db-wal
+*.db-shm
 
 # Age-encrypted seed bundles and the age identity files. Committing these would
 # defeat the whole key-management section.
 secrets/
+*.age
+runtime.key
+admin.key
 
 # PM2 / process logs. The contents are ignored, the directory is not, so a fresh
 # clone has a `logs/` for the systemd unit's ReadWritePaths and for PM2.

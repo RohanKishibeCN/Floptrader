@@ -236,6 +236,24 @@ export class RoomReader {
           localMessages.push({ room, message });
         }
       }
+      if (advance.reason === 'bootstrap_truncated') {
+        // Fires exactly once per room: the reason can only be
+        // `bootstrap_truncated` on the read that lifts the cursor off zero.
+        this.logger.event({
+          level: 'warn',
+          source: 'room-reader',
+          code: 'bootstrap_truncated',
+          message:
+            `${room} opened with truncated history: the retained window starts at seq ${advance.firstSeq}, ` +
+            `so seq ${advance.missedFrom}..${advance.missedTo} were never available to this process`,
+          data: {
+            room,
+            firstSeq: advance.firstSeq,
+            missedFrom: advance.missedFrom,
+            missedTo: advance.missedTo,
+          },
+        });
+      }
       if (advance.reason === 'gap') {
         this.logger.event({
           level: 'warn',
@@ -291,13 +309,46 @@ export class RoomReader {
     return this.stopped;
   }
 
-  /** Rooms with an unrecovered gap or reset, for the Lark report. */
-  gaps(): { total: number; rooms: string[]; resets: string[] } {
+  /**
+   * Per-room cursor state for the status report.
+   *
+   * `gaps` is the run-time finding (a mid-run loss) and is what enters
+   * conservative mode; `bootstrap` is the permanent record of a room whose
+   * retained history did not reach back to our start, which is not a loss this
+   * process suffered and must not be reported as one.
+   */
+  gaps(): {
+    total: number;
+    rooms: string[];
+    resets: string[];
+    bootstrap: string[];
+    states: Array<{
+      room: string;
+      state: CursorRecord['bootstrapState'];
+      gapCount: number;
+      lastGapFrom: number | null;
+      lastGapTo: number | null;
+      firstObservedSeq: number | null;
+      lastObservedSeq: number | null;
+    }>;
+  } {
     const cursors = this.cursorStore.all();
     return {
       total: cursors.reduce((sum, cursor) => sum + cursor.gap, 0),
       rooms: cursors.filter((cursor) => cursor.gap > 0).map((cursor) => cursor.room),
       resets: cursors.filter((cursor) => cursor.roomReset).map((cursor) => cursor.room),
+      bootstrap: cursors
+        .filter((cursor) => cursor.bootstrapState === 'bootstrap_truncated')
+        .map((cursor) => cursor.room),
+      states: cursors.map((cursor) => ({
+        room: cursor.room,
+        state: cursor.bootstrapState,
+        gapCount: cursor.gapCount,
+        lastGapFrom: cursor.lastGapFrom,
+        lastGapTo: cursor.lastGapTo,
+        firstObservedSeq: cursor.firstObservedSeq,
+        lastObservedSeq: cursor.lastObservedSeq,
+      })),
     };
   }
 }

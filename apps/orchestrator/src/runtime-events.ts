@@ -52,6 +52,10 @@ export const RUNTIME_EVENT_SEVERITY: Record<string, RuntimeSeverity> = {
 
   // ---- warning: worth knowing, not worth waking anyone --------------------
   mint_unknown: 'warning',
+  // A first start against a room whose retained history does not reach back to
+  // seq 1. Not a loss this process suffered, so it is not `cursor_gap` — but it
+  // is permanent, and it must never be mistaken for a complete history.
+  bootstrap_truncated: 'warning',
   archive_unavailable: 'warning',
   archive_hash_mismatch: 'warning',
   archive_verify_failed: 'warning',

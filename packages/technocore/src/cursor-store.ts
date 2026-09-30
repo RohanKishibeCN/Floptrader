@@ -10,9 +10,11 @@
  * The SQLite half lives in `@flop/storage`'s `RoomCursorRepository`; this is the
  * domain view the reader and the reader's callers use.
  */
-import type { Repositories, RoomCursorRow, SqliteDatabase } from '@flop/storage';
+import type { Repositories, RoomBootstrapState, RoomCursorRow, SqliteDatabase } from '@flop/storage';
 import type { RoomMessage } from './protocol.js';
 import { CursorAdvance } from './protocol.js';
+
+export type { RoomBootstrapState };
 
 export interface CursorRecord {
   room: string;
@@ -24,6 +26,13 @@ export interface CursorRecord {
   roomReset: boolean;
   consecutiveErrors: number;
   lastOkAt: string | null;
+  bootstrapState: RoomBootstrapState;
+  firstObservedSeq: number | null;
+  lastObservedSeq: number | null;
+  gapCount: number;
+  lastGapFrom: number | null;
+  lastGapTo: number | null;
+  bootstrapAt: string | null;
 }
 
 export function toCursorRecord(row: RoomCursorRow): CursorRecord {
@@ -37,7 +46,46 @@ export function toCursorRecord(row: RoomCursorRow): CursorRecord {
     roomReset: row.room_reset === 1,
     consecutiveErrors: row.consecutive_errors,
     lastOkAt: row.last_ok_at,
+    bootstrapState: row.bootstrap_state,
+    firstObservedSeq: row.first_observed_seq,
+    lastObservedSeq: row.last_observed_seq,
+    gapCount: row.gap_count,
+    lastGapFrom: row.last_gap_from,
+    lastGapTo: row.last_gap_to,
+    bootstrapAt: row.bootstrap_at,
   };
+}
+
+/**
+ * How far each bootstrap state has escalated.
+ *
+ * The states only ever move up. `bootstrap_truncated` is a permanent record of
+ * how the process started — it is never overwritten by a healthy `ready` — and a
+ * later, genuine mid-run gap escalates it to `cursor_gap`. A clean start becomes
+ * `ready` and stays there until something actually goes wrong.
+ */
+const BOOTSTRAP_RANK: Record<RoomBootstrapState, number> = {
+  bootstrap_pending: 0,
+  ready: 1,
+  bootstrap_truncated: 2,
+  cursor_gap: 3,
+  cursor_reset: 4,
+};
+
+/** The escalation-only successor of `current` given what this read did. */
+export function nextBootstrapState(
+  current: RoomBootstrapState,
+  reason: CursorAdvance['reason'],
+): RoomBootstrapState {
+  const candidate: RoomBootstrapState =
+    reason === 'bootstrap_truncated'
+      ? 'bootstrap_truncated'
+      : reason === 'gap'
+        ? 'cursor_gap'
+        : reason === 'room_reset'
+          ? 'cursor_reset'
+          : 'ready';
+  return BOOTSTRAP_RANK[candidate] > BOOTSTRAP_RANK[current] ? candidate : current;
 }
 
 export interface CursorStore {
@@ -117,6 +165,20 @@ export class SqliteCursorStore implements CursorStore {
         });
         if (wasInserted) inserted += 1;
       }
+      const current = repositories.roomCursors.ensure(room);
+      const isGap = advance.reason === 'gap';
+      const firstObserved =
+        advance.firstSeq === null
+          ? current.first_observed_seq
+          : current.first_observed_seq === null
+            ? advance.firstSeq
+            : Math.min(current.first_observed_seq, advance.firstSeq);
+      const lastObserved =
+        advance.lastSeq === null
+          ? current.last_observed_seq
+          : current.last_observed_seq === null
+            ? advance.lastSeq
+            : Math.max(current.last_observed_seq, advance.lastSeq);
       repositories.roomCursors.update(room, {
         cursor: advance.cursor,
         generation: advance.generation,
@@ -126,6 +188,13 @@ export class SqliteCursorStore implements CursorStore {
         room_reset: advance.roomReset ? 1 : 0,
         consecutive_errors: 0,
         last_ok_at: ingestedAt,
+        bootstrap_state: nextBootstrapState(current.bootstrap_state, advance.reason),
+        first_observed_seq: firstObserved,
+        last_observed_seq: lastObserved,
+        gap_count: isGap ? current.gap_count + 1 : current.gap_count,
+        last_gap_from: isGap ? (advance.missedFrom ?? null) : current.last_gap_from,
+        last_gap_to: isGap ? (advance.missedTo ?? null) : current.last_gap_to,
+        bootstrap_at: current.bootstrap_at ?? ingestedAt,
       });
     });
     transaction();

@@ -101,6 +101,34 @@ describe('LarkReportScheduler.render', () => {
     expect(withCritical).toContain('- 磁盘 92%');
   });
 
+  it('renders the four alert bands in order and omits the empty ones', () => {
+    const { scheduler } = makeScheduler(() => content());
+    const text = scheduler.render(
+      content({
+        alerts: {
+          blocking: ['referee not ready — registration and trading are held'],
+          critical: ['cursor gaps (mid-run loss): 2'],
+          warning: ['bootstrap_truncated (history before first_seq was never retrievable): close1'],
+          info: ['registration disabled / not expected: 150 agent(s) have no readback'],
+        },
+      }),
+    );
+    expect(text).toContain('⛔ BLOCKING');
+    expect(text).toContain('⚠ CRITICAL');
+    expect(text).toContain('△ WARNING');
+    expect(text).toContain('· INFO');
+    expect(text.indexOf('⛔ BLOCKING')).toBeLessThan(text.indexOf('· INFO'));
+
+    // A dry-run must not carry a "severe" heading it never earned.
+    const quiet = scheduler.render(
+      content({ alerts: { blocking: [], critical: [], warning: [], info: ['dry-run only'] } }),
+    );
+    expect(quiet).toContain('· INFO');
+    expect(quiet).not.toContain('⛔ BLOCKING');
+    expect(quiet).not.toContain('⚠ CRITICAL');
+    expect(quiet).not.toContain('△ WARNING');
+  });
+
   it('collapses a wall of 150 DIDs to a single placeholder', () => {
     const { scheduler } = makeScheduler(() => content());
     const did = `did:key:z6Mk${'A'.repeat(44)}`;

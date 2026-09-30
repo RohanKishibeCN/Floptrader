@@ -38,6 +38,7 @@ import {
   parseAdminPublicKey,
   parseBundle,
   parseInventory,
+  readAgeIdentityFile,
   verifyInventorySignature,
   type AgentSecretRecord,
   type ManifestSignature,
@@ -180,11 +181,11 @@ export function loadRules(config: Config, logger?: Logger): Rules {
  * running with a corrupted seed would produce signatures nobody accepts.
  */
 function collectAgeIdentities(config: Config): string[] {
-  const identities: string[] = [];
-  if (config.ageIdentityFile.length > 0 && existsSync(config.ageIdentityFile)) {
-    identities.push(readFileSync(config.ageIdentityFile, 'utf8').trim());
-  }
-  return identities;
+  if (config.ageIdentityFile.length === 0 || !existsSync(config.ageIdentityFile)) return [];
+  // Exactly one secret key, and a failure that names the file rather than the
+  // key. The path itself is unchanged: `AGE_IDENTITY_FILE` still points where it
+  // always did.
+  return [readAgeIdentityFile(config.ageIdentityFile)];
 }
 
 /** The key-store loader the orchestrator, the CLI and the soak harness share. */

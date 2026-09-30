@@ -24,6 +24,7 @@ import {
   parseAdminPublicKey,
   parseBundle,
   parseInventory,
+  readAgeIdentityFile,
   verifyInventorySignature,
   type ManifestSignature,
 } from '@flop/identity';
@@ -69,7 +70,13 @@ const ciphertext = new Uint8Array(readFileSync(input));
 const digest = createHash('sha256').update(ciphertext).digest('hex');
 process.stdout.write(`  sha256:    ${digest}\n  bytes:     ${ciphertext.byteLength}\n`);
 
-const identity = readFileSync(config.ageIdentityFile, 'utf8').trim();
+let identity: string;
+try {
+  identity = readAgeIdentityFile(config.ageIdentityFile);
+} catch (error) {
+  fail(`could not read the age identity: ${String(error)}`);
+  process.exit(1);
+}
 let agents: ReturnType<typeof parseBundle>['agents'];
 try {
   const plaintext = await decryptBundle(ciphertext, [identity]);

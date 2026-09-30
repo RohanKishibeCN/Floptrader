@@ -8,6 +8,7 @@
  * `identities restore` are the only paths that touch the ciphertext, and there is
  * deliberately no command that writes a plaintext seed to disk.
  */
+import { readFileSync } from 'node:fs';
 import { Decrypter, Encrypter, generateIdentity, identityToRecipient } from 'age-encryption';
 import { sha256 } from '@noble/hashes/sha256';
 import {
@@ -144,6 +145,64 @@ export async function createAgeIdentity(): Promise<string> {
 
 export async function ageRecipientFor(identity: string): Promise<string> {
   return identityToRecipient(identity);
+}
+
+/**
+ * The one line of an age identity file that is actually the key.
+ *
+ * `age-keygen` writes a short file format — `# created: …`, `# public key: …`,
+ * then the secret key — while `age-encryption`'s `generateIdentity()` returns the
+ * bare key alone. Both are accepted, and both are reduced to exactly the secret
+ * key line, so the same parser serves a file written by either tool.
+ */
+export const AGE_SECRET_KEY_PREFIX = 'AGE-SECRET-KEY-1';
+
+/**
+ * Extract the single `AGE-SECRET-KEY-1…` line from the text of an age identity
+ * file.
+ *
+ * Exactly one is required. Zero means the file is not an identity (a public key,
+ * an empty file, a placeholder); more than one means we cannot tell which key
+ * the operator meant, and guessing would either fail to decrypt or decrypt with
+ * a key they did not intend. Both are refusals.
+ *
+ * The error text names `source` and never the key material: a startup failure
+ * must not become a way to print a secret into a log or a terminal.
+ */
+export function parseAgeIdentity(text: string, source: string): string {
+  const keys = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith(AGE_SECRET_KEY_PREFIX));
+  if (keys.length === 0) {
+    throw new IdentityError(
+      `no ${AGE_SECRET_KEY_PREFIX} line found in ${source}; an age identity file must contain exactly one`,
+    );
+  }
+  if (keys.length > 1) {
+    throw new IdentityError(
+      `${source} contains ${keys.length} ${AGE_SECRET_KEY_PREFIX} lines; exactly one is required`,
+    );
+  }
+  return keys[0]!;
+}
+
+/**
+ * Read and validate an age identity file.
+ *
+ * Used everywhere `AGE_IDENTITY_FILE` is consulted, so the "exactly one key"
+ * rule and the "never echo the key" rule hold on every path.
+ */
+export function readAgeIdentityFile(path: string): string {
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch (error) {
+    throw new IdentityError(
+      `could not read the age identity at ${path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  return parseAgeIdentity(text, path);
 }
 
 /** Encrypt the plaintext bundle to N age recipients. */

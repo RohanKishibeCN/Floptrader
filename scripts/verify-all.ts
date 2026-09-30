@@ -516,6 +516,28 @@ await check('a fresh database gets every table the code expects', () => {
     const missing = required.filter((table) => !tables.has(table));
     assert(missing.length === 0, `missing tables: ${missing.join(', ')}`);
 
+    // The bootstrap state machine writes these, and the report reads them: a
+    // fresh database that lacks one is a build that would misreport a fresh VPS's
+    // first read as a lost cursor.
+    const cursorColumns = new Set(
+      (db.prepare('PRAGMA table_info(room_cursors)').all() as Array<{ name: string }>).map((row) => row.name),
+    );
+    const requiredCursorColumns = [
+      'bootstrap_state',
+      'first_observed_seq',
+      'last_observed_seq',
+      'gap_count',
+      'last_gap_from',
+      'last_gap_to',
+      'bootstrap_at',
+      'updated_at',
+    ];
+    const missingCursorColumns = requiredCursorColumns.filter((column) => !cursorColumns.has(column));
+    assert(
+      missingCursorColumns.length === 0,
+      `room_cursors is missing: ${missingCursorColumns.join(', ')}`,
+    );
+
     assert(SCHEMA_VERSION === MIGRATIONS[MIGRATIONS.length - 1]!.version, 'SCHEMA_VERSION is stale');
     assert(
       (db.pragma('user_version', { simple: true }) as number) === SCHEMA_VERSION,

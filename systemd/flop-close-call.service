@@ -4,6 +4,12 @@ Documentation=https://github.com/flop-labs/technocore-close-call-challenge
 # Only start once the network and the filesystem holding /opt are up.
 After=network-online.target
 Wants=network-online.target
+# These two live in [Unit], not [Service]: they bound how often systemd will
+# *start* the unit. systemd does not recognise them under [Service] and reports
+# "Unknown key name" while silently ignoring them, which would let a crash loop
+# spin on a shared box.
+StartLimitIntervalSec=300
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -24,9 +30,8 @@ EnvironmentFile=/opt/flop-close-call/shared/flop.env
 ExecStart=/usr/bin/node --max-old-space-size=512 /opt/flop-close-call/current/dist/main.mjs
 Restart=always
 RestartSec=5s
-# A crash loop must not spin on a shared box.
-StartLimitIntervalSec=300
-StartLimitBurst=10
+# The crash-loop bound is `StartLimitIntervalSec`/`StartLimitBurst` in [Unit]
+# above; systemd only reads them there.
 # Give an in-flight room write time to finish before SIGKILL.
 KillSignal=SIGTERM
 TimeoutStopSec=30s

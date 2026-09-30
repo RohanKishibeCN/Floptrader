@@ -196,6 +196,8 @@ export class OrchestratorReader {
   private readonly logger: Logger;
   private readonly maxDiscoveredRooms: number | null;
   private readonly externalOfferTakerEnabled: boolean;
+  /** Set once `hydrateFromSnapshots()` has replayed the stored referee history. */
+  private hydrated = false;
 
   constructor(options: ReaderOptions) {
     this.rules = options.rules;
@@ -563,11 +565,50 @@ export class OrchestratorReader {
     if (applied > 0) {
       this.persistSweepState(this.verifier.snapshot(this.now()));
     }
+    this.hydrated = true;
     return { applied, skipped };
   }
 
-  gaps(): { total: number; rooms: string[]; resets: string[] } {
+  /**
+   * The cursor view the report and the readiness gate read.
+   *
+   * `gaps` is a mid-run loss and is critical; `bootstrap` is a room whose
+   * retained history never reached back to our first read, which is a permanent
+   * record of how we started and not a loss this process suffered.
+   */
+  gaps(): {
+    total: number;
+    rooms: string[];
+    resets: string[];
+    bootstrap: string[];
+    states: Array<{
+      room: string;
+      state: string;
+      gapCount: number;
+      lastGapFrom: number | null;
+      lastGapTo: number | null;
+      firstObservedSeq: number | null;
+      lastObservedSeq: number | null;
+    }>;
+  } {
     return this.roomReader.gaps();
+  }
+
+  /** True once the verifier has been rebuilt from the stored referee history. */
+  get isHydrated(): boolean {
+    return this.hydrated;
+  }
+
+  /**
+   * The rooms recreated underneath us (a generation change), for the readiness
+   * gate. A referee room in this list means the referee's own state was
+   * invalidated and must not be treated as established.
+   */
+  refereeRoomsReset(): string[] {
+    const referee = new Set(this.fixedRooms.filter((room) => room !== (this.rules.tradingRoom || TRADING_ROOM)));
+    return this.gaps()
+      .states.filter((entry) => entry.state === 'cursor_reset' && referee.has(entry.room))
+      .map((entry) => entry.room);
   }
 
   /** Messages from our own DIDs seen on the last tick, for the trade ledger. */

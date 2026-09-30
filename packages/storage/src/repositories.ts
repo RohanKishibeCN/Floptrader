@@ -569,6 +569,28 @@ export class ControlProofRepository {
   }
 }
 
+/**
+ * How a room's history began, as far as this process can tell.
+ *
+ *   bootstrap_pending    nothing read from this room yet
+ *   bootstrap_truncated  first read; the room retained only a suffix of history,
+ *                        so the earliest messages were never available to us
+ *   ready                read normally
+ *   cursor_gap           a gap was detected *after* we held a position: messages
+ *                        we should have seen were dropped before we read them
+ *   cursor_reset         the room was recreated (generation changed)
+ *
+ * The states only ever escalate, by this order. `bootstrap_truncated` is a
+ * permanent record of how we started and is never overwritten by `ready`; a
+ * later real gap escalates it to `cursor_gap`.
+ */
+export type RoomBootstrapState =
+  | 'bootstrap_pending'
+  | 'bootstrap_truncated'
+  | 'ready'
+  | 'cursor_gap'
+  | 'cursor_reset';
+
 export interface RoomCursorRow {
   room: string;
   cursor: number;
@@ -579,6 +601,13 @@ export interface RoomCursorRow {
   room_reset: number;
   consecutive_errors: number;
   last_ok_at: string | null;
+  bootstrap_state: RoomBootstrapState;
+  first_observed_seq: number | null;
+  last_observed_seq: number | null;
+  gap_count: number;
+  last_gap_from: number | null;
+  last_gap_to: number | null;
+  bootstrap_at: string | null;
   updated_at: string;
 }
 
@@ -608,14 +637,23 @@ export class RoomCursorRepository {
       room_reset: 0,
       consecutive_errors: 0,
       last_ok_at: null,
+      bootstrap_state: 'bootstrap_pending',
+      first_observed_seq: null,
+      last_observed_seq: null,
+      gap_count: 0,
+      last_gap_from: null,
+      last_gap_to: null,
+      bootstrap_at: null,
       updated_at: nowIso(),
     };
     this.db
       .prepare(
         `INSERT INTO room_cursors (room, cursor, generation, first_seq, last_seq, gap,
-           room_reset, consecutive_errors, last_ok_at, updated_at)
+           room_reset, consecutive_errors, last_ok_at, bootstrap_state, first_observed_seq,
+           last_observed_seq, gap_count, last_gap_from, last_gap_to, bootstrap_at, updated_at)
          VALUES (@room, @cursor, @generation, @first_seq, @last_seq, @gap, @room_reset,
-           @consecutive_errors, @last_ok_at, @updated_at)`,
+           @consecutive_errors, @last_ok_at, @bootstrap_state, @first_observed_seq,
+           @last_observed_seq, @gap_count, @last_gap_from, @last_gap_to, @bootstrap_at, @updated_at)`,
       )
       .run(row);
     return row;
@@ -628,10 +666,21 @@ export class RoomCursorRepository {
       .prepare(
         `UPDATE room_cursors SET cursor = @cursor, generation = @generation,
            first_seq = @first_seq, last_seq = @last_seq, gap = @gap, room_reset = @room_reset,
-           consecutive_errors = @consecutive_errors, last_ok_at = @last_ok_at, updated_at = @updated_at
+           consecutive_errors = @consecutive_errors, last_ok_at = @last_ok_at,
+           bootstrap_state = @bootstrap_state, first_observed_seq = @first_observed_seq,
+           last_observed_seq = @last_observed_seq, gap_count = @gap_count,
+           last_gap_from = @last_gap_from, last_gap_to = @last_gap_to,
+           bootstrap_at = @bootstrap_at, updated_at = @updated_at
          WHERE room = @room`,
       )
       .run({ ...next, room, updated_at: nowIso() });
+  }
+
+  /** Rooms whose bootstrap recorded a truncated history. */
+  truncatedRooms(): RoomCursorRow[] {
+    return this.db
+      .prepare("SELECT * FROM room_cursors WHERE bootstrap_state = 'bootstrap_truncated' ORDER BY room")
+      .all() as RoomCursorRow[];
   }
 
   anyGap(): boolean {

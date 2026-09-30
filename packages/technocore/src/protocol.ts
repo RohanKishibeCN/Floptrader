@@ -141,18 +141,23 @@ export interface RoomCursorView {
 /**
  * Detect what a read implies about the room's continuity.
  *
- * A cursor can be lost in three distinguishable ways, and the response is the
- * same for all of them — go conservative — but the record differs:
+ * A cursor can be lost in four distinguishable ways, and the record differs:
  *
- *   - `room_reset`: the generation changed, so the room was recreated and every
- *     sequence number we knew is meaningless;
- *   - `gap`: the oldest seq we can now see is greater than cursor + 1, so messages
- *     were dropped from the retained ring before we read them;
- *   - `first_read`: we have no cursor yet; adopt the newest message.
+ *   - `room_reset`: the generation changed *while we held a position*, so the
+ *     room was recreated and every sequence number we knew is meaningless;
+ *   - `gap`: the oldest seq we can now see is greater than cursor + 1, and we
+ *     held a cursor, so messages were dropped from the retained ring before we
+ *     read them;
+ *   - `bootstrap_truncated`: we held no cursor (cursor 0) and the room's oldest
+ *     retained message is not seq 1. Nothing was lost *by us* — the history was
+ *     never available — so this is recorded, not treated as an incident. It does
+ *     not add to `gap`, so it does not put the process into conservative mode;
+ *   - `first_read`: we have no cursor yet and history reaches back to the start.
  *
- * A gap is never silently stepped over. The missing range is recorded, and the
- * reader enters conservative mode, because a missed trade message could be one of
- * ours and the local ledger would then be wrong.
+ * A mid-run gap is never silently stepped over: the missing range is recorded,
+ * `gap` grows, and the reader enters conservative mode, because a missed trade
+ * message could be one of ours and the local ledger would then be wrong. The
+ * bootstrap case is the opposite situation and must not be confused with it.
  */
 export interface CursorAdvance {
   cursor: number;
@@ -161,7 +166,7 @@ export interface CursorAdvance {
   lastSeq: number | null;
   gap: number;
   roomReset: boolean;
-  reason: 'ok' | 'room_reset' | 'gap' | 'first_read' | 'empty';
+  reason: 'ok' | 'room_reset' | 'gap' | 'first_read' | 'empty' | 'bootstrap_truncated';
   missedFrom?: number;
   missedTo?: number;
 }
@@ -176,6 +181,9 @@ export function advanceCursor(
   const lastSeq = read.last_seq ?? (read.messages[read.messages.length - 1]?.seq ?? null);
 
   if (previous === null) {
+    // No stored row at all: a first read. If the room's retained history does not
+    // start at seq 1, that is the bootstrap case, not a lost-cursor incident.
+    const truncated = firstSeq !== null && firstSeq > 1;
     return {
       cursor: lastSeq ?? 0,
       generation,
@@ -183,7 +191,8 @@ export function advanceCursor(
       lastSeq,
       gap: 0,
       roomReset: false,
-      reason: 'first_read',
+      reason: truncated ? 'bootstrap_truncated' : 'first_read',
+      ...(truncated ? { missedFrom: 1, missedTo: firstSeq - 1 } : {}),
     };
   }
 
@@ -193,6 +202,9 @@ export function advanceCursor(
   // the very first tick would put the process into conservative mode permanently.
   if (generation !== previous.generation) {
     if (previous.cursor === 0) {
+      // Never held a position: this is still a first read, however the generation
+      // happens to be numbered.
+      const truncated = firstSeq !== null && firstSeq > 1;
       return {
         cursor: lastSeq ?? 0,
         generation,
@@ -200,7 +212,8 @@ export function advanceCursor(
         lastSeq,
         gap: 0,
         roomReset: false,
-        reason: 'first_read',
+        reason: truncated ? 'bootstrap_truncated' : 'first_read',
+        ...(truncated ? { missedFrom: 1, missedTo: firstSeq - 1 } : {}),
       };
     }
     return {
@@ -226,10 +239,28 @@ export function advanceCursor(
     };
   }
 
-  // A retained-ring gap: the room's oldest visible message is past our cursor.
+  // The room's oldest visible message is past where we are. Which of the two
+  // situations this is depends entirely on whether we ever held a position.
   if (firstSeq !== null && firstSeq > previous.cursor + 1) {
     const missedFrom = previous.cursor + 1;
     const missedTo = firstSeq - 1;
+    if (previous.cursor === 0) {
+      // A first start against a room whose retained history does not reach back
+      // to seq 1: the messages before `first_seq` were never available to us, so
+      // nothing was lost by this process. Recorded, but `gap` stays 0 — otherwise
+      // every fresh VPS would go conservative on its first read and stay there.
+      return {
+        cursor: lastSeq ?? previous.cursor,
+        generation,
+        firstSeq,
+        lastSeq,
+        gap: 0,
+        roomReset: false,
+        reason: 'bootstrap_truncated',
+        missedFrom,
+        missedTo,
+      };
+    }
     return {
       cursor: lastSeq ?? previous.cursor,
       generation,

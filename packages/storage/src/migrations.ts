@@ -508,6 +508,38 @@ export const MIGRATIONS: Migration[] = [
       `CREATE INDEX IF NOT EXISTS idx_trades_posted_sweep ON trades(posted_sweep)`,
     ],
   },
+  {
+    version: 6,
+    name: 'room-bootstrap-state',
+    statements: [
+      // Why a fresh database must not be read as a mid-run gap.
+      //
+      // `close1` and the referee rooms retain a bounded history, so a process
+      // starting against an empty database sees `first_seq` in the hundreds of
+      // thousands and, before this column existed, recorded a 400k-message gap
+      // and went conservative on its very first read. That conflates three
+      // different facts — a first start whose history was never available to us,
+      // a run that lost messages, and a room that was recreated — and only the
+      // second one is an incident.
+      //
+      // `bootstrap_state` names which one applies, and it is durable: a restart
+      // must not re-derive it, and it must never be downgraded (a later real gap
+      // escalates the state, it does not reset it).
+      `ALTER TABLE room_cursors ADD COLUMN bootstrap_state TEXT NOT NULL DEFAULT 'bootstrap_pending'`,
+      // The oldest and newest sequence numbers we have actually observed, kept
+      // separately from the cursor so a truncated first read is still visible
+      // after the cursor has advanced past it.
+      `ALTER TABLE room_cursors ADD COLUMN first_observed_seq INTEGER`,
+      `ALTER TABLE room_cursors ADD COLUMN last_observed_seq INTEGER`,
+      // Gap accounting: how many gaps have been recorded for this room, and the
+      // range the most recent one covered.
+      `ALTER TABLE room_cursors ADD COLUMN gap_count INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE room_cursors ADD COLUMN last_gap_from INTEGER`,
+      `ALTER TABLE room_cursors ADD COLUMN last_gap_to INTEGER`,
+      // When the room first reached a settled bootstrap state, for the report.
+      `ALTER TABLE room_cursors ADD COLUMN bootstrap_at TEXT`,
+    ],
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;
