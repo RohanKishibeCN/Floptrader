@@ -197,6 +197,36 @@ export const EnvSchema = z.object({
   /** The published sweep-record archive; an audit source, never an authority. */
   CHALLENGE_ARCHIVE_BASE_URL: z.string().default('https://challenges.technocore.chat/close-1'),
   ARCHIVE_CHECK_INTERVAL_MINUTES: intString(15),
+  /**
+   * The archive has published well over a thousand sweeps. A check is a *bounded*
+   * batch, never a full backfill: at most this many records, at most this many
+   * bytes, and at most this many requests per minute.
+   */
+  ARCHIVE_MAX_RECORDS_PER_CHECK: intString(10),
+  ARCHIVE_MAX_BYTES_PER_CHECK: intString(100_000_000),
+  ARCHIVE_MAX_REQUESTS_PER_MINUTE: intString(10),
+  /** Which end of the backlog a backfill pass takes next. */
+  ARCHIVE_BACKFILL_MODE: z.enum(['oldest_first', 'newest_first']).default('oldest_first'),
+
+  // ---- optional dependencies (off unless asked for) ------------------------
+  /**
+   * Takes other owners' open offers in discovered rooms.
+   *
+   * Off by default: the dynamic room reader has not completed a real staging
+   * validation, so the process must not claim coverage of the registered rooms
+   * nor accept offers found in them. Turning it on is an operator decision made
+   * once dynamic-room staging, cursor recovery, unlisted handling and repost
+   * readback have all passed.
+   */
+  EXTERNAL_OFFER_TAKER_ENABLED: boolish.default(false),
+  /**
+   * Whether the language model may review strategy parameters at all.
+   *
+   * Off by default: every strategy has a deterministic fallback, and the trade
+   * path never waits on a model. The budget, windows and validators stay in place
+   * for when it is switched on.
+   */
+  DEEPSEEK_ENABLED: boolish.default(false),
 
   // ---- staging acceptance -------------------------------------------------
   /**
@@ -270,6 +300,8 @@ export interface Config {
     maxInflight: number;
   };
   deepseek: {
+    /** Whether any model call may happen. Off by default. */
+    enabled: boolean;
     baseUrl: string;
     apiKey: string;
     model: string;
@@ -315,7 +347,25 @@ export interface Config {
     externalOffer: { maxQty: Decimal; maxNotional: Decimal; clawbackBuffer: Decimal };
   };
   roomDiscovery: { maxRooms: number; dynamicReadConcurrency: number };
-  archive: { baseUrl: string; checkIntervalMinutes: number };
+  /**
+   * Whether the external-offer taker may act on offers found in discovered rooms.
+   *
+   * While it is false the process neither claims coverage of the registered rooms
+   * nor accepts offers from them; the report says `room_scope=close1_only`.
+   */
+  externalOfferTakerEnabled: boolean;
+  archive: {
+    baseUrl: string;
+    checkIntervalMinutes: number;
+    /** Per-check ceiling on downloaded records: a bounded batch, never a backfill. */
+    maxRecordsPerCheck: number;
+    /** Per-check ceiling on downloaded bytes. */
+    maxBytesPerCheck: number;
+    /** Ceiling on archive requests per minute, enforced between request starts. */
+    maxRequestsPerMinute: number;
+    /** Which end of the backlog a backfill pass takes. */
+    backfillMode: 'oldest_first' | 'newest_first';
+  };
   /** Opt-in flag for the real-network staging smoke test; never read at runtime. */
   stagingSmokeTest: boolean;
   health: { port: number; host: string };
@@ -406,6 +456,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const expectedPackageHash = raw.EXPECTED_PACKAGE_HASH.trim().toLowerCase();
   if (expectedPackageHash.length > 0 && !SHA256_HEX.test(expectedPackageHash)) {
     throw new ConfigError('EXPECTED_PACKAGE_HASH must be a 64-character sha256 hex digest');
+  }
+  // Live must name the package it is running against. Falling back to this
+  // checkout's own manifest hash would let a live process trade under whatever
+  // rules happened to be on disk, which is the one thing the pin exists to stop.
+  if (liveArmed && expectedPackageHash.length === 0) {
+    throw new ConfigError(
+      'FLOP_MODE=live requires EXPECTED_PACKAGE_HASH — the exact sha256 of the official ' +
+        'reference/manifest.json this process is pinned to; the local manifest is not a substitute',
+    );
   }
 
   if (raw.REQUIRE_FULL_FLEET && raw.EXPECTED_AGENT_COUNT !== DEFAULT_AGENT_COUNT) {
@@ -513,6 +572,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       maxInflight: Math.max(1, raw.MAX_INFLIGHT),
     },
     deepseek: {
+      enabled: raw.DEEPSEEK_ENABLED,
       baseUrl: raw.DEEPSEEK_BASE_URL.replace(/\/+$/, ''),
       apiKey: raw.DEEPSEEK_API_KEY,
       model: raw.DEEPSEEK_MODEL,
@@ -568,9 +628,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       maxRooms: raw.MAX_DISCOVERED_ROOMS,
       dynamicReadConcurrency: Math.max(1, raw.DYNAMIC_ROOM_READ_CONCURRENCY),
     },
+    externalOfferTakerEnabled: raw.EXTERNAL_OFFER_TAKER_ENABLED,
     archive: {
       baseUrl: raw.CHALLENGE_ARCHIVE_BASE_URL.replace(/\/+$/, ''),
       checkIntervalMinutes: raw.ARCHIVE_CHECK_INTERVAL_MINUTES,
+      maxRecordsPerCheck: Math.max(1, raw.ARCHIVE_MAX_RECORDS_PER_CHECK),
+      maxBytesPerCheck: Math.max(1, raw.ARCHIVE_MAX_BYTES_PER_CHECK),
+      maxRequestsPerMinute: Math.max(1, raw.ARCHIVE_MAX_REQUESTS_PER_MINUTE),
+      backfillMode: raw.ARCHIVE_BACKFILL_MODE,
     },
     stagingSmokeTest: raw.STAGING_SMOKE_TEST,
     health: { port: raw.HEALTH_PORT, host: raw.HEALTH_HOST },

@@ -268,6 +268,7 @@ await check('a control proof verifies against the signed inventory', () => {
 
 await check('live mode requires confirmation, registration and a pinned referee', () => {
   const refereeDid = didFromSeed(newSeed());
+  const packageHash = sha256Hex(referenceFile('manifest.json'));
   const mustThrow = (env: NodeJS.ProcessEnv, why: string): void => {
     let threw = false;
     try {
@@ -297,12 +298,22 @@ await check('live mode requires confirmation, registration and a pinned referee'
     },
     'FLOP_MODE=live armed with REQUIRE_REFEREE_PIN=false',
   );
+  mustThrow(
+    {
+      FLOP_MODE: 'live',
+      FLOP_LIVE_CONFIRM: 'close-1',
+      FLOP_ALLOW_REGISTRATION: 'true',
+      EXPECTED_REFEREE_DID: refereeDid,
+    },
+    'FLOP_MODE=live armed without EXPECTED_PACKAGE_HASH',
+  );
 
   const armed = loadConfig({
     FLOP_MODE: 'live',
     FLOP_LIVE_CONFIRM: 'close-1',
     FLOP_ALLOW_REGISTRATION: 'true',
     EXPECTED_REFEREE_DID: refereeDid,
+    EXPECTED_PACKAGE_HASH: packageHash,
   } as NodeJS.ProcessEnv);
   assert(armed.liveArmed, 'an explicitly confirmed live config did not arm');
   assert(!armed.tradingArmed, 'live without FLOP_ALLOW_TRADING armed trading');
@@ -310,7 +321,60 @@ await check('live mode requires confirmation, registration and a pinned referee'
   const byDefault = loadConfig({} as NodeJS.ProcessEnv);
   assert(!byDefault.liveArmed, 'the default configuration armed live trading');
   assert(byDefault.mode === 'dry-run', `the default mode is ${byDefault.mode}`);
-  return 'default dry-run; live needs FLOP_MODE + FLOP_LIVE_CONFIRM + FLOP_ALLOW_REGISTRATION + a pinned referee';
+  return 'default dry-run; live needs FLOP_MODE + FLOP_LIVE_CONFIRM + FLOP_ALLOW_REGISTRATION + a pinned referee + a package pin';
+});
+
+/**
+ * The live package-hash gate, printed under its own name so a release log can be
+ * grepped for it: live must name the package, the pin must be a sha256, and the
+ * pin must equal the vendored manifest — the third leg (the bundle hash) is
+ * checked at startup by `resolvePackagePin`.
+ */
+await check('live package hash required', () => {
+  const manifestHash = sha256Hex(referenceFile('manifest.json'));
+  const refereeDid = didFromSeed(newSeed());
+
+  const live = (overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv =>
+    ({
+      FLOP_MODE: 'live',
+      FLOP_LIVE_CONFIRM: 'close-1',
+      FLOP_ALLOW_REGISTRATION: 'true',
+      EXPECTED_REFEREE_DID: refereeDid,
+      ...overrides,
+    }) as NodeJS.ProcessEnv;
+
+  // Missing: live must refuse.
+  let threw = false;
+  try {
+    loadConfig(live({}));
+  } catch {
+    threw = true;
+  }
+  assert(threw, 'live started with no EXPECTED_PACKAGE_HASH');
+
+  // Malformed: live must refuse a hash that is not a 64-hex sha256.
+  for (const bad of ['not-a-hash', 'a'.repeat(63), 'g'.repeat(64), `${'a'.repeat(62)}zz`]) {
+    let rejected = false;
+    try {
+      loadConfig(live({ EXPECTED_PACKAGE_HASH: bad }));
+    } catch {
+      rejected = true;
+    }
+    assert(rejected, `live accepted a malformed EXPECTED_PACKAGE_HASH: ${JSON.stringify(bad)}`);
+  }
+
+  // Valid: accepted, and case-insensitive.
+  const parsed = loadConfig(live({ EXPECTED_PACKAGE_HASH: manifestHash.toUpperCase() }));
+  assert(
+    parsed.expectedPackageHash === manifestHash,
+    `the pin was not normalised to lowercase: ${parsed.expectedPackageHash}`,
+  );
+
+  // Dry-run: a missing pin is allowed.
+  const dry = loadConfig({} as NodeJS.ProcessEnv);
+  assert(dry.expectedPackageHash === null, 'the dry-run default invented a package pin');
+
+  return `missing rejected, malformed rejected, ${manifestHash.slice(0, 12)}… accepted (case-insensitive); dry-run may omit`;
 });
 
 await check('load thresholds must be ordered', () => {

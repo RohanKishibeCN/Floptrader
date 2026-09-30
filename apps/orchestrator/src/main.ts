@@ -65,6 +65,12 @@ export interface RuntimeOverrides {
    * injected transport. Tests use it to serve a fixed `index.json`.
    */
   archiveFetchImpl?: typeof fetch;
+  /**
+   * The archive monitor's request-rate gate. Tests inject a no-op (or a
+   * clock-advancing) sleep so a bounded batch does not spend real minutes
+   * waiting between requests.
+   */
+  archiveSleep?: (ms: number) => Promise<void>;
   /** Test seams. */
   larkTransport?: Parameters<typeof createLarkStack>[0]['transport'];
   larkNotifierClientFactory?: Parameters<typeof createLarkStack>[0]['notifierClientFactory'];
@@ -240,8 +246,18 @@ export interface PackagePin {
  * record pins one — `EXPECTED_PACKAGE_HASH`. Any disagreement is a manual-release
  * problem; papering over it at startup is how a process ends up trading under
  * rules it never agreed to.
+ *
+ * Live and dry-run differ in exactly one place: when `EXPECTED_PACKAGE_HASH` is
+ * unset. Live has already refused to reach this point without one (see
+ * `loadConfig`), so a null here is impossible live; a dry run may proceed against
+ * the vendored manifest's own hash, but it is recorded as a warning because the
+ * pin was never made explicit.
  */
-export function resolvePackagePin(config: Config, bundlePackageHash: string): PackagePin {
+export function resolvePackagePin(
+  config: Config,
+  bundlePackageHash: string,
+  logger?: Logger,
+): PackagePin {
   const local = computeLocalPackageManifestHash(config.referenceDir);
   if (!local.ok || local.manifestHash.length === 0) {
     throw new ConfigError(
@@ -256,13 +272,37 @@ export function resolvePackagePin(config: Config, bundlePackageHash: string): Pa
     );
   }
 
-  const expected = config.expectedPackageHash ?? local.manifestHash;
-  if (config.expectedPackageHash !== null && local.manifestHash !== config.expectedPackageHash) {
+  // Live cannot get here without a pin: `loadConfig` refuses to arm live without
+  // `EXPECTED_PACKAGE_HASH`. Assert it rather than trusting the caller, so a
+  // future entry point that skips `loadConfig` still cannot trade unpinned.
+  if (config.mode === 'live' && config.expectedPackageHash === null) {
     throw new ConfigError(
-      `the vendored package hashes to ${local.manifestHash}, but EXPECTED_PACKAGE_HASH pins ` +
-        `${config.expectedPackageHash}; re-vendor the official package as a deliberate release`,
+      'FLOP_MODE=live requires EXPECTED_PACKAGE_HASH — refusing to run live without an explicit package pin',
     );
   }
+
+  let expected: string;
+  if (config.expectedPackageHash !== null) {
+    if (local.manifestHash !== config.expectedPackageHash) {
+      throw new ConfigError(
+        `the vendored package hashes to ${local.manifestHash}, but EXPECTED_PACKAGE_HASH pins ` +
+          `${config.expectedPackageHash}; re-vendor the official package as a deliberate release`,
+      );
+    }
+    expected = config.expectedPackageHash;
+  } else {
+    logger?.event({
+      level: 'warn',
+      source: 'main',
+      code: 'package_pin_implicit',
+      message:
+        'EXPECTED_PACKAGE_HASH is unset; falling back to the vendored manifest hash — ' +
+        'acceptable in dry-run, never in live',
+      data: { localManifest: local.manifestHash },
+    });
+    expected = local.manifestHash;
+  }
+
   if (fromBundle !== expected) {
     throw new ConfigError(
       `the bundle was generated against package ${fromBundle}, but this process pins ${expected}; ` +
@@ -455,7 +495,7 @@ export async function createRuntime(
 
   // The package pin binds the bundle, the public inventory and the referee's
   // seed to one rule set. Every disagreement here is fatal.
-  const pin = resolvePackagePin(config, meta.packageHash);
+  const pin = resolvePackagePin(config, meta.packageHash, logger);
   logger.event({
     level: 'info',
     source: 'main',
@@ -533,6 +573,7 @@ export async function createRuntime(
     staleReferenceMode: config.risk.staleReferenceMode,
     maxDiscoveredRooms: config.roomDiscovery.maxRooms,
     dynamicReadConcurrency: config.roomDiscovery.dynamicReadConcurrency,
+    externalOfferTakerEnabled: config.externalOfferTakerEnabled,
     live: config.mode === 'live',
     now,
   });
@@ -621,6 +662,7 @@ export async function createRuntime(
     repositories,
     localSweep: () => reader.verifier.state.currentSweep,
     ...(overrides.archiveFetchImpl ? { fetchImpl: overrides.archiveFetchImpl } : {}),
+    ...(overrides.archiveSleep ? { sleep: overrides.archiveSleep } : {}),
     now,
   });
 
@@ -708,7 +750,21 @@ export async function createRuntime(
           timezone: config.timezone,
         },
       });
-      await lark.start();
+      // The WebSocket is an optional status channel: a failure to connect is a
+      // warning, never a reason to refuse to start. Reports go out through the
+      // Open API and the outbox regardless, and no trading decision reads the
+      // socket's state.
+      try {
+        await lark.start();
+      } catch (error) {
+        logger.event({
+          level: 'warn',
+          source: 'main',
+          code: 'lark_start_failed',
+          message: 'Lark WebSocket did not start; reports are still generated and queued',
+          data: { error: error instanceof Error ? error.message : String(error) },
+        });
+      }
       if (health) await health.start();
       archiveMonitor.start();
       scheduler.start();

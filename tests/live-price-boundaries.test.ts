@@ -221,6 +221,7 @@ describe('the running reader records the live anomalies', () => {
         FLOP_MODE: 'live',
         FLOP_LIVE_CONFIRM: 'close-1',
         FLOP_ALLOW_REGISTRATION: 'true',
+        EXPECTED_PACKAGE_HASH: HARNESS_PACKAGE_HASH,
         MAX_DISCOVERED_ROOMS: '1',
       },
     });

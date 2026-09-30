@@ -89,6 +89,15 @@ export interface ReaderOptions {
    * — or in front of — the fixed referee feed.
    */
   dynamicReadConcurrency?: number;
+  /**
+   * Whether the process may act on offers found in discovered owner rooms.
+   *
+   * Off by default. While it is off the reader still keeps its bounded eye on the
+   * discovered rooms — a `missed` there is evidence the re-post path needs — but
+   * it surfaces no external offers and reports `room_scope=close1_only`, because
+   * the dynamic room read has not been validated against a real staging run.
+   */
+  externalOfferTakerEnabled?: boolean;
   /** Live mode tightens the `applied`/`for` boundaries in the verifier. */
   live?: boolean;
   now?: () => Date;
@@ -186,6 +195,7 @@ export class OrchestratorReader {
   private readonly now: () => Date;
   private readonly logger: Logger;
   private readonly maxDiscoveredRooms: number | null;
+  private readonly externalOfferTakerEnabled: boolean;
 
   constructor(options: ReaderOptions) {
     this.rules = options.rules;
@@ -194,6 +204,7 @@ export class OrchestratorReader {
     this.now = options.now ?? (() => new Date());
     this.logger = options.logger;
     this.maxDiscoveredRooms = options.maxDiscoveredRooms ?? null;
+    this.externalOfferTakerEnabled = options.externalOfferTakerEnabled === true;
     this.fixedRooms = roomsFor(options.rules);
 
     const requirePin = options.requireRefereePin === true;
@@ -263,8 +274,17 @@ export class OrchestratorReader {
     return [...this.fixedRooms];
   }
 
-  /** `close1_only` when discovery is off; otherwise the registered rooms we read. */
+  /**
+   * The scope the process is willing to *claim*, for the report.
+   *
+   * `close1_only` unless the external-offer taker has been enabled — and it may
+   * only be enabled once dynamic-room staging, cursor recovery, unlisted handling
+   * and repost readback have all passed. Until then the process reads the
+   * discovered rooms (a `missed` there is re-post evidence) but never claims to
+   * have observed every registered room, and never acts on an offer found in one.
+   */
   get roomScope(): 'close1_only' | 'registered_rooms_plus_close1' {
+    if (!this.externalOfferTakerEnabled) return 'close1_only';
     return this.dynamicReader === null ? 'close1_only' : 'registered_rooms_plus_close1';
   }
 
@@ -428,8 +448,13 @@ export class OrchestratorReader {
    * our own DIDs, and that the price and clock are still plausible. Funds and
    * caps are checked at accept time, when the accepting agent's own account is
    * in hand.
+   *
+   * Empty unless the external-offer taker is enabled: taking a stranger's offer
+   * found in a discovered room is exactly what the unvalidated dynamic-room read
+   * must not yet permit.
    */
   externalOffers(): ExternalOffer[] {
+    if (!this.externalOfferTakerEnabled) return [];
     const local = this.localDids();
     const snapshot = this.snapshot();
     const room = this.rules.tradingRoom || TRADING_ROOM;

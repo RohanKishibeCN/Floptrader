@@ -33,6 +33,8 @@ import { cleanup, tempDir } from './support/harness.js';
 
 const config = loadConfig({
   TIMEZONE: 'Asia/Shanghai',
+  // These tests exercise the model lane, which is off by default in the MVP.
+  DEEPSEEK_ENABLED: 'true',
   DEEPSEEK_API_KEY: 'test-key',
   DEEPSEEK_MIN_INTERVAL_MS: '0',
   DEEPSEEK_TIMEOUT_MS: '1000',
@@ -352,5 +354,92 @@ describe('crossCheckWithFold', () => {
     const empty = crossCheckWithFold(DEFAULT_PARAMS.trend_following, []);
     expect(empty.same).toBe(false);
     expect(empty.detail).toContain('fold');
+  });
+});
+
+describe('the model lane is off unless it is asked for', () => {
+  /** A config identical to the one above, except the lane is disabled. */
+  const disabled = loadConfig({
+    TIMEZONE: 'Asia/Shanghai',
+    DEEPSEEK_API_KEY: 'test-key',
+    DEEPSEEK_MIN_INTERVAL_MS: '0',
+    DEEPSEEK_TIMEOUT_MS: '1000',
+  });
+
+  it('defaults to disabled', () => {
+    expect(loadConfig({}).deepseek.enabled).toBe(false);
+    expect(disabled.deepseek.enabled).toBe(false);
+  });
+
+  it('refuses every call at the client, without touching the transport', async () => {
+    const fetchImpl = vi.fn();
+    const client = new DeepSeekClient({
+      config: disabled,
+      logger,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    const result = await client.complete('review the parameters');
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe('deepseek_disabled');
+    expect(result.totalTokens).toBe(0);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('schedules nothing and attempts nothing', async () => {
+    const budget = new DeepSeekBudget({ repositories, config: disabled, logger, now: () => allowedTime });
+    const optimiser = new ParameterOptimiser({
+      config: disabled,
+      logger,
+      repositories,
+      client: new DeepSeekClient({ config: disabled, logger, fetchImpl: vi.fn() as unknown as typeof fetch }),
+      budget,
+      now: () => allowedTime,
+    });
+    const scheduler = new DeepSeekScheduler({ config: disabled, logger, optimiser, budget, now: () => allowedTime });
+
+    // Even inside a nominally due slot, a disabled lane reviews nothing.
+    const outcome = await scheduler.runOnce(slotOne);
+    expect(outcome.attempted).toEqual([]);
+    expect(outcome.refused).toEqual([]);
+    expect(repositories.llmCalls.history(10)).toHaveLength(0);
+  });
+});
+
+describe('transport-level failures leave the strategy untouched', () => {
+  it('reports a 429 as http_429 and writes no version', async () => {
+    const fetchImpl = vi.fn(async () => new Response('rate limited', { status: 429 }));
+    const client = new DeepSeekClient({ config, logger, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    const result = await client.complete('review');
+    expect(result.ok).toBe(false);
+    expect(result.status).toBe(429);
+    expect(result.error).toBe('http_429');
+  });
+
+  it('reports a timeout as timeout and writes no version', async () => {
+    const fetchImpl = vi.fn(async () => {
+      const error = new Error('aborted');
+      error.name = 'TimeoutError';
+      throw error;
+    });
+    const client = new DeepSeekClient({ config, logger, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    const outcome = await optimiserWith(client).review({
+      group: 'trend_following',
+      current: { ...DEFAULT_PARAMS.trend_following.values },
+      currentVersion: DEFAULT_PARAMS.trend_following.version,
+      tradesSettled: 0,
+      tradesVoid: 0,
+      realisedPnl: '0',
+      winRate: '0',
+      sweepsObserved: 0,
+      volatility: '0',
+    } satisfies ParameterReviewInput);
+
+    expect(outcome.accepted).toBe(false);
+    expect(outcome.reason).toBe('transport');
+    // Nothing was written, so the strategy keeps using its previous parameters.
+    expect(repositories.strategyVersions.effective('trend_following')).toBeUndefined();
   });
 });

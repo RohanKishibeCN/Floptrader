@@ -22,6 +22,7 @@
     "soak-test": "tsx scripts/soak-test.ts",
     "cost-report": "tsx scripts/cost-report.ts",
     "disk-report": "tsx scripts/disk-report.ts",
+    "vps-smoke": "bash scripts/vps-smoke.sh",
     "identities:generate": "tsx scripts/generate-identities.ts",
     "verify:backup": "tsx scripts/verify-backup.ts"
   },

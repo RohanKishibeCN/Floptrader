@@ -160,6 +160,13 @@ export interface HarnessOptions {
    * `archive_unavailable`.
    */
   archiveFetchImpl?: typeof fetch;
+  /**
+   * The archive monitor's request-rate gate. Defaults to advancing the harness
+   * clock, so a bounded batch does not spend real minutes waiting: the rate limit
+   * is still enforced against the injected clock, just instantly. A test that
+   * wants to observe the waits supplies its own recorder.
+   */
+  archiveSleep?: (ms: number) => Promise<void>;
   now?: () => Date;
   /** Extra environment; merged last, so a test can override any knob. */
   env?: Record<string, string>;
@@ -314,6 +321,12 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
   const overrides: RuntimeOverrides = {
     fetchImpl: transport.fetchImpl as unknown as typeof fetch,
     ...(options.archiveFetchImpl ? { archiveFetchImpl: options.archiveFetchImpl } : {}),
+    // The rate gate is real, but the wait is instant: it advances the injected
+    // clock rather than sleeping, so a bounded batch stays a unit test.
+    archiveSleep: options.archiveSleep ?? ((ms: number) => {
+      clockMs += ms;
+      return Promise.resolve();
+    }),
     now,
     skipHealth: true,
     readDiskUsage: () => diskUsedPercent,

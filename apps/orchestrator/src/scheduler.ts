@@ -5,17 +5,24 @@
  * fixed order, and the order is the design:
  *
  *   1. sample the load guard, so every later step can be shed by tier;
- *   2. read the six rooms — reads are never shed, because reading is how the
+ *   2. read the rooms — reads are never shed, because reading is how the
  *      process finds out the problem is over;
- *   3. seed the local risk mirror from the mints the referee has confirmed;
- *   4. make sure every agent has a signed owner registration and a readback;
- *   5. run each group's slice of agents through its deterministic strategy;
- *   6. post a trade, but only past the validator, the local caps and the load
- *      guard — and never in dry-run;
- *   7. reconcile participation against the referee's flow posts;
- *   8. once a day: the weekly watchdog, which is the 7x24h floor;
- *   9. twice a day: the Lark report, and the maintenance pass after it lands;
- *  10. twice a day, in an idle window only: the model parameter review.
+ *   3. reconcile participation: every agent gets a signed owner registration
+ *      and a readback (ParticipationService);
+ *   4. reconcile settlement: apply the referee's flow, mints and outcomes
+ *      (SettlementService);
+ *   5. run each group's slice of agents through its deterministic strategy,
+ *      validate risk, then post a trade — but only past the validator, the
+ *      local caps and the load guard, and never in dry-run (TradingService);
+ *   6. reconcile the missed-message repost queue (RecoveryService);
+ *   7. persist status, then run the background operations — watchdog, Lark
+ *      report, model review, upstream check (OperationsService).
+ *
+ * Steps 1-6 are the trading path. Step 7 is deliberately outside it: each
+ * background task is bounded by a timeout, isolated in its own try/catch, and
+ * can neither reorder a trade nor take the tick down. The five groups above are
+ * marked in the body as section headers; they are the only acceptable place to
+ * add work, and the tick order is fixed.
  *
  * Two properties this class deliberately holds:
  *
@@ -96,6 +103,35 @@ function advanceStatus(
   next: ParticipationStatus,
 ): ParticipationStatus {
   return PARTICIPATION_RANK[next] > PARTICIPATION_RANK[current] ? next : current;
+}
+
+/**
+ * How long a background task may run before the tick gives up on it.
+ *
+ * Background work — the report pass, the watchdog, the model review, the
+ * upstream check — is never allowed to hold the tick open indefinitely. A task
+ * that overruns is abandoned; whatever it was going to do simply happens on a
+ * later tick, from durable state.
+ */
+const BACKGROUND_TIMEOUT_MS = 120_000;
+
+/**
+ * Race `work` against a timeout.
+ *
+ * The abandoned promise is explicitly drained so a late rejection cannot surface
+ * as an unhandled rejection after the timeout already won the race.
+ */
+async function withTimeout<T>(work: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} exceeded ${ms}ms`)), ms);
+  });
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    void work.catch(() => undefined);
+  }
 }
 
 /** One trade the referee named in a flow post's `settled`/`void` list. */
@@ -409,41 +445,42 @@ export class OrchestratorScheduler {
     }
   }
 
+  /**
+   * One full pass. The order below is the design and is fixed:
+   *
+   *   read → verify → reconcile participation → reconcile settlement →
+   *   run local strategies → validate risk → post trades →
+   *   reconcile repost queue → persist status → return report
+   *
+   * Nothing may be inserted between "validate risk" and "post trades", and
+   * background work (DeepSeek, upstream, the Lark report, the watchdog) is run
+   * only *after* the trade path has closed for this tick — it can delay itself
+   * but never reorder or block a trade posting.
+   */
   private async tickOnce(): Promise<TickReport> {
     const at = this.now();
     const state = this.loadGuard.poll();
 
+    // read → verify: never shed, because reading is how we learn the problem is over.
     const tick = await this.reader.tick();
     this.seedRiskBook();
 
+    // reconcile participation (ParticipationService)
     const participation = await this.ensureParticipation();
 
+    // reconcile settlement (SettlementService)
+    const reconciled = this.reconcileMints();
+    this.reconcileRefereeSettlements();
+
+    // run local strategies → validate risk → post trades (TradingService)
     const runOutcome = this.runAgentSlices();
     const trades = await this.executeActions(runOutcome.outcomes);
 
-    const reconciled = this.reconcileMints();
-    this.reconcileRefereeSettlements();
+    // reconcile repost queue (RecoveryService)
     const repost = await this.reconcileReposts();
-    const watchdog = await this.maybeRunWatchdog(at);
-    const lark = await this.maybeReport(at);
 
-    let deepseek = { attempted: [] as string[], refused: 0 };
-    if (this.deepSeek && this.loadGuard.allow('llm')) {
-      try {
-        const result = await this.deepSeek.runOnce(at);
-        deepseek = { attempted: result.attempted, refused: result.refused.length };
-      } catch (error) {
-        this.logger.event({
-          level: 'warn',
-          source: 'scheduler',
-          code: 'deepseek_slot_failed',
-          message: 'model slot failed; the previous parameters stay effective',
-          data: { error: error instanceof Error ? error.message : String(error) },
-        });
-      }
-    }
-
-    const upstream = await this.maybeCheckUpstream(at);
+    // persist status → background operations (OperationsService), fully isolated
+    const background = await this.runBackgroundOperations(at);
     const pin = this.repositories.upstream.getPin();
 
     return {
@@ -471,14 +508,89 @@ export class OrchestratorScheduler {
       },
       trades,
       repost,
-      watchdog,
-      lark,
-      deepseek,
+      watchdog: background.watchdog,
+      lark: background.lark,
+      deepseek: background.deepseek,
       upstream: {
-        checked: upstream,
+        checked: background.upstream,
         drift: Number(pin?.drift ?? 0) === 1,
       },
     };
+  }
+
+  /**
+   * Background operations (OperationsService).
+   *
+   * Everything that must never block, reorder or slow a trade posting: the
+   * weekly watchdog, the Lark report and its maintenance pass, the model
+   * parameter review and the upstream package check. Each one is:
+   *
+   *   - bounded by a timeout;
+   *   - wrapped in its own try/catch, so a failure is a warning and not a tick;
+   *   - recorded as a status/last_error event for the operator;
+   *   - unable to mutate the market snapshot or change the referee's verdict.
+   *
+   * The trading path has already finished by the time this runs, so a hang here
+   * costs a report, never a trade.
+   */
+  private async runBackgroundOperations(at: Date): Promise<{
+    watchdog: { ran: boolean; backfilled: number };
+    lark: { delivered: string[]; maintenance: boolean };
+    deepseek: { attempted: string[]; refused: number };
+    upstream: boolean;
+  }> {
+    let watchdog: { ran: boolean; backfilled: number } = { ran: false, backfilled: 0 };
+    let lark: { delivered: string[]; maintenance: boolean } = { delivered: [], maintenance: false };
+    let deepseek: { attempted: string[]; refused: number } = { attempted: [], refused: 0 };
+    let upstream = false;
+
+    try {
+      watchdog = await withTimeout(this.maybeRunWatchdog(at), BACKGROUND_TIMEOUT_MS, 'watchdog');
+    } catch (error) {
+      this.backgroundFailure('watchdog_failed', error);
+    }
+
+    try {
+      lark = await withTimeout(this.maybeReport(at), BACKGROUND_TIMEOUT_MS, 'lark_report');
+    } catch (error) {
+      this.backgroundFailure('lark_report_failed', error);
+    }
+
+    if (this.deepSeek && this.loadGuard.allow('llm')) {
+      try {
+        const result = await withTimeout(
+          this.deepSeek.runOnce(at),
+          BACKGROUND_TIMEOUT_MS,
+          'deepseek',
+        );
+        deepseek = { attempted: result.attempted, refused: result.refused.length };
+      } catch (error) {
+        this.backgroundFailure('deepseek_slot_failed', error);
+      }
+    }
+
+    try {
+      upstream = await withTimeout(
+        this.maybeCheckUpstream(at),
+        BACKGROUND_TIMEOUT_MS,
+        'upstream_check',
+      );
+    } catch (error) {
+      this.backgroundFailure('upstream_check_failed', error);
+    }
+
+    return { watchdog, lark, deepseek, upstream };
+  }
+
+  /** Record a background-task failure without letting it reach the tick. */
+  private backgroundFailure(code: string, error: unknown): void {
+    this.logger.event({
+      level: 'warn',
+      source: 'scheduler',
+      code,
+      message: 'background task failed; the trading path is unaffected',
+      data: { error: error instanceof Error ? error.message : String(error) },
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -540,7 +652,7 @@ export class OrchestratorScheduler {
   }
 
   // -------------------------------------------------------------------------
-  // participation
+  // ParticipationService — owner registration, readback, mint status, lock
   // -------------------------------------------------------------------------
 
   /**
@@ -875,7 +987,7 @@ export class OrchestratorScheduler {
   }
 
   // -------------------------------------------------------------------------
-  // referee verdicts, funds side, and the missed-message repost queue
+  // SettlementService — referee flow parsing, settled/void, funds reason
   // -------------------------------------------------------------------------
   /**
    * Apply the referee's own per-trade outcomes.
@@ -940,6 +1052,10 @@ export class OrchestratorScheduler {
     }
     return outcome;
   }
+
+  // -------------------------------------------------------------------------
+  // RecoveryService — repost queue, cursor gaps, snapshot replay, outbox
+  // -------------------------------------------------------------------------
 
   /**
    * Queue the local messages the referee reported as `missed`, and re-post them.
@@ -1122,7 +1238,7 @@ export class OrchestratorScheduler {
   }
 
   // -------------------------------------------------------------------------
-  // local strategy runs
+  // TradingService — strategy outcomes, risk validation, signing, posting
   // -------------------------------------------------------------------------
 
   /**
@@ -1219,7 +1335,7 @@ export class OrchestratorScheduler {
   }
 
   // -------------------------------------------------------------------------
-  // trades
+  // TradingService — trade writer
   // -------------------------------------------------------------------------
 
   /**
@@ -1531,7 +1647,7 @@ export class OrchestratorScheduler {
   }
 
   // -------------------------------------------------------------------------
-  // weekly watchdog
+  // OperationsService — watchdog, Lark report, upstream check
   // -------------------------------------------------------------------------
 
   /**
@@ -1600,7 +1716,7 @@ export class OrchestratorScheduler {
   }
 
   // -------------------------------------------------------------------------
-  // Lark report + maintenance
+  // OperationsService — Lark report + maintenance
   // -------------------------------------------------------------------------
 
   /**
@@ -1662,7 +1778,7 @@ export class OrchestratorScheduler {
   }
 
   // -------------------------------------------------------------------------
-  // upstream
+  // OperationsService — upstream package check
   // -------------------------------------------------------------------------
 
   private async maybeCheckUpstream(at: Date): Promise<boolean> {
@@ -1693,7 +1809,7 @@ export class OrchestratorScheduler {
   }
 
   // -------------------------------------------------------------------------
-  // status
+  // OperationsService — status and health
   // -------------------------------------------------------------------------
 
   status(): StatusSnapshot {

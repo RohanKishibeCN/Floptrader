@@ -52,6 +52,9 @@ function liveEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     FLOP_LIVE_CONFIRM: 'close-1',
     FLOP_ALLOW_REGISTRATION: 'true',
     EXPECTED_REFEREE_DID: REFEREE_DID,
+    // Live must name the package it runs against; the vendored manifest's own
+    // hash is the value the harness pins.
+    EXPECTED_PACKAGE_HASH: HARNESS_PACKAGE_HASH,
     ...extra,
   };
 }
@@ -210,6 +213,52 @@ describe('the package pin is the manifest, not a placeholder', () => {
     expect(referenceRules().lockSweep).toBe(rules.lockSweep);
     expect(sha256Hex(readFileSync(join(REFERENCE_DIR, 'manifest.json')))).toBe(
       HARNESS_PACKAGE_HASH,
+    );
+  });
+});
+
+describe('live requires an explicit, matching package hash', () => {
+  it('refuses live with no EXPECTED_PACKAGE_HASH', () => {
+    // Live must name the package: falling back to whatever manifest happens to
+    // be on disk is exactly the drift the pin exists to prevent.
+    expect(() => loadConfig(liveEnv({ EXPECTED_PACKAGE_HASH: '' }))).toThrow(
+      /EXPECTED_PACKAGE_HASH/,
+    );
+  });
+
+  it('refuses live with a malformed hash (case-insensitive sha256 only)', () => {
+    for (const bad of ['not-a-hash', 'a'.repeat(63), 'g'.repeat(64), `${'a'.repeat(62)}zz`]) {
+      expect(() => loadConfig(liveEnv({ EXPECTED_PACKAGE_HASH: bad }))).toThrow(/sha256/);
+    }
+    // Uppercase is accepted and normalised, because the digest is the same value.
+    const upper = loadConfig(liveEnv({ EXPECTED_PACKAGE_HASH: HARNESS_PACKAGE_HASH.toUpperCase() }));
+    expect(upper.expectedPackageHash).toBe(HARNESS_PACKAGE_HASH);
+  });
+
+  it('refuses when the vendored manifest does not hash to the pin', () => {
+    const config = loadConfig(liveEnv({ REFERENCE_DIR, EXPECTED_PACKAGE_HASH: 'a'.repeat(64) }));
+    expect(() => resolvePackagePin(config, 'a'.repeat(64), silent)).toThrow(/EXPECTED_PACKAGE_HASH/);
+  });
+
+  it('refuses when the encrypted bundle was built against another package', () => {
+    const config = loadConfig(liveEnv({ REFERENCE_DIR }));
+    expect(() => resolvePackagePin(config, 'b'.repeat(64), silent)).toThrow(
+      /generated against package/,
+    );
+  });
+
+  it('lets a dry run omit the pin, but records the fallback as a warning', () => {
+    const config = loadConfig({ REFERENCE_DIR });
+    expect(config.expectedPackageHash).toBeNull();
+
+    const events: Array<{ code: string; level: string }> = [];
+    const logger = {
+      event: (entry: { code: string; level: string }) => events.push(entry),
+    } as unknown as Logger;
+    const pin = resolvePackagePin(config, HARNESS_PACKAGE_HASH, logger);
+    expect(pin.expected).toBe(HARNESS_PACKAGE_HASH);
+    expect(events.some((entry) => entry.code === 'package_pin_implicit' && entry.level === 'warn')).toBe(
+      true,
     );
   });
 });

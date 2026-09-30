@@ -111,6 +111,7 @@ describe('a missed local message is queued once and re-posted with a new nonce',
         FLOP_LIVE_CONFIRM: 'close-1',
         FLOP_ALLOW_REGISTRATION: 'true',
         FLOP_ALLOW_TRADING: 'true',
+        EXPECTED_PACKAGE_HASH: HARNESS_PACKAGE_HASH,
         MAX_DISCOVERED_ROOMS: '1',
       },
     });

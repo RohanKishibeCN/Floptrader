@@ -452,6 +452,27 @@ export const MIGRATIONS: Migration[] = [
       `CREATE INDEX IF NOT EXISTS idx_repost_queue_status ON repost_queue(status, id)`,
     ],
   },
+  {
+    version: 4,
+    name: 'archive-monitor-budgets',
+    statements: [
+      // The size `index.json` advertised, kept so a re-published entry can be
+      // detected. A verified sweep is only skipped while status, path, expected
+      // sha256 *and* this size are unchanged; any of them moving means the bytes
+      // behind the entry changed and must be re-downloaded and re-verified.
+      `ALTER TABLE archive_sweeps ADD COLUMN expected_size INTEGER`,
+
+      // The archive monitor's bounded-batch accounting. `bytes_today` is rolled
+      // over by `bytes_today_day`, so a restart mid-day does not reset the count
+      // and the daily download volume stays visible across restarts.
+      `ALTER TABLE archive_state ADD COLUMN pending_count INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE archive_state ADD COLUMN unavailable_count INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE archive_state ADD COLUMN mismatch_count INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE archive_state ADD COLUMN bytes_this_check INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE archive_state ADD COLUMN bytes_today INTEGER NOT NULL DEFAULT 0`,
+      `ALTER TABLE archive_state ADD COLUMN bytes_today_day TEXT`,
+    ],
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;

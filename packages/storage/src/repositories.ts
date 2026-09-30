@@ -1760,6 +1760,8 @@ export interface ArchiveSweepRow {
   status: string;
   path: string | null;
   expected_sha256: string | null;
+  /** The size `index.json` advertised, so a re-published entry is detectable. */
+  expected_size?: number | null;
   actual_sha256: string | null;
   verified: number;
   redacted_trades: number | null;
@@ -1776,14 +1778,15 @@ export class ArchiveSweepRepository {
     this.db
       .prepare(
         `INSERT INTO archive_sweeps (
-           sweep, status, path, expected_sha256, actual_sha256, verified, redacted_trades,
-           fetched_at, unavailable, error, updated_at)
-         VALUES (@sweep, @status, @path, @expected_sha256, @actual_sha256, @verified,
+           sweep, status, path, expected_sha256, expected_size, actual_sha256, verified,
+           redacted_trades, fetched_at, unavailable, error, updated_at)
+         VALUES (@sweep, @status, @path, @expected_sha256, @expected_size, @actual_sha256, @verified,
            @redacted_trades, @fetched_at, @unavailable, @error, @updated_at)
          ON CONFLICT(sweep) DO UPDATE SET
            status = excluded.status,
            path = excluded.path,
            expected_sha256 = excluded.expected_sha256,
+           expected_size = excluded.expected_size,
            actual_sha256 = excluded.actual_sha256,
            verified = excluded.verified,
            redacted_trades = excluded.redacted_trades,
@@ -1796,6 +1799,7 @@ export class ArchiveSweepRepository {
         ...row,
         path: row.path ?? null,
         expected_sha256: row.expected_sha256 ?? null,
+        expected_size: row.expected_size ?? null,
         actual_sha256: row.actual_sha256 ?? null,
         redacted_trades: row.redacted_trades ?? null,
         fetched_at: row.fetched_at ?? null,
@@ -1849,6 +1853,24 @@ export class ArchiveSweepRepository {
     ).n;
   }
 
+  /**
+   * How many of the sweeps the index names are still not verified.
+   *
+   * Scoped to the index we just read, so a sweep the archive has since dropped
+   * from its listing does not inflate the backlog.
+   */
+  pendingCount(knownSweeps: number[]): number {
+    if (knownSweeps.length === 0) return 0;
+    const verified = new Set(
+      (
+        this.db.prepare('SELECT sweep FROM archive_sweeps WHERE verified = 1').all() as Array<{
+          sweep: number;
+        }>
+      ).map((row) => row.sweep),
+    );
+    return knownSweeps.filter((sweep) => !verified.has(sweep)).length;
+  }
+
   maxVerifiedSweep(): number | null {
     const row = this.db
       .prepare('SELECT MAX(sweep) AS sweep FROM archive_sweeps WHERE verified = 1')
@@ -1866,6 +1888,12 @@ export interface ArchiveStateRow {
   latest_index_sweep: number | null;
   latest_verified_sweep: number | null;
   lag_sweeps: number | null;
+  pending_count: number;
+  unavailable_count: number;
+  mismatch_count: number;
+  bytes_this_check: number;
+  bytes_today: number;
+  bytes_today_day: string | null;
   last_check_at: string | null;
   last_error: string | null;
   updated_at: string;
@@ -1884,18 +1912,35 @@ export class ArchiveStateRepository {
     latestIndexSweep: number | null;
     latestVerifiedSweep: number | null;
     lagSweeps: number | null;
+    pendingCount?: number;
+    unavailableCount?: number;
+    mismatchCount?: number;
+    bytesThisCheck?: number;
+    bytesToday?: number;
+    bytesTodayDay?: string | null;
     lastCheckAt: string | null;
     lastError: string | null;
   }): void {
     this.db
       .prepare(
         `INSERT OR REPLACE INTO archive_state (
-           id, latest_index_sweep, latest_verified_sweep, lag_sweeps, last_check_at,
-           last_error, updated_at)
-         VALUES (1, @latestIndexSweep, @latestVerifiedSweep, @lagSweeps, @lastCheckAt,
-           @lastError, @updated_at)`,
+           id, latest_index_sweep, latest_verified_sweep, lag_sweeps, pending_count,
+           unavailable_count, mismatch_count, bytes_this_check, bytes_today, bytes_today_day,
+           last_check_at, last_error, updated_at)
+         VALUES (1, @latestIndexSweep, @latestVerifiedSweep, @lagSweeps, @pendingCount,
+           @unavailableCount, @mismatchCount, @bytesThisCheck, @bytesToday, @bytesTodayDay,
+           @lastCheckAt, @lastError, @updated_at)`,
       )
-      .run({ ...patch, updated_at: nowIso() });
+      .run({
+        pendingCount: patch.pendingCount ?? 0,
+        unavailableCount: patch.unavailableCount ?? 0,
+        mismatchCount: patch.mismatchCount ?? 0,
+        bytesThisCheck: patch.bytesThisCheck ?? 0,
+        bytesToday: patch.bytesToday ?? 0,
+        bytesTodayDay: patch.bytesTodayDay ?? null,
+        ...patch,
+        updated_at: nowIso(),
+      });
   }
 }
 

@@ -391,6 +391,20 @@ export class DeepSeekClient {
 
   async complete(prompt: string, options: CompletionOptions = {}): Promise<CompletionResult> {
     const purpose = options.purpose ?? DEEPSEEK_PURPOSE;
+    // The single choke point for every model call. A disabled lane cannot spend a
+    // token, whatever calls it — this is stronger than relying on each caller to
+    // check the flag.
+    if (!this.config.deepseek.enabled) {
+      return {
+        ok: false,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        latencyMs: 0,
+        status: 0,
+        error: 'deepseek_disabled',
+      };
+    }
     // Rough local estimate: ~4 characters per token. This exists to refuse an
     // oversized prompt without spending a network round trip.
     const estimatedPromptTokens = Math.ceil(prompt.length / 4);
@@ -1095,6 +1109,11 @@ export class DeepSeekScheduler {
   }
 
   async runOnce(at?: Date): Promise<RunOnceResult> {
+    // Off by default: the model is not a trading dependency. Every strategy has a
+    // deterministic parameter set, and the previous accepted version is used
+    // until a new one is accepted, so skipping the review changes nothing about
+    // how a tick trades.
+    if (!this.config.deepseek.enabled) return { attempted: [], refused: [] };
     const when = at ?? this.now();
     const day = this.budget.dayKey(when);
     const attempted: string[] = [];
@@ -1115,6 +1134,17 @@ export class DeepSeekScheduler {
 
   start(): void {
     if (this.timer) return;
+    if (!this.config.deepseek.enabled) {
+      // No timer at all when the model lane is off: nothing to skip every minute.
+      this.logger.event({
+        level: 'info',
+        source: 'deepseek-scheduler',
+        code: 'deepseek_disabled',
+        message: 'DEEPSEEK_ENABLED is false; the parameter review is not scheduled',
+        data: { enabled: false },
+      });
+      return;
+    }
     this.timer = setInterval(() => {
       void this.runOnce().catch((error: unknown) =>
         this.logger.error({ source: 'deepseek-scheduler' }, `scheduled review failed: ${toMessage(error)}`),

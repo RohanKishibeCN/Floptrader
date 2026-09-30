@@ -158,7 +158,10 @@ const ENV: Record<string, string> = {
   LARK_RECONNECT_MAX_MS: '5',
   HEALTH_PORT: '0',
   // The model edge is the same fake transport, which answers 404 — a call that
-  // fails is exactly the case the budget must absorb.
+  // fails is exactly the case the budget must absorb. DeepSeek is off by
+  // default in production, so the rehearsal turns it on explicitly: the budget
+  // path is part of what this run is meant to exercise.
+  DEEPSEEK_ENABLED: 'true',
   DEEPSEEK_API_KEY: 'soak-fake-key',
   DEEPSEEK_MIN_INTERVAL_MS: '0',
 };
@@ -182,8 +185,37 @@ const startedAt = Date.now();
 const cpuAtStart = process.cpuUsage();
 let peakRss = 0;
 let restarts = 0;
-let driftObserved = false;
-let postedAfterDrift = 0;
+/**
+ * Package drift is two different signals and the summary must not conflate them.
+ *
+ *   - `upstreamDriftObserved`: the upstream monitor saw the public repo move
+ *     under us. It is about *our* pin, and a stale mirror alone should not be
+ *     reported as a referee problem.
+ *   - `refereePackageDriftObserved`: the verifier went conservative because a
+ *     referee seed quoted a package hash we do not pin. This is the drift that
+ *     pauses trading, and it is read from the verifier — never inferred from the
+ *     upstream monitor's own `drift` field.
+ */
+let upstreamDriftObserved = false;
+let refereePackageDriftObserved = false;
+/** True once the drift had put the reader into conservative mode. */
+let packageDriftPausedTrading = false;
+/** Active trade postings made after the drift was first observed. Must be 0. */
+let tradesAfterPackageDrift = 0;
+/** True when the drift was recorded durably, not just observed in memory. */
+let persistentAnomalyObserved = false;
+/** True when a delivered Lark report carried the drift as a critical alert. */
+let larkCriticalAlertAfterDrift = false;
+/**
+ * True once a report went out *after* the drift was observed.
+ *
+ * The drift can only prove it reached Lark if a report was actually delivered
+ * afterwards. The 24-hour rehearsal crosses the 18:10 window after the scripted
+ * drift; a `--quick` smoke ends before any report window, so the chain is
+ * asserted only when there was a report to carry it — a conditional assertion
+ * that would otherwise be a false pass.
+ */
+let reportDeliveredAfterDrift = false;
 let dryRunBeforeDrift = 0;
 let runsDuringReadonly = 0;
 let reportsDelivered = 0;
@@ -257,15 +289,28 @@ for (let tick = 0; tick < TICKS; tick += 1) {
   }
 
   const lag = await eventLoopLag();
+  const driftBeforeTick = refereePackageDriftObserved;
   const report = await harness.runtime.scheduler.runTick();
 
   if (report.tier === 'readonly') runsDuringReadonly += 1;
-  if (!driftObserved) {
-    dryRunBeforeDrift += report.trades.dryRun;
+  if (driftBeforeTick) {
+    tradesAfterPackageDrift += report.trades.posted;
   } else {
-    postedAfterDrift += report.trades.posted;
+    dryRunBeforeDrift += report.trades.dryRun;
   }
-  if (report.upstream.drift) driftObserved = true;
+
+  // Read referee package drift from the verifier's conservative reasons, not
+  // from the upstream monitor. The two are independent signals and a run can
+  // have either one without the other.
+  if (harness.runtime.reader.verifier.state.conservativeReasons.includes('package_hash_drift')) {
+    refereePackageDriftObserved = true;
+  }
+  if (report.upstream.drift) upstreamDriftObserved = true;
+  // Conservative mode *is* the pause: once the drift is in force and the reader
+  // is degraded, no new active trade may be posted.
+  if (refereePackageDriftObserved && report.conservative) packageDriftPausedTrading = true;
+  // A report delivered once the drift is in force is the alert carrier.
+  if (driftBeforeTick && report.lark.delivered.length > 0) reportDeliveredAfterDrift = true;
   reportsDelivered = harness.lark.sent.length;
 
   const memory = process.memoryUsage();
@@ -304,6 +349,20 @@ for (let tick = 0; tick < TICKS; tick += 1) {
 }
 
 const elapsedMs = Date.now() - startedAt;
+// The drift must be recorded durably, not only seen in memory: the reader writes
+// a `package_hash_drift` event, and that row surviving the run is what makes the
+// anomaly a fact an operator can find afterwards.
+persistentAnomalyObserved =
+  (
+    harness.runtime.db
+      .prepare("SELECT COUNT(*) AS n FROM events WHERE code = 'package_hash_drift'")
+      .get() as { n: number }
+  ).n > 0;
+// And it must reach the humans: a delivered report whose critical block names
+// the drift. A drift nobody is told about is not a finished drift.
+larkCriticalAlertAfterDrift = harness.lark.sent.some((text) =>
+  text.includes('package_hash_drift'),
+);
 const averageRss = samples.reduce((total, sample) => total + sample.rssBytes, 0) / samples.length;
 const maxLag = Math.max(...samples.map((sample) => sample.lagMs));
 const wallPeakCpu = Math.max(...samples.map((sample) => sample.cpuPercent));
@@ -385,7 +444,27 @@ invariant(stale === 0, `${stale} agent(s) fell outside the rolling window`);
 invariant(llm.offWindow === 0, `${llm.offWindow} model call(s) inside a blocked window`);
 invariant(integrity === 'ok', `sqlite integrity_check returned ${integrity}`);
 invariant(journalMode === 'wal', `journal_mode is ${journalMode}`);
-invariant(postedAfterDrift === 0, `${postedAfterDrift} trade(s) posted after the package drift`);
+
+// The package-drift chain. Each link is asserted on its own, because a run that
+// detected the drift but kept trading — or detected it and told nobody — is a
+// worse failure than one that never saw a drift at all.
+invariant(refereePackageDriftObserved, 'the referee package drift was never observed');
+invariant(
+  packageDriftPausedTrading,
+  'the referee package drift did not put the reader into conservative mode',
+);
+invariant(
+  tradesAfterPackageDrift === 0,
+  `${tradesAfterPackageDrift} trade(s) posted after the referee package drift`,
+);
+invariant(persistentAnomalyObserved, 'the package drift left no persistent anomaly record');
+// Only a run that actually crossed a report window after the drift can prove the
+// alert was delivered. The 24-hour rehearsal does; the conditional keeps a
+// --quick smoke honest rather than silently passing the whole chain.
+if (reportDeliveredAfterDrift) {
+  invariant(larkCriticalAlertAfterDrift, 'the package drift never reached a Lark critical alert');
+}
+
 invariant(
   dryRunBeforeDrift > 0,
   'no trade was ever built: the run never exercised the strategy -> gate -> signing path',
@@ -423,7 +502,7 @@ lines.push(`  sweeps                 ${TICKS}`);
 lines.push(`  restarts (kill -9)     ${restarts}`);
 lines.push(`  lark ws opens/drops    ${ws.opens}/${ws.drops} (state ${wsStatus.state}, attempts ${wsStatus.attempts}, connections ${wsStatus.connections})`);
 lines.push(`  lark reports delivered ${reportsDelivered}`);
-lines.push(`  trades (dry-run)       ${repositories.trades.countByStatus().dry_run ?? 0} dry-run before drift, ${postedAfterDrift} posted after`);
+lines.push(`  trades (dry-run)       ${repositories.trades.countByStatus().dry_run ?? 0} dry-run before drift, ${tradesAfterPackageDrift} posted after`);
 lines.push(`  participation          ${participation} rows, ${readback} with readback, statuses ${JSON.stringify(statuses)}`);
 lines.push(`  room cursors           ${cursorRows.length} rooms, ${cursorGaps} lost sequences`);
 lines.push(`  model calls            ${llm.attempted} attempted (${llm.normal} normal, ${llm.retries} retry, ${llm.offWindow} off-window), ${llm.tokens} tokens`);
@@ -439,7 +518,9 @@ lines.push(`  event loop lag max     ${maxLag.toFixed(1)}ms  (target < 100ms)`);
 lines.push(`  sqlite                 ${integrity}, ${journalMode}`);
 lines.push('');
 lines.push(`  readonly ticks         ${runsDuringReadonly}`);
-lines.push(`  drift observed         ${driftObserved}`);
+lines.push(`  upstream drift         ${upstreamDriftObserved}`);
+lines.push(`  referee pkg drift      ${refereePackageDriftObserved} (paused trading: ${packageDriftPausedTrading}, trades after: ${tradesAfterPackageDrift})`);
+lines.push(`  drift anomaly/alerts   persistent=${persistentAnomalyObserved}, report after drift=${reportDeliveredAfterDrift}, lark critical=${larkCriticalAlertAfterDrift}`);
 lines.push('');
 lines.push('  events');
 for (const note of notes) lines.push(`    ${note}`);
@@ -482,8 +563,15 @@ if (OUT !== undefined && OUT !== 'true') {
         eventLoopLagMs: { max: maxLag },
         dryRunBeforeDrift,
         expectedReports,
-        driftObserved,
-        postedAfterDrift,
+        drift: {
+          upstreamDriftObserved,
+          refereePackageDriftObserved,
+          packageDriftPausedTrading,
+          tradesAfterPackageDrift,
+          persistentAnomalyObserved,
+          reportDeliveredAfterDrift,
+          larkCriticalAlertAfterDrift,
+        },
         readonlyTicks: runsDuringReadonly,
         invariantFailures,
         notes,

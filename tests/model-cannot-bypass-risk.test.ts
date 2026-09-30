@@ -62,6 +62,8 @@ import { cleanup, tempDir } from './support/harness.js';
 
 const config = loadConfig({
   TIMEZONE: 'Asia/Shanghai',
+  // This test drives the optimiser, which is off by default in the MVP.
+  DEEPSEEK_ENABLED: 'true',
   DEEPSEEK_API_KEY: 'test-key',
   DEEPSEEK_MIN_INTERVAL_MS: '0',
   DEEPSEEK_TIMEOUT_MS: '1000',

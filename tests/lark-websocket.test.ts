@@ -29,6 +29,7 @@ import {
 } from '../apps/orchestrator/src/lark.js';
 import { Logger } from '../apps/orchestrator/src/logger.js';
 import { cleanup, tempDir } from './support/harness.js';
+import { buildHarness } from './support/orchestrator.js';
 
 const RECONNECT_MIN_MS = 100;
 const RECONNECT_MAX_MS = 1_600;
@@ -165,6 +166,12 @@ describe('LarkWebSocketClient connection lifecycle', () => {
     await vi.advanceTimersByTimeAsync(RECONNECT_MAX_MS * 8);
     expect(client.status.attempts).toBe(transports.length);
     expect(client.status.connections).toBe(0);
+
+    // Stop while the fake clock is still installed: a pending reconnect left
+    // behind would fire for real once the timers are restored, and log against a
+    // database this test's teardown has already closed.
+    await client.stop();
+    expect(client.status.state).toBe('stopped');
   });
 
   it('reports a heartbeat older than the timeout as stale', async () => {
@@ -223,6 +230,10 @@ describe('LarkWebSocketClient connection lifecycle', () => {
 
     expect(client.status.lastError).toBe('transport failed');
     expect(client.status.lastError).not.toContain('super-secret-value');
+
+    // A failed connect schedules a real reconnect. Stop the client so that timer
+    // cannot outlive this test and log against the closed database afterwards.
+    await client.stop();
   });
 });
 
@@ -301,5 +312,49 @@ describe('the SDK lifecycle adapter', () => {
     logger.info([['[ws]', 'some other line nobody promised']]);
 
     expect(seen).toEqual(['pong', 'ready', 'ready', 'error', 'close:the socket closed']);
+  });
+});
+
+describe('the socket is an optional status channel, never a startup gate', () => {
+  it('starts and keeps reporting when the socket cannot connect', async () => {
+    const harness = await buildHarness({
+      agentCount: 4,
+      env: {
+        // A configured Lark, so the stack really tries to open a socket.
+        LARK_MODE: 'websocket',
+        LARK_APP_ID: 'cli-test',
+        LARK_APP_SECRET: 'secret-test',
+        LARK_CHAT_ID: 'oc-test',
+        // A long reconnect delay keeps the ladder from firing inside the test;
+        // the transport is stopped by the runtime's own shutdown either way.
+        LARK_RECONNECT_MIN_MS: '60000',
+        LARK_RECONNECT_MAX_MS: '60000',
+      },
+      // A transport whose very first connect fails, which is the case the start
+      // path has to survive: no credentials, a DNS failure, a refused handshake.
+      wsFactory: () =>
+        ({
+          async start(): Promise<void> {
+            throw new Error('dns is down');
+          },
+          async stop(): Promise<void> {},
+        }) satisfies WsLike,
+    });
+    try {
+      // The runtime starts: the socket is an optional status channel.
+      await expect(harness.runtime.start()).resolves.toBeUndefined();
+
+      const status = harness.runtime.scheduler.status();
+      expect(status.lark.connected).toBe(false);
+      expect(status.lark.state).not.toBe('connected');
+
+      // The core path is unaffected: a tick still runs and a report still builds.
+      const tick = await harness.runtime.scheduler.runTick();
+      expect(tick.rooms.readErrors).toBe(0);
+      const report = await harness.runtime.scheduler.buildReport();
+      expect(report).toBeTruthy();
+    } finally {
+      await harness.dispose();
+    }
   });
 });
