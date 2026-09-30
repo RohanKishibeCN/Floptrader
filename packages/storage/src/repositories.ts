@@ -951,6 +951,8 @@ export interface TradeRow {
   agent_id?: string | null;
   counter_agent_id?: string | null;
   settle_sweep?: number | null;
+  /** The sweep this trade was proposed at, so "posted in sweep N" is answerable. */
+  posted_sweep?: number | null;
   /**
    * The referee's own reason for a void, when it named one.
    *
@@ -979,12 +981,12 @@ export class TradeRepository {
       .prepare(
         `INSERT OR IGNORE INTO trades (
            id, season, maker_did, taker_did, side, qty, px, until_sweep, maker_sig, taker_sig,
-           status, reason, room, seq, agent_id, counter_agent_id, settle_sweep,
+           status, reason, room, seq, agent_id, counter_agent_id, settle_sweep, posted_sweep,
            referee_reason, referee_funds_side, local_funds_side, funds_side_confidence,
            created_at, updated_at)
          VALUES (@id, @season, @maker_did, @taker_did, @side, @qty, @px, @until_sweep,
            @maker_sig, @taker_sig, @status, @reason, @room, @seq, @agent_id, @counter_agent_id,
-           @settle_sweep, @referee_reason, @referee_funds_side, @local_funds_side,
+           @settle_sweep, @posted_sweep, @referee_reason, @referee_funds_side, @local_funds_side,
            @funds_side_confidence, @created_at, @updated_at)`,
       )
       .run({
@@ -997,6 +999,7 @@ export class TradeRepository {
         agent_id: row.agent_id ?? null,
         counter_agent_id: row.counter_agent_id ?? null,
         settle_sweep: row.settle_sweep ?? null,
+        posted_sweep: row.posted_sweep ?? null,
         referee_reason: row.referee_reason ?? null,
         referee_funds_side: row.referee_funds_side ?? null,
         local_funds_side: row.local_funds_side ?? null,
@@ -1132,6 +1135,28 @@ export class TradeRepository {
     ).n;
   }
 
+
+  /**
+   * How many trades were proposed at each of two sweeps of interest.
+   *
+   * `inSweep` is the current sweep; `afterLock` is everything proposed past the
+   * lock sweep, which the lock gate should hold at zero. Both are counted from
+   * `posted_sweep`, the sweep the trade was written at.
+   */
+  sweepCounts(currentSweep: number | null, lockSweep: number): { inSweep: number; afterLock: number } {
+    const inSweep =
+      currentSweep === null
+        ? 0
+        : (this.db
+            .prepare('SELECT COUNT(*) AS n FROM trades WHERE posted_sweep = ?')
+            .get(currentSweep) as { n: number }).n;
+    const afterLock = (
+      this.db
+        .prepare('SELECT COUNT(*) AS n FROM trades WHERE posted_sweep > ?')
+        .get(lockSweep) as { n: number }
+    ).n;
+    return { inSweep, afterLock };
+  }
 
   count(): number {
     return (this.db.prepare('SELECT COUNT(*) AS n FROM trades').get() as { n: number }).n;
@@ -1603,6 +1628,122 @@ export class EventRepository {
       )
       .run(row);
     return Number(info.lastInsertRowid);
+  }
+}
+
+export type RuntimeEventSeverity = 'critical' | 'warning';
+export type RuntimeEventLarkStatus = 'none' | 'pending' | 'sent' | 'failed';
+
+export interface RuntimeEventRow {
+  id?: number;
+  /** Deterministic per occurrence, so the same event is never alerted twice. */
+  event_id: string;
+  severity: RuntimeEventSeverity;
+  code: string;
+  message: string;
+  sweep: number | null;
+  agent_id: string | null;
+  created_at?: string;
+  lark_status?: RuntimeEventLarkStatus;
+  sent_at?: string | null;
+  retry_count?: number;
+}
+
+/**
+ * The runtime event trail that feeds the Lark alerts.
+ *
+ * The durable outbox owns retry and dedupe for the *message*; this table owns
+ * the *event*: whether it happened, and whether the operator was told. `record`
+ * is idempotent on `event_id`, so a restart that re-observes the same condition
+ * neither duplicates the row nor re-alerts.
+ */
+export class RuntimeEventRepository {
+  constructor(private readonly db: SqliteDatabase) {}
+
+  /** Returns false when this event_id was already recorded. */
+  record(row: RuntimeEventRow): boolean {
+    const info = this.db
+      .prepare(
+        `INSERT OR IGNORE INTO runtime_events
+           (event_id, severity, code, message, sweep, agent_id, created_at, lark_status, retry_count)
+         VALUES (@event_id, @severity, @code, @message, @sweep, @agent_id, @created_at, @lark_status, 0)`,
+      )
+      .run({
+        ...row,
+        sweep: row.sweep ?? null,
+        agent_id: row.agent_id ?? null,
+        created_at: row.created_at ?? nowIso(),
+        lark_status: row.lark_status ?? 'none',
+      });
+    return info.changes > 0;
+  }
+
+  /**
+   * Mirror the outbox's outcome onto the event row.
+   *
+   * `retryCount` is the outbox row's own attempt count, so the two stay in step
+   * rather than being counted twice from different places.
+   */
+  markLarkStatus(
+    eventId: string,
+    status: RuntimeEventLarkStatus,
+    retryCount: number | null = null,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE runtime_events
+            SET lark_status = ?,
+                sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END,
+                retry_count = COALESCE(?, retry_count)
+          WHERE event_id = ?`,
+      )
+      .run(status, status, nowIso(), retryCount, eventId);
+  }
+
+  /** Rows whose alert has not yet been confirmed as sent. */
+  unsettled(limit: number): RuntimeEventRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM runtime_events
+          WHERE lark_status IN ('pending','failed')
+          ORDER BY id ASC LIMIT ?`,
+      )
+      .all(limit) as RuntimeEventRow[];
+  }
+
+  countBySeverity(): Record<string, number> {
+    const rows = this.db
+      .prepare('SELECT severity, COUNT(*) AS n FROM runtime_events GROUP BY severity')
+      .all() as Array<{ severity: string; n: number }>;
+    return Object.fromEntries(rows.map((row) => [row.severity, row.n]));
+  }
+
+  countByCode(code: string): number {
+    return (
+      this.db.prepare('SELECT COUNT(*) AS n FROM runtime_events WHERE code = ?').get(code) as {
+        n: number;
+      }
+    ).n;
+  }
+
+  /** How the alerts fared: none / pending / sent / failed. */
+  countByLarkStatus(): Record<string, number> {
+    const rows = this.db
+      .prepare('SELECT lark_status, COUNT(*) AS n FROM runtime_events GROUP BY lark_status')
+      .all() as Array<{ lark_status: string; n: number }>;
+    return Object.fromEntries(rows.map((row) => [row.lark_status, row.n]));
+  }
+
+  count(): number {
+    return (
+      this.db.prepare('SELECT COUNT(*) AS n FROM runtime_events').get() as { n: number }
+    ).n;
+  }
+
+  recent(limit: number): RuntimeEventRow[] {
+    return this.db
+      .prepare('SELECT * FROM runtime_events ORDER BY id DESC LIMIT ?')
+      .all(limit) as RuntimeEventRow[];
   }
 }
 
@@ -2117,6 +2258,7 @@ export interface Repositories {
   roomRegistry: RoomRegistryRepository;
   refereeAnomalies: RefereeAnomalyRepository;
   events: EventRepository;
+  runtimeEvents: RuntimeEventRepository;
 }
 
 export function createRepositories(db: SqliteDatabase): Repositories {
@@ -2144,5 +2286,6 @@ export function createRepositories(db: SqliteDatabase): Repositories {
     roomRegistry: new RoomRegistryRepository(db),
     refereeAnomalies: new RefereeAnomalyRepository(db),
     events: new EventRepository(db),
+    runtimeEvents: new RuntimeEventRepository(db),
   };
 }

@@ -473,6 +473,41 @@ export const MIGRATIONS: Migration[] = [
       `ALTER TABLE archive_state ADD COLUMN bytes_today_day TEXT`,
     ],
   },
+  {
+    version: 5,
+    name: 'runtime-events-and-trade-sweep',
+    statements: [
+      // ---- the runtime event trail, mirrored to Lark ------------------------
+      // Every critical/warning event an operator must be told about lands here
+      // first, keyed by a deterministic `event_id` so the same event is never
+      // alerted twice (across restarts included). `lark_status` mirrors the
+      // outbox row that carries the alert; the outbox owns retry and dedupe, and
+      // this row records the outcome so a report can say what was told to whom.
+      `CREATE TABLE IF NOT EXISTS runtime_events (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         event_id TEXT NOT NULL UNIQUE,
+         severity TEXT NOT NULL,
+         code TEXT NOT NULL,
+         message TEXT NOT NULL,
+         sweep INTEGER,
+         agent_id TEXT,
+         created_at TEXT NOT NULL,
+         lark_status TEXT NOT NULL DEFAULT 'none',
+         sent_at TEXT,
+         retry_count INTEGER NOT NULL DEFAULT 0
+       )`,
+      `CREATE INDEX IF NOT EXISTS idx_runtime_events_severity ON runtime_events(severity, id)`,
+      `CREATE INDEX IF NOT EXISTS idx_runtime_events_lark ON runtime_events(lark_status, id)`,
+      `CREATE INDEX IF NOT EXISTS idx_runtime_events_code ON runtime_events(code, sweep)`,
+
+      // The sweep a trade was proposed at. `until_sweep` bounds a trade forward
+      // and `settle_sweep` records when the referee settled it, but neither says
+      // *when we posted it* — which is what "trades in the current sweep" and
+      // "trades after the lock" need to be answerable.
+      `ALTER TABLE trades ADD COLUMN posted_sweep INTEGER`,
+      `CREATE INDEX IF NOT EXISTS idx_trades_posted_sweep ON trades(posted_sweep)`,
+    ],
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;

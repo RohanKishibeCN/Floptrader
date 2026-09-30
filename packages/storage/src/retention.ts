@@ -49,6 +49,9 @@ export const PERMANENT_TABLES = [
   // unlisted the referee reported: a data gap is evidence about the feed.
   'room_registry',
   'referee_anomalies',
+  // The critical/warning runtime events that were pushed to Lark. Losing one
+  // would turn "we told the operator" into something nobody can prove.
+  'runtime_events',
 ] as const;
 
 /** Event codes that survive every prune, however old they are. */

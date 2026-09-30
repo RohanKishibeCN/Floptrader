@@ -41,6 +41,18 @@ export const EnvSchema = z.object({
   SECRETS_DIR: z.string().default('secrets'),
   RELEASES_DIR: z.string().default('releases'),
 
+  // ---- profile -------------------------------------------------------------
+  /**
+   * The runtime profile: `lite` for the deployable contest configuration, `full`
+   * for the whole platform.
+   *
+   * `lite` is a *convergence*, not an exemption: it keeps every contest-critical
+   * behaviour (150 DIDs, registration, signing, risk, lock, settlement, recovery,
+   * evidence, Lark) and turns off the operational extras that would otherwise sit
+   * near the trade loop. It never relaxes a live gate.
+   */
+  FLOP_PROFILE: z.enum(['lite', 'full']).default('lite'),
+
   // ---- mode ---------------------------------------------------------------
   /** dry-run by default. "live" is the only value that trades for real. */
   FLOP_MODE: z.enum(['dry-run', 'live']).default('dry-run'),
@@ -117,7 +129,23 @@ export const EnvSchema = z.object({
   DEEPSEEK_MAX_OUTPUT_TOKENS: intString(160),
 
   // ---- lark ---------------------------------------------------------------
-  LARK_MODE: z.enum(['websocket', 'off']).default('websocket'),
+  /**
+   * How Lark is used.
+   *
+   * `open-api` is the default and the MVP: outbound reports and alerts go through
+   * the Open API and the durable outbox, and no inbound socket is opened.
+   * `websocket` additionally opens the optional inbound status channel, and only
+   * when `LARK_WS_ENABLED` is also true.
+   */
+  LARK_MODE: z.enum(['open-api', 'websocket', 'off']).default('open-api'),
+  /**
+   * Whether the optional inbound WebSocket may be opened at all.
+   *
+   * Off by default. The socket is a status channel: it can never gate startup,
+   * never gate trading, and a failure to connect or a drop is a warning. Reports
+   * and alerts go out through the Open API regardless of this flag.
+   */
+  LARK_WS_ENABLED: boolish.default(false),
   LARK_TIMEZONE: z.string().default('Asia/Shanghai'),
   LARK_APP_ID: z.string().default(''),
   LARK_APP_SECRET: z.string().default(''),
@@ -264,6 +292,14 @@ export interface Config {
   dataDir: string;
   secretsDir: string;
   releasesDir: string;
+  /** `lite` (the deployable contest profile) or `full` (the whole platform). */
+  profile: 'lite' | 'full';
+  /**
+   * The non-core modules the profile turned off, as `NAME=value` strings, so the
+   * operator can see that a requested setting was overridden rather than silently
+   * ignored. Empty under `full`.
+   */
+  profileOverrides: string[];
   mode: 'dry-run' | 'live';
   liveArmed: boolean;
   allowRegistration: boolean;
@@ -315,7 +351,9 @@ export interface Config {
     maxOutputTokens: number;
   };
   lark: {
-    mode: 'websocket' | 'off';
+    mode: 'open-api' | 'websocket' | 'off';
+    /** Whether the optional inbound socket may be opened. Never a trading gate. */
+    websocketEnabled: boolean;
     timezone: string;
     appId: string;
     appSecret: string;
@@ -415,6 +453,37 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     throw new ConfigError(`invalid environment configuration: ${detail}`);
   }
   const raw = parsed.data;
+
+  // ---- the profile resolves the non-core modules ---------------------------
+  //
+  // `lite` is the deployable contest profile. It keeps every contest-critical
+  // behaviour and closes the operational extras that would otherwise sit near the
+  // trade loop: the model lane, the dynamic-room reader and the external-offer
+  // taker. It is a *convergence*, not an exemption — no live gate is relaxed, and
+  // every override it makes is recorded so nothing is silently ignored.
+  const lite = raw.FLOP_PROFILE === 'lite';
+  const profileOverrides: string[] = [];
+  const forceOff = (name: string, requested: boolean, reason: string): boolean => {
+    if (lite && requested) profileOverrides.push(`${name} (${reason})`);
+    return lite ? false : requested;
+  };
+  const deepseekEnabled = forceOff(
+    'DEEPSEEK_ENABLED',
+    raw.DEEPSEEK_ENABLED,
+    'lite: the model lane is not on the trade path',
+  );
+  const externalOfferTakerEnabled = forceOff(
+    'EXTERNAL_OFFER_TAKER_ENABLED',
+    raw.EXTERNAL_OFFER_TAKER_ENABLED,
+    'lite: dynamic rooms are not read',
+  );
+  // Only an *explicitly requested* discovery cap is worth reporting: the schema's
+  // own default is not an operator decision, so it is not announced as overridden.
+  const askedForRooms = env.MAX_DISCOVERED_ROOMS !== undefined && env.MAX_DISCOVERED_ROOMS !== '';
+  if (lite && askedForRooms && raw.MAX_DISCOVERED_ROOMS !== 0) {
+    profileOverrides.push('MAX_DISCOVERED_ROOMS=0 (lite: fixed six rooms only)');
+  }
+  const maxDiscoveredRooms = lite ? 0 : raw.MAX_DISCOVERED_ROOMS;
 
   const liveArmed = raw.FLOP_MODE === 'live' && raw.FLOP_LIVE_CONFIRM === raw.SEASON;
   if (raw.FLOP_MODE === 'live' && !liveArmed) {
@@ -529,8 +598,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (clawbackBuffer.isNegative()) {
     throw new ConfigError('MAX_CLAWBACK_BUFFER must not be negative');
   }
-  if (raw.MAX_DISCOVERED_ROOMS < 1) {
-    throw new ConfigError('MAX_DISCOVERED_ROOMS must be at least 1');
+  // Under `full` the cap must be a real bound: zero would silently mean "no
+  // discovery at all", which is exactly what the lite profile is for. Under
+  // `lite` the cap is forced to zero and the operator's value has already been
+  // recorded as a profile override, so it is not re-litigated here.
+  if (!lite && raw.MAX_DISCOVERED_ROOMS <= 0) {
+    throw new ConfigError('MAX_DISCOVERED_ROOMS must be positive (the lite profile forces 0)');
   }
 
   const dataDir = raw.DATA_DIR.replace(/\/+$/, '');
@@ -541,6 +614,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     dataDir,
     secretsDir: raw.SECRETS_DIR,
     releasesDir: raw.RELEASES_DIR,
+    profile: raw.FLOP_PROFILE,
+    profileOverrides,
     mode: raw.FLOP_MODE,
     liveArmed,
     allowRegistration: raw.FLOP_ALLOW_REGISTRATION,
@@ -572,7 +647,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       maxInflight: Math.max(1, raw.MAX_INFLIGHT),
     },
     deepseek: {
-      enabled: raw.DEEPSEEK_ENABLED,
+      enabled: deepseekEnabled,
       baseUrl: raw.DEEPSEEK_BASE_URL.replace(/\/+$/, ''),
       apiKey: raw.DEEPSEEK_API_KEY,
       model: raw.DEEPSEEK_MODEL,
@@ -587,6 +662,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     },
     lark: {
       mode: raw.LARK_MODE,
+      websocketEnabled: raw.LARK_WS_ENABLED && raw.LARK_MODE === 'websocket',
       timezone: raw.LARK_TIMEZONE,
       appId: raw.LARK_APP_ID,
       appSecret: raw.LARK_APP_SECRET,
@@ -625,10 +701,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       },
     },
     roomDiscovery: {
-      maxRooms: raw.MAX_DISCOVERED_ROOMS,
+      maxRooms: maxDiscoveredRooms,
       dynamicReadConcurrency: Math.max(1, raw.DYNAMIC_ROOM_READ_CONCURRENCY),
     },
-    externalOfferTakerEnabled: raw.EXTERNAL_OFFER_TAKER_ENABLED,
+    externalOfferTakerEnabled,
     archive: {
       baseUrl: raw.CHALLENGE_ARCHIVE_BASE_URL.replace(/\/+$/, ''),
       checkIntervalMinutes: raw.ARCHIVE_CHECK_INTERVAL_MINUTES,

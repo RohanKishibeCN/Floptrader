@@ -183,6 +183,17 @@ export class LoadGuard {
     return this.readDiskUsage(path);
   }
 
+  /**
+   * The signals the last `poll()` sampled.
+   *
+   * Exposed read-only so the status report can quote the same writer-queue depth
+   * and memory readings the shed ladder acted on, rather than measuring again
+   * and reporting a different number.
+   */
+  get signals(): LoadSignals {
+    return { ...this.current };
+  }
+
   get state(): LoadState {
     return {
       ...this.lastState,

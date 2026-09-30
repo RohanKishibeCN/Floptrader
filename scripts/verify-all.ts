@@ -427,8 +427,53 @@ await check('lark report times are exactly two valid HH:MM entries', () => {
 
   const lark = loadConfig({} as NodeJS.ProcessEnv).lark;
   assert(lark.reportTimes.join(',') === '08:50,18:10', `report times: ${lark.reportTimes}`);
-  assert(lark.mode === 'websocket', `default lark mode is ${lark.mode}`);
+  // The MVP default is the Open API with the inbound socket off: reports and
+  // alerts always go through the durable outbox, and nothing waits on a socket.
+  assert(lark.mode === 'open-api', `default lark mode is ${lark.mode}`);
+  assert(lark.websocketEnabled === false, 'the default configuration opens the Lark socket');
   return lark.reportTimes.join(' and ');
+});
+
+/**
+ * The lite profile, printed under its own name: it must close the model lane, the
+ * dynamic-room reader and the external-offer taker, and it must not relax a
+ * single live gate while doing so.
+ */
+await check('lite profile closes the operational extras and no live gate', () => {
+  const lite = loadConfig({} as NodeJS.ProcessEnv);
+  assert(lite.profile === 'lite', `the default profile is ${lite.profile}`);
+  assert(lite.deepseek.enabled === false, 'lite left the model lane enabled');
+  assert(lite.roomDiscovery.maxRooms === 0, `lite discovery cap is ${lite.roomDiscovery.maxRooms}`);
+  assert(lite.externalOfferTakerEnabled === false, 'lite left the external-offer taker enabled');
+  assert(lite.lark.mode === 'open-api', 'lite did not keep the Lark Open API');
+
+  // A requested setting is overridden *and* recorded, never silently ignored.
+  const overridden = loadConfig({
+    DEEPSEEK_ENABLED: 'true',
+    EXTERNAL_OFFER_TAKER_ENABLED: 'true',
+    MAX_DISCOVERED_ROOMS: '10',
+  } as NodeJS.ProcessEnv);
+  assert(overridden.deepseek.enabled === false, 'lite honoured a requested DEEPSEEK_ENABLED');
+  assert(overridden.profileOverrides.length === 3, `overrides: ${overridden.profileOverrides.join(', ')}`);
+
+  // The gates are unchanged: live still refuses an unpinned referee under lite.
+  let threw = false;
+  try {
+    loadConfig({
+      FLOP_MODE: 'live',
+      FLOP_LIVE_CONFIRM: 'close-1',
+      FLOP_ALLOW_REGISTRATION: 'true',
+      EXPECTED_PACKAGE_HASH: sha256Hex(referenceFile('manifest.json')),
+    } as NodeJS.ProcessEnv);
+  } catch {
+    threw = true;
+  }
+  assert(threw, 'lite armed live without a pinned referee DID');
+
+  const full = loadConfig({ FLOP_PROFILE: 'full' } as NodeJS.ProcessEnv);
+  assert(full.profileOverrides.length === 0, 'full reported profile overrides');
+  assert(full.roomDiscovery.maxRooms === 10, `full discovery cap is ${full.roomDiscovery.maxRooms}`);
+  return 'lite: model/dynamic-rooms/external-offers off, gates intact; full unchanged';
 });
 
 // ---------------------------------------------------------------------------
@@ -466,6 +511,7 @@ await check('a fresh database gets every table the code expects', () => {
       'room_registry',
       'referee_anomalies',
       'events',
+      'runtime_events',
     ];
     const missing = required.filter((table) => !tables.has(table));
     assert(missing.length === 0, `missing tables: ${missing.join(', ')}`);

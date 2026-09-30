@@ -35,6 +35,7 @@
  *     reader goes conservative. Nothing here may ever downgrade it to `failed`.
  */
 import { existsSync } from 'node:fs';
+import { performance } from 'node:perf_hooks';
 import {
   Decimal,
   RiskAccount,
@@ -74,6 +75,7 @@ import type { LarkStack } from './lark.js';
 import type { LoadGuard, LoadTier } from './load-guard.js';
 import type { Logger } from './logger.js';
 import type { OrchestratorReader } from './reader.js';
+import { runtimeEventSummary, type RuntimeEventNotifier } from './runtime-events.js';
 import { ownerRegistrationText, type OrchestratorWriter } from './writer.js';
 import type { UpstreamMonitor } from './upstream-monitor.js';
 
@@ -231,6 +233,8 @@ export interface TickReport {
 
 export interface StatusSnapshot {
   at: string;
+  /** Which operating profile the process was started under. */
+  profile: 'lite' | 'full';
   mode: 'dry-run' | 'live';
   liveArmed: boolean;
   tier: LoadTier;
@@ -253,10 +257,27 @@ export interface StatusSnapshot {
     staleCount: number;
     staleSample: string[];
     lastRunAt: string | null;
+    /** Individual agent strategy failures, from the alert trail. */
+    failures: number;
   };
   participation: Record<string, number> & { total: number; readback: number };
   runs: { today: number; window: number };
   trades: Record<string, number>;
+  /**
+   * Trades counted by the sweep they were written at, plus the duplicate-id
+   * refusals. `afterLock` should stay at zero: the lock gate is what holds it.
+   */
+  tradeSweeps: { inCurrent: number; afterLock: number; duplicateAttempts: number };
+  /** The immediate-alert trail (critical + warning), as recorded locally. */
+  runtimeEvents: {
+    total: number;
+    critical: number;
+    warning: number;
+    delivered: number;
+    pending: number;
+    failed: number;
+    recentCodes: string[];
+  };
   /** The referee's named reasons, and how its `funds` verdicts are labelled. */
   funds: {
     officialReasons: Record<string, number>;
@@ -288,8 +309,22 @@ export interface StatusSnapshot {
   llm: { normal: number; retries: number; total: number; blocked: number; tokens: number };
   lark: { connected: boolean; state: string; heartbeatStale: boolean; outbox: Record<string, number> };
   upstream: { checkedAt: string | null; drift: boolean };
-  system: { rssBytes: number; heapUsedBytes: number; cpuPercent: number; uptimeSeconds: number; diskUsedPercent: number };
-  storage: { dbBytes: number; archiveBytes: number; walBytes: number };
+  system: {
+    rssBytes: number;
+    heapUsedBytes: number;
+    cpuPercent: number;
+    uptimeSeconds: number;
+    diskUsedPercent: number;
+    /** Last zero-delay timer reading, off the trade path. */
+    eventLoopLagMs: number;
+  };
+  storage: {
+    dbBytes: number;
+    archiveBytes: number;
+    walBytes: number;
+    /** Writes waiting behind the current one; a bounded, in-process queue. */
+    writerQueueDepth: number;
+  };
 }
 
 export interface SchedulerOptions {
@@ -310,6 +345,8 @@ export interface SchedulerOptions {
   lark?: LarkStack;
   maintenance?: ArchiveMaintenance;
   upstream?: UpstreamMonitor;
+  /** The immediate-alert channel; optional so a test can omit it. */
+  notifier?: RuntimeEventNotifier;
   now?: () => Date;
 }
 
@@ -331,6 +368,7 @@ export class OrchestratorScheduler {
   private readonly lark: LarkStack | undefined;
   private readonly maintenance: ArchiveMaintenance | undefined;
   private readonly upstream: UpstreamMonitor | undefined;
+  private readonly notifier: RuntimeEventNotifier | undefined;
   private readonly now: () => Date;
 
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -340,6 +378,8 @@ export class OrchestratorScheduler {
   private lastMaintenanceDay: string | null = null;
   private lastUpstreamCheckMs = 0;
   private lastTickReport: TickReport | null = null;
+  /** The last event-loop lag the background step measured, in milliseconds. */
+  private lastEventLoopLagMs = 0;
   /** Per-agent mirror of cash and open lots; rebuilt from the referee's mints. */
   private readonly riskBook: Map<string, RiskAccount> = new Map();
   /** DID -> agent id, built once, for matching a missed message back to its agent. */
@@ -364,6 +404,7 @@ export class OrchestratorScheduler {
     this.lark = options.lark;
     this.maintenance = options.maintenance;
     this.upstream = options.upstream;
+    this.notifier = options.notifier;
     this.now = options.now ?? (() => new Date());
     this.bootstrapRiskBook();
   }
@@ -544,6 +585,19 @@ export class OrchestratorScheduler {
     let deepseek: { attempted: string[]; refused: number } = { attempted: [], refused: 0 };
     let upstream = false;
 
+    // A cheap liveness reading for the status report, taken off the trade path.
+    await this.measureEventLoopLag();
+
+    // Alerts first: a critical event recorded this tick should not wait behind a
+    // daily report that may be building. The outbox owns the retry.
+    if (this.notifier) {
+      try {
+        await this.notifier.flush(25);
+      } catch (error) {
+        this.backgroundFailure('runtime_alert_flush_failed', error);
+      }
+    }
+
     try {
       watchdog = await withTimeout(this.maybeRunWatchdog(at), BACKGROUND_TIMEOUT_MS, 'watchdog');
     } catch (error) {
@@ -569,17 +623,31 @@ export class OrchestratorScheduler {
       }
     }
 
-    try {
-      upstream = await withTimeout(
-        this.maybeCheckUpstream(at),
-        BACKGROUND_TIMEOUT_MS,
-        'upstream_check',
-      );
-    } catch (error) {
-      this.backgroundFailure('upstream_check_failed', error);
+    // Lite does the package check once, at startup, and never again per tick: the
+    // upstream repo is an audit source, and a periodic GitHub request has no
+    // business sitting inside the contest loop.
+    if (this.config.profile === 'full') {
+      try {
+        upstream = await withTimeout(
+          this.maybeCheckUpstream(at),
+          BACKGROUND_TIMEOUT_MS,
+          'upstream_check',
+        );
+      } catch (error) {
+        this.backgroundFailure('upstream_check_failed', error);
+      }
     }
 
     return { watchdog, lark, deepseek, upstream };
+  }
+
+  /** Time a zero-delay timer: how long the loop took to come back to us. */
+  private async measureEventLoopLag(): Promise<void> {
+    const start = performance.now();
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    this.lastEventLoopLagMs = Number((performance.now() - start).toFixed(2));
   }
 
   /** Record a background-task failure without letting it reach the tick. */
@@ -1845,8 +1913,11 @@ export class OrchestratorScheduler {
     const officialReasons = this.repositories.trades.refereeReasonCounts();
     const localInferred = this.repositories.trades.countLocalInference();
 
+    const sweeps = this.repositories.trades.sweepCounts(verifier.currentSweep, this.rules.lockSweep);
+
     return {
       at: at.toISOString(),
+      profile: this.config.profile,
       mode: this.config.mode,
       liveArmed: this.config.liveArmed,
       tier: this.loadGuard.state.tier,
@@ -1877,6 +1948,7 @@ export class OrchestratorScheduler {
             .filter((value): value is string => value !== null)
             .sort()
             .pop() ?? null,
+        failures: this.repositories.runtimeEvents.countByCode('agent_run_failed'),
       },
       participation: {
         ...this.repositories.participation.countByStatus(),
@@ -1887,7 +1959,16 @@ export class OrchestratorScheduler {
         today: this.repositories.agentRuns.countSince(dayStart),
         window: this.repositories.agentRuns.countSince(runWindowStart),
       },
-      trades: this.repositories.trades.countByStatus(),
+      trades: {
+        ...this.repositories.trades.countByStatus(),
+        total: this.repositories.trades.count(),
+      },
+      tradeSweeps: {
+        inCurrent: sweeps.inSweep,
+        afterLock: sweeps.afterLock,
+        duplicateAttempts: this.repositories.runtimeEvents.countByCode('duplicate_trade_id'),
+      },
+      runtimeEvents: runtimeEventSummary(this.repositories),
       funds: {
         officialReasons,
         fundsVerdicts: verdicts.length,
@@ -1936,6 +2017,7 @@ export class OrchestratorScheduler {
         cpuPercent: Number((((cpu.user + cpu.system) / 1000 / uptimeSeconds) * 100).toFixed(2)),
         uptimeSeconds: Number(uptimeSeconds.toFixed(0)),
         diskUsedPercent: Number(this.loadGuard.diskUsedPercent(this.config.dataDir).toFixed(2)),
+        eventLoopLagMs: this.lastEventLoopLagMs,
       },
       storage: {
         dbBytes: existsSync(this.config.paths.database)
@@ -1945,6 +2027,7 @@ export class OrchestratorScheduler {
         walBytes: existsSync(`${this.config.paths.database}-wal`)
           ? fileBytes(`${this.config.paths.database}-wal`)
           : 0,
+        writerQueueDepth: this.writer.depth,
       },
     };
   }
@@ -2007,16 +2090,27 @@ export class OrchestratorScheduler {
     return {
       reportId: '',
       title: `FLOP Close Call (close-1) 运行报告 ${status.at}`,
-      summary: `${status.mode}${status.liveArmed ? ' (armed)' : ''} · tier ${status.tier} · sweep ${status.sweep ?? '-'} · agents ${status.agents.total}`,
+      summary: `${status.profile} · ${status.mode}${status.liveArmed ? ' (armed)' : ''} · tier ${status.tier} · sweep ${status.sweep ?? '-'} · agents ${status.agents.total}`,
       sections: [
         {
           heading: '运行状态',
           lines: [
             `report_time: ${status.at}`,
-            `uptime: ${status.system.uptimeSeconds}s`,
-            `mode: ${status.mode}${status.liveArmed ? ' (live armed)' : ' (dry-run)'}`,
+            `process_uptime: ${status.system.uptimeSeconds}s`,
+            `profile: ${status.profile}`,
+            `current_mode: ${status.mode}${status.liveArmed ? ' (live armed)' : ' (dry-run)'}`,
+            `current_sweep: ${status.sweep ?? '-'}`,
+            `locked: ${status.locked}`,
+            `conservative: ${status.conservative}${
+              status.conservative
+                ? ` (${status.conservativeReasons.join('; ') || 'reason unlabelled'})`
+                : ''
+            }`,
+            `package_hash: ${status.packageHash ?? '-'}`,
+            `referee_did: ${status.refereeDid ?? '-'}`,
+            `room_scope: ${status.rooms.scope}`,
             `load tier: ${status.tier}${status.tierReasons.length ? ` (${status.tierReasons.join('; ')})` : ''}`,
-            `event loop: rss ${(status.system.rssBytes / 1024 / 1024).toFixed(1)}MB heap ${(status.system.heapUsedBytes / 1024 / 1024).toFixed(1)}MB cpu ${status.system.cpuPercent}%`,
+            `event loop: rss ${(status.system.rssBytes / 1024 / 1024).toFixed(1)}MB heap ${(status.system.heapUsedBytes / 1024 / 1024).toFixed(1)}MB cpu ${status.system.cpuPercent}% lag ${status.system.eventLoopLagMs}ms`,
           ],
         },
         {
@@ -2036,9 +2130,12 @@ export class OrchestratorScheduler {
         {
           heading: '参赛证据',
           lines: [
-            `agents total: ${status.agents.total} enabled: ${status.agents.enabled}`,
-            `participation records: ${status.participation.total}`,
-            `registration readback: ${status.participation.readback}`,
+            `total_agents: ${status.agents.total}`,
+            `enabled_agents: ${status.agents.enabled}`,
+            `groups: ${STRATEGY_GROUPS.map((group) => `${group}=${status.agents.byGroup[group] ?? 0}`).join(' ')}`,
+            `strategy failures: ${status.agents.failures}`,
+            `registration count: ${status.participation.total}`,
+            `registration readback count: ${status.participation.readback}`,
             `statuses: ${participationStatuses}`,
             `mint_observed: ${status.participation.mint_observed ?? 0}`,
             `mint_unknown: ${status.participation.mint_unknown ?? 0}`,
@@ -2047,11 +2144,11 @@ export class OrchestratorScheduler {
         {
           heading: '运行覆盖 (7x24h)',
           lines: [
-            `today runs: ${status.runs.today}`,
-            `window runs: ${status.runs.window}`,
-            `agents not run in window: ${status.agents.staleCount}`,
+            `runs today: ${status.runs.today}`,
+            `agents_run_in_last_window: ${status.agents.total - status.agents.staleCount}`,
+            `agents_not_run_in_last_window: ${status.agents.staleCount}`,
+            `last_agent_run_at: ${status.agents.lastRunAt ?? 'never'}`,
             `missing agent ids: ${status.agents.staleSample.join(', ') || 'none'}`,
-            `last run at: ${status.agents.lastRunAt ?? 'never'}`,
           ],
         },
         {
@@ -2063,7 +2160,13 @@ export class OrchestratorScheduler {
         {
           heading: '交易',
           lines: [
-            `trades: ${Object.entries(status.trades)
+            `total trades: ${status.trades.total ?? 0}`,
+            `pending: ${status.trades.pending ?? 0} settled: ${status.trades.settled ?? 0} void: ${status.trades.void ?? 0} funds: ${status.trades.funds ?? 0} limits: ${status.trades.limits ?? 0} expired: ${status.trades.expired ?? 0}`,
+            `trades in current sweep: ${status.tradeSweeps.inCurrent}`,
+            `trades after lock (should be 0): ${status.tradeSweeps.afterLock}`,
+            `duplicate trade attempts: ${status.tradeSweeps.duplicateAttempts}`,
+            `by status: ${Object.entries(status.trades)
+              .filter(([key]) => key !== 'total')
               .map(([key, value]) => `${key}=${value}`)
               .join(' ') || 'none'}`,
             `cursor gap: ${status.cors.gaps}${status.cors.gapRooms.length ? ` (${status.cors.gapRooms.join(', ')})` : ''}`,
@@ -2129,10 +2232,22 @@ export class OrchestratorScheduler {
           ],
         },
         {
-          heading: '存储',
+          heading: '运行事件 (runtime events)',
+          lines: [
+            `events recorded: ${status.runtimeEvents.total} (critical ${status.runtimeEvents.critical} / warning ${status.runtimeEvents.warning})`,
+            `alert delivery: delivered ${status.runtimeEvents.delivered} pending ${status.runtimeEvents.pending} failed ${status.runtimeEvents.failed}`,
+            `recent codes: ${status.runtimeEvents.recentCodes.join(', ') || 'none'}`,
+          ],
+        },
+        {
+          heading: '存储与基础设施',
           lines: [
             `db: ${(status.storage.dbBytes / 1024 / 1024).toFixed(1)}MB wal: ${(status.storage.walBytes / 1024 / 1024).toFixed(1)}MB`,
             `archive: ${(status.storage.archiveBytes / 1024 / 1024).toFixed(1)}MB`,
+            `writer queue depth: ${status.storage.writerQueueDepth}`,
+            `lark outbox pending: ${status.lark.outbox.pending ?? 0} failed: ${status.lark.outbox.failed ?? 0} sent: ${status.lark.outbox.sent ?? 0}`,
+            `archive status: ${status.archive.lastError ?? 'ok'} (last check ${status.archive.lastCheckAt ?? 'never'})`,
+            `last error: ${status.archive.lastError ?? 'none'}`,
             `disk used: ${status.system.diskUsedPercent}%`,
           ],
         },

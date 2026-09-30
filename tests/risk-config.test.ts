@@ -60,14 +60,17 @@ describe('the external-offer ceilings', () => {
 });
 
 describe('the room and archive knobs', () => {
-  it('carries a discoverable-room cap and refuses a nonsensical one', () => {
+  it('carries a discoverable-room cap and refuses a nonsensical one in full', () => {
     // Ten discovered owner rooms, read one at a time: the bounded default the
-    // spec names, not an unbounded long-poll per registered room.
-    expect(load().roomDiscovery.maxRooms).toBe(10);
+    // spec names, not an unbounded long-poll per registered room. This is the
+    // `full` profile; `lite` forces the cap to zero (see lite-profile.test.ts).
+    expect(load({ FLOP_PROFILE: 'full' }).roomDiscovery.maxRooms).toBe(10);
     expect(load().roomDiscovery.dynamicReadConcurrency).toBe(1);
-    expect(load({ MAX_DISCOVERED_ROOMS: '10' }).roomDiscovery.maxRooms).toBe(10);
+    expect(
+      load({ FLOP_PROFILE: 'full', MAX_DISCOVERED_ROOMS: '10' }).roomDiscovery.maxRooms,
+    ).toBe(10);
     expect(load({ DYNAMIC_ROOM_READ_CONCURRENCY: '4' }).roomDiscovery.dynamicReadConcurrency).toBe(4);
-    expect(() => load({ MAX_DISCOVERED_ROOMS: '0' })).toThrow(ConfigError);
+    expect(() => load({ FLOP_PROFILE: 'full', MAX_DISCOVERED_ROOMS: '0' })).toThrow(ConfigError);
   });
 
   it('points at the published archive and normalises the trailing slash', () => {

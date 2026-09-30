@@ -50,6 +50,7 @@ import { ChallengeArchiveMonitor } from './challenge-archive-monitor.js';
 import { loadConfig, ConfigError, type Config } from './config.js';
 import { OrchestratorScheduler } from './scheduler.js';
 import { OrchestratorReader } from './reader.js';
+import { RuntimeEventNotifier } from './runtime-events.js';
 import { OrchestratorWriter } from './writer.js';
 import { createHealthServer, type HealthServer } from './health.js';
 import { createLarkStack, type LarkStack } from './lark.js';
@@ -93,6 +94,8 @@ export interface Runtime {
   writer: OrchestratorWriter;
   scheduler: OrchestratorScheduler;
   lark: LarkStack;
+  /** The immediate-alert channel: runtime events mirrored to the Lark outbox. */
+  notifier: RuntimeEventNotifier;
   /** The published sweep archive, polled off the trading path. */
   archiveMonitor: ChallengeArchiveMonitor;
   health: HealthServer | null;
@@ -464,10 +467,15 @@ export async function createRuntime(
 
   const db = openDatabase({ path: config.paths.database, fileMode: 0o600 });
   const repositories = createRepositories(db);
+  // Late-bound: the notifier needs the Lark outbox, which is built further down
+  // with the rest of the Lark stack. Until then a nil observer is correct — the
+  // events it cares about are runtime conditions, not startup lines.
+  const notifierRef: { current: RuntimeEventNotifier | null } = { current: null };
   const logger = Logger.create({
     level: config.logLevel,
     name: 'flop-close-call',
     repositories,
+    onEvent: (record) => notifierRef.current?.observe(record),
   });
 
   const { keyStore, meta } = await loadAgentKeyStoreAsync(config, logger);
@@ -684,6 +692,11 @@ export async function createRuntime(
       : {}),
   });
 
+  // The immediate-alert channel: the same durable outbox the daily report uses,
+  // fed from the structured log. Built here because it needs the outbox.
+  const notifier = new RuntimeEventNotifier({ repositories, logger, outbox: lark.outbox, now });
+  notifierRef.current = notifier;
+
   scheduler = new OrchestratorScheduler({
     config,
     logger,
@@ -702,6 +715,7 @@ export async function createRuntime(
     lark,
     maintenance,
     upstream,
+    notifier,
     now,
   });
 
@@ -721,6 +735,7 @@ export async function createRuntime(
     writer,
     scheduler,
     lark,
+    notifier,
     archiveMonitor,
     health,
     startedAt: now().toISOString(),
@@ -740,9 +755,10 @@ export async function createRuntime(
         level: 'info',
         source: 'main',
         code: 'startup',
-        message: `starting in ${config.mode}${config.liveArmed ? ' (live armed)' : ''}`,
+        message: `starting in ${config.mode}${config.liveArmed ? ' (live armed)' : ''} under the ${config.profile} profile`,
         data: {
           mode: config.mode,
+          profile: config.profile,
           liveArmed: config.liveArmed,
           agents: keyStore.size,
           season: config.season,
@@ -750,6 +766,17 @@ export async function createRuntime(
           timezone: config.timezone,
         },
       });
+      // A profile that overrode an operator's setting says so out loud: silently
+      // ignoring `DEEPSEEK_ENABLED=true` would be worse than refusing it.
+      if (config.profileOverrides.length > 0) {
+        logger.event({
+          level: 'warn',
+          source: 'main',
+          code: 'profile_overrode_settings',
+          message: `the ${config.profile} profile closed ${config.profileOverrides.length} requested setting(s)`,
+          data: { profile: config.profile, overrides: config.profileOverrides },
+        });
+      }
       // The WebSocket is an optional status channel: a failure to connect is a
       // warning, never a reason to refuse to start. Reports go out through the
       // Open API and the outbox regardless, and no trading decision reads the

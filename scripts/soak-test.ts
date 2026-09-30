@@ -146,10 +146,16 @@ const ENV: Record<string, string> = {
   DATA_DIR: join(dir, 'data'),
   SECRETS_DIR: join(dir, 'secrets'),
   CONTEST_JSON_PATH: REFERENCE_CONTEST_PATH,
+  // The soak exercises the whole platform, so it is explicit about the `full`
+  // profile: the model lane and the Lark socket ladder are part of the run.
+  FLOP_PROFILE: 'full',
   FLOP_MODE: 'dry-run',
   FLOP_ALLOW_REGISTRATION: 'true',
   TICK_SECONDS: String(SWEEP_SECONDS),
+  // Both the mode and the flag gate the socket; the soak wants it open so the
+  // simulated drop exercises the reconnect ladder.
   LARK_MODE: 'websocket',
+  LARK_WS_ENABLED: 'true',
   LARK_APP_ID: 'soak-app',
   LARK_APP_SECRET: 'soak-secret',
   LARK_CHAT_ID: 'soak-chat',

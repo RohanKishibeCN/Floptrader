@@ -62,7 +62,9 @@ import { cleanup, tempDir } from './support/harness.js';
 
 const config = loadConfig({
   TIMEZONE: 'Asia/Shanghai',
-  // This test drives the optimiser, which is off by default in the MVP.
+  // The optimiser only exists under the `full` profile, and even there it is off
+  // unless it is asked for; this test drives it, so both are explicit.
+  FLOP_PROFILE: 'full',
   DEEPSEEK_ENABLED: 'true',
   DEEPSEEK_API_KEY: 'test-key',
   DEEPSEEK_MIN_INTERVAL_MS: '0',

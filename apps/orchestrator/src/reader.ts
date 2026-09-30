@@ -756,10 +756,11 @@ export class OrchestratorReader {
       });
     }
 
-    if (this.maxDiscoveredRooms !== null) {
+    if (this.maxDiscoveredRooms !== null && this.maxDiscoveredRooms > 0) {
       // Overflow is about the *discovered* set, not the six rooms we read
       // unconditionally: those are never dropped, so counting them would make
-      // the alert fire from the first sweep.
+      // the alert fire from the first sweep. A cap of 0 means discovery is off
+      // rather than "everything is an overflow".
       const discovered = this.dynamicCandidates().length;
       if (discovered > this.maxDiscoveredRooms) {
         this.repositories.refereeAnomalies.record({

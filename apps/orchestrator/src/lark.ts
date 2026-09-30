@@ -932,6 +932,19 @@ export function createLarkStack(options: CreateLarkStackOptions): LarkStack {
         });
         return;
       }
+      if (!config.lark.websocketEnabled) {
+        // Open API only: reports and alerts still go out through the outbox, and
+        // nothing here is a trading gate. The socket is an optional status
+        // channel, so this is an informational event, not a warning.
+        logger.event({
+          level: 'info',
+          source: 'lark',
+          code: 'lark_ws_disabled',
+          message: 'Lark WebSocket is disabled; reports and alerts use the Open API only',
+          data: { mode: config.lark.mode, websocketEnabled: false },
+        });
+        return;
+      }
       await websocket.start();
     },
     async stop(): Promise<void> {

@@ -7,11 +7,13 @@
 # filesystem layout, and checks the things a unit test cannot: file modes, the
 # WAL journal, a graceful SIGTERM, survival of a `kill -9`, cursors and the
 # outbox recovering from it, the health endpoint, and that no secret reaches the
-# log. It never trades and never registers — the whole run is dry-run with every
-# live gate held shut:
+# log. It never trades and never registers — the whole run is the deployable
+# `lite` profile in dry-run, with every live gate held shut:
 #
-#   FLOP_MODE=dry-run FLOP_ALLOW_REGISTRATION=false FLOP_ALLOW_TRADING=false
-#   DEEPSEEK_ENABLED=false EXTERNAL_OFFER_TAKER_ENABLED=false
+#   FLOP_PROFILE=lite FLOP_MODE=dry-run FLOP_ALLOW_REGISTRATION=false
+#   FLOP_ALLOW_TRADING=false DEEPSEEK_ENABLED=false
+#   EXTERNAL_OFFER_TAKER_ENABLED=false MAX_DISCOVERED_ROOMS=0
+#   LARK_MODE=open-api LARK_WS_ENABLED=false
 #
 # Usage:
 #   scripts/vps-smoke.sh                 # isolated temp dir, cleaned up after
@@ -100,8 +102,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The environment every child process runs under. Dry-run, nothing armed, no
-# model, no external offers — a rehearsal must not be able to trade by accident.
+# The environment every child process runs under. The deployable profile, in
+# dry-run, with nothing armed, no model, no dynamic rooms and no external offers
+# — a rehearsal must not be able to trade by accident.
 runtime_env() {
   exec env \
     NODE_ENV=production \
@@ -113,6 +116,7 @@ runtime_env() {
     CONTEST_JSON_PATH="$REPO_ROOT/reference/contest.json" \
     REFERENCE_DIR="$REPO_ROOT/reference" \
     AGE_IDENTITY_FILE="$SECRETS_DIR/runtime.key" \
+    FLOP_PROFILE=lite \
     FLOP_MODE=dry-run \
     FLOP_ALLOW_REGISTRATION=false \
     FLOP_ALLOW_TRADING=false \
@@ -120,13 +124,14 @@ runtime_env() {
     EXTERNAL_OFFER_TAKER_ENABLED=false \
     REQUIRE_FULL_FLEET=false \
     EXPECTED_AGENT_COUNT="$AGENTS" \
-    MAX_DISCOVERED_ROOMS="${MAX_DISCOVERED_ROOMS:-10}" \
+    MAX_DISCOVERED_ROOMS="${MAX_DISCOVERED_ROOMS:-0}" \
     DYNAMIC_ROOM_READ_CONCURRENCY="${DYNAMIC_ROOM_READ_CONCURRENCY:-1}" \
     ARCHIVE_MAX_RECORDS_PER_CHECK="${ARCHIVE_MAX_RECORDS_PER_CHECK:-10}" \
     ARCHIVE_MAX_BYTES_PER_CHECK="${ARCHIVE_MAX_BYTES_PER_CHECK:-100000000}" \
     ARCHIVE_MAX_REQUESTS_PER_MINUTE="${ARCHIVE_MAX_REQUESTS_PER_MINUTE:-10}" \
     ARCHIVE_BACKFILL_MODE="${ARCHIVE_BACKFILL_MODE:-oldest_first}" \
-    LARK_MODE=off LARK_APP_ID= LARK_APP_SECRET= LARK_CHAT_ID= \
+    LARK_MODE=open-api LARK_WS_ENABLED=false \
+    LARK_APP_ID= LARK_APP_SECRET= LARK_CHAT_ID= \
     HEALTH_PORT="$HEALTH_PORT" HEALTH_HOST="$HEALTH_HOST" \
     TICK_SECONDS="${TICK_SECONDS:-5}" \
     "$@"
@@ -289,10 +294,25 @@ fi
 
 # The scheduler runs off the trading path: it must have ticked at least once.
 sleep 6
-if http_body "http://$HEALTH_HOST:$HEALTH_PORT/status" | grep -q '"mode":"dry-run"'; then
+STATUS_BODY="$(http_body "http://$HEALTH_HOST:$HEALTH_PORT/status" || true)"
+if printf '%s' "$STATUS_BODY" | grep -q '"mode":"dry-run"'; then
   pass "status reports dry-run mode"
 else
   fail "status did not report dry-run mode"
+fi
+
+# The convergence must be visible from the running process, not only the env:
+# the lite profile with discovery off means `room_scope=close1_only`.
+if printf '%s' "$STATUS_BODY" | grep -q '"profile":"lite"'; then
+  pass "status reports the lite profile"
+else
+  fail "status did not report the lite profile"
+fi
+
+if printf '%s' "$STATUS_BODY" | grep -q '"scope":"close1_only"'; then
+  pass "room scope is close1_only (fixed six rooms)"
+else
+  fail "room scope is not close1_only"
 fi
 
 # WAL is the journal mode the crash-recovery story depends on.
@@ -327,6 +347,10 @@ step "5. crash recovery: kill -9, restart, cursors and outbox survive"
 # ---------------------------------------------------------------------------
 
 cursors_before="$(sqlite_scalar 'SELECT COUNT(*) n FROM room_cursors' 0)"
+# Nonces are the monotonic counter behind every signed message; the outbox is the
+# durable report queue. Both must survive the hard kill without losing a row.
+nonces_before="$(sqlite_scalar 'SELECT COUNT(*) n FROM nonces' 0)"
+outbox_before="$(sqlite_scalar 'SELECT COUNT(*) n FROM lark_outbox' 0)"
 
 if start_and_wait; then
   pass "process restarted after the graceful stop"
@@ -359,11 +383,30 @@ else
     fail "room cursors did not recover (found ${cursors_after:-0})"
   fi
 
-  # The outbox is a table; its presence is what a report retry depends on.
+  # Nonces must be monotonic across the kill: a rollback would let a signed
+  # message reuse a counter, which the referee refuses outright.
+  nonces_after="$(sqlite_scalar 'SELECT COUNT(*) n FROM nonces' 0)"
+  if [[ "${nonces_after:-0}" -ge "${nonces_before:-0}" ]]; then
+    pass "nonce counter recovered monotonically ($nonces_before before kill, $nonces_after after)"
+  else
+    fail "nonce counter rolled back ($nonces_before before kill, $nonces_after after)"
+  fi
+
+  # The outbox is a table, and it must be readable after the restart: that is what
+  # a report/alert retry depends on.
+  outbox_after="$(sqlite_scalar 'SELECT COUNT(*) n FROM lark_outbox' 0)"
   if ( cd "$REPO_ROOT" && node -e "const D=require('better-sqlite3');const db=new D(process.argv[1],{readonly:true});db.prepare('SELECT COUNT(*) n FROM lark_outbox').get();" "$DB_FILE" 2>/dev/null ); then
-    pass "Lark outbox survived the restart"
+    pass "Lark outbox persisted locally across the restart ($outbox_before before kill, $outbox_after after)"
   else
     fail "Lark outbox missing after the restart"
+  fi
+
+  # The immediate-alert trail is the other durable evidence table; it must exist
+  # too, so a critical recorded just before the kill is still on the record.
+  if ( cd "$REPO_ROOT" && node -e "const D=require('better-sqlite3');const db=new D(process.argv[1],{readonly:true});db.prepare('SELECT COUNT(*) n FROM runtime_events').get();" "$DB_FILE" 2>/dev/null ); then
+    pass "runtime_events trail survived the restart"
+  else
+    fail "runtime_events missing after the restart"
   fi
 fi
 

@@ -274,6 +274,11 @@ export async function buildHarness(options: HarnessOptions = {}): Promise<Harnes
     AGE_RECIPIENT_VPS: recipient,
     FLOP_MODE: 'dry-run',
     FLOP_ALLOW_REGISTRATION: 'true',
+    // The harness exercises the whole platform, so it pins `full`. The lite
+    // profile is the *product* default, and the lite-specific tests opt into it
+    // explicitly via `env: { FLOP_PROFILE: 'lite' }` — that keeps the existing
+    // suite meaning what it always meant while making the convergence testable.
+    FLOP_PROFILE: 'full',
     // The referee is pinned exactly as production pins it; a fixture that could
     // only ever exercise the permissive path would not test the wiring.
     EXPECTED_REFEREE_DID: HARNESS_REFEREE_DID,

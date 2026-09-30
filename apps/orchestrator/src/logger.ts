@@ -46,6 +46,14 @@ export interface LoggerOptions {
   repositories?: Repositories;
   /** Test hook: capture lines instead of writing them. */
   destination?: NodeJS.WritableStream;
+  /**
+   * An observer of every persisted event.
+   *
+   * Used to mirror selected event codes to the runtime event trail and the Lark
+   * outbox. It is called *after* the secret scan, so a payload that was refused
+   * is never forwarded, and it is wrapped so a listener can never break logging.
+   */
+  onEvent?: (record: EventRecord) => void;
 }
 
 export interface EventRecord {
@@ -59,10 +67,16 @@ export interface EventRecord {
 export class Logger {
   private readonly pino: PinoLogger;
   private readonly repositories?: Repositories;
+  private readonly onEvent?: (record: EventRecord) => void;
 
-  private constructor(pinoInstance: PinoLogger, repositories?: Repositories) {
+  private constructor(
+    pinoInstance: PinoLogger,
+    repositories?: Repositories,
+    onEvent?: (record: EventRecord) => void,
+  ) {
     this.pino = pinoInstance;
     this.repositories = repositories;
+    this.onEvent = onEvent;
   }
 
   static create(options: LoggerOptions): Logger {
@@ -76,12 +90,12 @@ export class Logger {
       },
       options.destination,
     );
-    return new Logger(instance, options.repositories);
+    return new Logger(instance, options.repositories, options.onEvent);
   }
 
   /** A logger carrying extra bindings, sharing the same destinations. */
   child(bindings: Record<string, unknown>): Logger {
-    return new Logger(this.pino.child(bindings), this.repositories);
+    return new Logger(this.pino.child(bindings), this.repositories, this.onEvent);
   }
 
   trace(data: Record<string, unknown>, message: string): void {
@@ -128,7 +142,6 @@ export class Logger {
 
   /** Persist without logging, for events already surfaced elsewhere. */
   persist(record: EventRecord): void {
-    if (!this.repositories) return;
     const serialized = JSON.stringify(record.data ?? {});
     for (const pattern of SECRET_PATTERNS) {
       if (pattern.test(serialized)) {
@@ -139,14 +152,25 @@ export class Logger {
         return;
       }
     }
-    this.repositories.events.insert({
-      at: new Date().toISOString(),
-      level: record.level,
-      source: record.source,
-      code: record.code,
-      message: record.message,
-      data: serialized === '{}' ? null : serialized,
-    });
+    if (this.repositories) {
+      this.repositories.events.insert({
+        at: new Date().toISOString(),
+        level: record.level,
+        source: record.source,
+        code: record.code,
+        message: record.message,
+        data: serialized === '{}' ? null : serialized,
+      });
+    }
+    if (this.onEvent) {
+      // An observer must never be able to break logging: a throw here would
+      // otherwise turn a diagnostic into a crash.
+      try {
+        this.onEvent(record);
+      } catch {
+        /* the runtime event trail is best-effort; the log line already landed */
+      }
+    }
   }
 }
 

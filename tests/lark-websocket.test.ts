@@ -322,6 +322,7 @@ describe('the socket is an optional status channel, never a startup gate', () =>
       env: {
         // A configured Lark, so the stack really tries to open a socket.
         LARK_MODE: 'websocket',
+        LARK_WS_ENABLED: 'true',
         LARK_APP_ID: 'cli-test',
         LARK_APP_SECRET: 'secret-test',
         LARK_CHAT_ID: 'oc-test',
