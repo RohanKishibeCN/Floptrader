@@ -136,6 +136,17 @@ export interface ReaderOptions {
   externalOfferTakerEnabled?: boolean;
   /** Live mode tightens the `applied`/`for` boundaries in the verifier. */
   live?: boolean;
+  /**
+   * Run without the opening seed, which has left the price room's ring.
+   *
+   * Relaxes exactly one rule — the seed-before-price ordering — and nothing
+   * else. The pinned referee DID and the pinned package hash are still required
+   * before the reader is even constructed, `unpinnedPolicy` stays `reject`, and
+   * every post must still carry a valid room-bound signature from that referee.
+   * What replaces the seed is the late-start readiness gate, which demands a
+   * current, usable, pinned-referee price post before any trade is written.
+   */
+  lateStart?: boolean;
   now?: () => Date;
 }
 
@@ -409,6 +420,8 @@ export class OrchestratorReader {
    */
   private seedProvenance: SeedProvenance | null = null;
   private readonly expectedRefereeDid: string | null;
+  /** True when this reader runs without the opening seed by design. */
+  private readonly lateStart: boolean;
 
   constructor(options: ReaderOptions) {
     this.rules = options.rules;
@@ -421,17 +434,30 @@ export class OrchestratorReader {
     this.fixedRooms = roomsFor(options.rules);
 
     const requirePin = options.requireRefereePin === true;
+    this.lateStart = options.lateStart === true;
     this.expectedRefereeDid = options.expectedRefereeDid ?? null;
     this.verifier = new RefereeVerifier({
       rules: options.rules,
       logger: options.logger,
       expectedPackageHash: options.expectedPackageHash ?? null,
       expectedRefereeDid: options.expectedRefereeDid ?? null,
-      unpinnedPolicy: requirePin ? 'reject' : 'adopt_first_sender',
-      requireSeedBeforeState: requirePin,
+      // Never `adopt_first_sender` in a late start: the seed is exactly the post
+      // that would otherwise have fixed the referee's identity, so without it
+      // the pin has to come from the launch configuration or not at all.
+      unpinnedPolicy: requirePin || this.lateStart ? 'reject' : 'adopt_first_sender',
+      // The seed is a one-time post and its room's ring has rotated past it. The
+      // rule this drops is an *ordering* rule, not a trust rule, and the
+      // late-start gates replace it with an explicit, current price-post check.
+      requireSeedBeforeState: requirePin && !this.lateStart,
       maxReferenceAgeSeconds: options.maxReferenceAgeSeconds,
       staleReferenceMode: options.staleReferenceMode,
-      live: options.live === true,
+      // `live` makes a missing `applied` a conservative-mode finding. The
+      // official price post is not required to carry `applied`, so in a late
+      // start that would park the process in conservative mode for the whole
+      // contest. The guarantees it stands for — a band labelled with the right
+      // `for`, usable to price a live trade — are enforced by the late-start
+      // gate instead, which is stricter about them than the flag ever was.
+      live: options.live === true && !this.lateStart,
     });
     // The page sizes, all clamped to the service's own ceiling. The trading room
     // gets its own pair because it is the one room that grows faster than a
@@ -912,6 +938,15 @@ export class OrchestratorReader {
     localAgentsInGap: string[];
     /** A local trade/offer/re-post message is stored inside the band. */
     localMessagesInGap: boolean;
+    /**
+     * The recorded loss band itself, as `{from,to}`, or null when there is none.
+     *
+     * Exposed so a caller can ask a question about *its own* rows — a trade seq
+     * inside the band — rather than inheriting the registration-shaped answer
+     * above. A late start must not be held by a registration that fell in an old
+     * band, but a trade in one is a different matter.
+     */
+    band: { from: number; to: number } | null;
   } {
     const room = this.tradingRoomName;
     const status = this.roomReader.readerThroughputFor(room);
@@ -964,6 +999,7 @@ export class OrchestratorReader {
       localSeqsInGap,
       localAgentsInGap,
       localMessagesInGap,
+      band: from === null || to === null || to < from ? null : { from, to },
     };
   }
 
@@ -1238,6 +1274,32 @@ export class OrchestratorReader {
   /** True once a seed has been accepted, from the rooms or from the bootstrap. */
   get seedVerified(): boolean {
     return this.verifier.state.seedSeen;
+  }
+
+  /** True when this reader was started in the seedless participation mode. */
+  get isLateStart(): boolean {
+    return this.lateStart;
+  }
+
+  /**
+   * True only when the whole history was replayed *from the seed*.
+   *
+   * Never true in a late start, and never claimed: a seedless start has no
+   * beginning to replay from, and reporting it as a full replay is exactly the
+   * confusion this flag exists to prevent.
+   */
+  get historicalReplayComplete(): boolean {
+    return this.hydrated && this.verifier.state.seedSeen;
+  }
+
+  /**
+   * True when the seed has left the retained ring and cannot be recovered.
+   *
+   * Not an error and not a failure: it is the honest description of a start
+   * that cannot reach the opening. The current price post is still usable.
+   */
+  get historicalReplayUnavailable(): boolean {
+    return this.lateStart && !this.verifier.state.seedSeen;
   }
 
   /** The accepted seed's provenance, for the report. Never the text. */

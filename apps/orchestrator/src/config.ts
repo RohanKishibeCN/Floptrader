@@ -70,6 +70,35 @@ export const EnvSchema = z.object({
    */
   FLOP_ALLOW_TRADING: boolish.default(false),
 
+  // ---- late-start full participation --------------------------------------
+  /**
+   * Run without the opening seed, which has left `d-close1-price`'s ring.
+   *
+   * The official seed is a one-time post. A process that starts after the
+   * room's retained history has rotated past it can never read it, so the
+   * strict mode — which requires the seed before it will believe a price — can
+   * never participate. This mode replaces that one requirement with a different
+   * one, and with nothing weaker: the referee DID and the package hash must
+   * both come from the reviewed launch configuration, every post must carry a
+   * valid room-bound signature from that pinned referee, and a *current* price
+   * post with a usable band must be held before a trade may be written.
+   *
+   * It is a separate confirmation on purpose. It is never opened by
+   * `FLOP_MODE=live` alone, never opens by itself, and never widens any other
+   * gate. Three switches, all off by default.
+   */
+  LATE_START_MODE: boolish.default(false),
+  /** Must equal this literal for `LATE_START_MODE` to take effect. */
+  LATE_START_CONFIRM: z.string().default(''),
+  /**
+   * A second, late-start-specific switch for writing trades.
+   *
+   * `FLOP_ALLOW_TRADING` alone is not enough here: the whole point of the mode
+   * is to be deliberate about a seedless start, so a trade needs both this and
+   * `FLOP_ALLOW_TRADING`. Off by default.
+   */
+  LATE_START_ALLOW_TRADING: boolish.default(false),
+
   // ---- close call ---------------------------------------------------------
   SEASON: z.literal('close-1').default('close-1'),
   TRADING_ROOM: z.string().default('close1'),
@@ -434,6 +463,22 @@ export interface Config {
   allowTrading: boolean;
   /** Live *and* explicitly allowed to trade. The only flag the trade path reads. */
   tradingArmed: boolean;
+  /**
+   * `LATE_START_MODE=true`, whatever else is set. Kept separate from
+   * `lateStartArmed` so `/status` can say "asked for, and why not".
+   */
+  lateStartRequested: boolean;
+  /** The seedless participation mode is fully confirmed and in force. */
+  lateStartArmed: boolean;
+  /** Why the mode is not in force, or null. Never a startup error. */
+  lateStartBlockedReason: string | null;
+  /**
+   * May a trade be written *in late-start mode*.
+   *
+   * Needs `lateStartArmed` **and** `FLOP_ALLOW_TRADING` **and**
+   * `LATE_START_ALLOW_TRADING`. Arming the mode is never enough on its own.
+   */
+  lateStartTradingArmed: boolean;
   season: 'close-1';
   tradingRoom: string;
   contestJsonPath: string;
@@ -620,6 +665,10 @@ export class ConfigError extends Error {
 /** The only DID shape this build accepts for a pinned identity. */
 export const DID_KEY_PATTERN = /^did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
+/** The exact string `LATE_START_CONFIRM` must equal for the mode to arm. */
+export const LATE_START_CONFIRM_VALUE = 'close-1-late-start';
+/** Only one sweep of freshness is promised; two is the widest tolerated gap. */
+export const LATE_START_MAX_STALE_SWEEPS = 2;
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const parsed = EnvSchema.safeParse(env);
@@ -709,6 +758,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       'FLOP_ALLOW_TRADING=true requires FLOP_MODE=live and FLOP_LIVE_CONFIRM=close-1',
     );
   }
+
+  // ---- late-start: requested, armed, and *why not* -------------------------
+  //
+  // A half-configured late start is not a startup error: the process keeps
+  // running as an ordinary dry run, refuses to post anything, and reports the
+  // missing switch. Refusing to boot would leave an operator with no status
+  // page to read, which is the opposite of what "explicitly confirmed" is for.
+  const lateStartRequested = raw.LATE_START_MODE;
+  const lateStartBlockedReason: string | null = !lateStartRequested
+    ? null
+    : raw.LATE_START_CONFIRM !== LATE_START_CONFIRM_VALUE
+      ? `LATE_START_CONFIRM must equal ${LATE_START_CONFIRM_VALUE}`
+      : !liveArmed
+        ? 'late-start requires FLOP_MODE=live and FLOP_LIVE_CONFIRM=close-1'
+        : null;
+  const lateStartArmed = lateStartRequested && lateStartBlockedReason === null;
+  // Both switches, on purpose: arming the mode must never be enough to write a
+  // trade. See LATE_START_ALLOW_TRADING.
+  const lateStartTradingArmed =
+    lateStartArmed && raw.FLOP_ALLOW_TRADING && raw.LATE_START_ALLOW_TRADING;
 
   const expectedRefereeDid = raw.EXPECTED_REFEREE_DID.trim();
   if (expectedRefereeDid.length > 0 && !DID_KEY_PATTERN.test(expectedRefereeDid)) {
@@ -824,6 +893,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     allowRegistration: raw.FLOP_ALLOW_REGISTRATION,
     allowTrading: raw.FLOP_ALLOW_TRADING,
     tradingArmed: liveArmed && raw.FLOP_ALLOW_TRADING,
+    lateStartRequested,
+    lateStartArmed,
+    lateStartBlockedReason,
+    lateStartTradingArmed,
     season: raw.SEASON,
     tradingRoom: raw.TRADING_ROOM,
     contestJsonPath: raw.CONTEST_JSON_PATH,

@@ -118,8 +118,15 @@ export class FakeReferee {
     });
   }
 
-  /** A price post. Limits default to ±5% of `px`, rounded to the cent. */
-  price(sweep: number, px: string, limits?: [string, string]): RoomMessageLike {
+  /**
+   * A price post. Limits default to ±5% of `px`, rounded to the cent.
+   *
+   * `forSweep` is the sweep the band applies to. The official post labels it, and
+   * a live trade may only be priced from a band whose `for` names the next sweep,
+   * so a late-start test passes it explicitly. Omitting it models the unlabelled
+   * post, which stays read-only.
+   */
+  price(sweep: number, px: string, limits?: [string, string], forSweep?: number): RoomMessageLike {
     const centre = Number.parseFloat(px);
     const low = limits?.[0] ?? (centre * 0.95).toFixed(2);
     const high = limits?.[1] ?? (centre * 1.05).toFixed(2);
@@ -129,6 +136,7 @@ export class FakeReferee {
       n: sweep,
       ref: { px, time: '2026-09-28T12:00:00Z', tid: `t${sweep}` },
       limits: [low, high],
+      ...(forSweep === undefined ? {} : { for: forSweep }),
     });
   }
 

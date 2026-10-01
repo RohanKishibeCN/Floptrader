@@ -600,8 +600,36 @@ export async function createRuntime(
     dynamicReadConcurrency: config.roomDiscovery.dynamicReadConcurrency,
     externalOfferTakerEnabled: config.externalOfferTakerEnabled,
     live: config.mode === 'live',
+    // The seedless participation mode. It does not relax the pin: the referee DID
+    // and the package hash must still both be fixed at launch, and every post is
+    // still signature-checked against them. It only removes the requirement that
+    // the *opening* seed be recoverable, which a late start cannot satisfy.
+    lateStart: config.lateStartArmed,
     now,
   });
+
+  // Say which posture we are in, and — when the mode was asked for but did not
+  // arm — exactly which switch is missing. A half-configured late start keeps
+  // running as a dry run; this line is how the operator learns why.
+  if (config.lateStartRequested || config.lateStartArmed) {
+    logger.event({
+      level: config.lateStartBlockedReason === null ? 'info' : 'warn',
+      source: 'main',
+      code: config.lateStartArmed ? 'late_start_armed' : 'late_start_blocked',
+      message:
+        config.lateStartBlockedReason === null
+          ? `late-start participation is armed (trading ${config.lateStartTradingArmed ? 'on' : 'off'})`
+          : `LATE_START_MODE was requested but did not arm: ${config.lateStartBlockedReason}`,
+      data: {
+        requested: config.lateStartRequested,
+        armed: config.lateStartArmed,
+        tradingArmed: config.lateStartTradingArmed,
+        blockedReason: config.lateStartBlockedReason,
+        allowRegistration: config.allowRegistration,
+        allowTrading: config.allowTrading,
+      },
+    });
+  }
 
   // The official seed lives in `d-close1-price` and the room's retained ring does
   // not reach back to the opening, so a late start has to be given the signed

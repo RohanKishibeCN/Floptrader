@@ -277,6 +277,19 @@ export class RefereeVerifier {
     return this.seedRoom;
   }
 
+  /**
+   * When the referee last posted something this verifier accepted.
+   *
+   * The referee posts once per sweep in each of its rooms, so "how long since
+   * the last accepted post" is the age of the *feed*, as distinct from
+   * `ageSeconds`, which is the age of the underlying market data the referee is
+   * quoting. A seedless late start gates new risk on the first; the second is
+   * the referee's own staleness signal and is reported separately.
+   */
+  get lastAcceptedPostAt(): string | null {
+    return this.lastPostAt;
+  }
+
   /** The snapshot the strategy layer consumes. */
   snapshot(now: Date = new Date()): MarketSnapshot {
     const locked = this.currentSweep !== null && isLocked(this.rules, this.currentSweep);

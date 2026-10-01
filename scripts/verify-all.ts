@@ -62,7 +62,7 @@ import {
   snapshotPermanentCounts,
 } from '@flop/storage';
 import { PINNED_PATHS, comparePackageHash, decideOnDrift, pinnedFromManifest, sha256Hex } from '@flop/technocore';
-import { loadConfig } from '../apps/orchestrator/src/config.js';
+import { LATE_START_CONFIRM_VALUE, loadConfig } from '../apps/orchestrator/src/config.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const referenceDir = join(root, 'reference');
@@ -322,6 +322,80 @@ await check('live mode requires confirmation, registration and a pinned referee'
   assert(!byDefault.liveArmed, 'the default configuration armed live trading');
   assert(byDefault.mode === 'dry-run', `the default mode is ${byDefault.mode}`);
   return 'default dry-run; live needs FLOP_MODE + FLOP_LIVE_CONFIRM + FLOP_ALLOW_REGISTRATION + a pinned referee + a package pin';
+});
+
+/**
+ * The seedless participation mode is a second, separate commitment.
+ *
+ * It is printed under its own name so a release log can be grepped for it. The
+ * properties asserted are the ones an accidental arming would violate: off by
+ * default, never armed by `FLOP_MODE=live` alone, armed only by its own
+ * confirmation literal, and never able to trade on the mode switch alone.
+ */
+await check('late start needs its own confirmation and a second trading switch', () => {
+  const refereeDid = didFromSeed(newSeed());
+  const packageHash = sha256Hex(referenceFile('manifest.json'));
+  const live = (overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv =>
+    ({
+      FLOP_MODE: 'live',
+      FLOP_LIVE_CONFIRM: 'close-1',
+      FLOP_ALLOW_REGISTRATION: 'true',
+      EXPECTED_REFEREE_DID: refereeDid,
+      EXPECTED_PACKAGE_HASH: packageHash,
+      REQUIRE_REFEREE_PIN: 'true',
+      ...overrides,
+    }) as NodeJS.ProcessEnv;
+
+  const byDefault = loadConfig({} as NodeJS.ProcessEnv);
+  assert(!byDefault.lateStartRequested, 'the default configuration requested the late-start mode');
+
+  // Live and fully pinned is still not late-start: the two are separate modes.
+  const plainLive = loadConfig(live({}));
+  assert(plainLive.liveArmed, 'the pinned live config did not arm');
+  assert(!plainLive.lateStartArmed, 'FLOP_MODE=live alone armed the late-start mode');
+
+  // Requested with the wrong literal, or outside live, does not arm — and does
+  // not throw either: the process keeps running as a dry run and reports why.
+  const wrongLiteral = loadConfig(live({ LATE_START_MODE: 'true', LATE_START_CONFIRM: 'yes' }));
+  assert(!wrongLiteral.lateStartArmed, 'a wrong LATE_START_CONFIRM armed the mode');
+  assert(
+    wrongLiteral.lateStartBlockedReason?.includes(LATE_START_CONFIRM_VALUE) === true,
+    `the blocked reason does not name the literal: ${wrongLiteral.lateStartBlockedReason}`,
+  );
+
+  const outsideLive = loadConfig({
+    LATE_START_MODE: 'true',
+    LATE_START_CONFIRM: LATE_START_CONFIRM_VALUE,
+  } as NodeJS.ProcessEnv);
+  assert(!outsideLive.lateStartArmed, 'the late-start mode armed outside live');
+
+  // Armed: registration is on, trading is not, until its own switch is thrown.
+  const registrationOnly = loadConfig(
+    live({ LATE_START_MODE: 'true', LATE_START_CONFIRM: LATE_START_CONFIRM_VALUE }),
+  );
+  assert(registrationOnly.lateStartArmed, 'the confirmed late-start mode did not arm');
+  assert(!registrationOnly.lateStartTradingArmed, 'the mode switch alone armed late-start trading');
+
+  const trading = loadConfig(
+    live({
+      LATE_START_MODE: 'true',
+      LATE_START_CONFIRM: LATE_START_CONFIRM_VALUE,
+      FLOP_ALLOW_TRADING: 'true',
+      LATE_START_ALLOW_TRADING: 'true',
+    }),
+  );
+  assert(trading.lateStartTradingArmed, 'both trading switches did not arm late-start trading');
+
+  const oneSwitch = loadConfig(
+    live({
+      LATE_START_MODE: 'true',
+      LATE_START_CONFIRM: LATE_START_CONFIRM_VALUE,
+      FLOP_ALLOW_TRADING: 'true',
+    }),
+  );
+  assert(!oneSwitch.lateStartTradingArmed, 'FLOP_ALLOW_TRADING alone armed late-start trading');
+
+  return `default off; live alone does not arm it; LATE_START_CONFIRM=${LATE_START_CONFIRM_VALUE} arms registration, both trading switches arm trading`;
 });
 
 /**

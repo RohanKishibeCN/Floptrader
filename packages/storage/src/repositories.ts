@@ -323,6 +323,48 @@ export class ParticipationRepository {
   }
 
   /**
+   * The three registration layers, counted separately.
+   *
+   * They are different facts and are never collapsed: a POST the service
+   * acknowledged, a room that echoed our exact bytes, and the referee naming our
+   * DID in a flow's mints. `mintUncertain` is not a failure — a sweep whose flow
+   * was omitted entirely leaves its mints unknown, which is recorded and
+   * reported, never turned into a zero.
+   */
+  outcomeCounts(): {
+    total: number;
+    postAcked: number;
+    roomEchoConfirmed: number;
+    mintConfirmed: number;
+    mintUncertain: number;
+  } {
+    const row = this.db
+      .prepare(
+        `SELECT
+           COUNT(*) AS total,
+           SUM(CASE WHEN technocore_seq IS NOT NULL THEN 1 ELSE 0 END) AS postAcked,
+           SUM(CASE WHEN readback_at IS NOT NULL THEN 1 ELSE 0 END) AS roomEchoConfirmed,
+           SUM(CASE WHEN flow_evidence_at IS NOT NULL THEN 1 ELSE 0 END) AS mintConfirmed,
+           SUM(CASE WHEN status = 'mint_unknown' THEN 1 ELSE 0 END) AS mintUncertain
+         FROM participation_records`,
+      )
+      .get() as {
+      total: number;
+      postAcked: number | null;
+      roomEchoConfirmed: number | null;
+      mintConfirmed: number | null;
+      mintUncertain: number | null;
+    };
+    return {
+      total: row.total,
+      postAcked: row.postAcked ?? 0,
+      roomEchoConfirmed: row.roomEchoConfirmed ?? 0,
+      mintConfirmed: row.mintConfirmed ?? 0,
+      mintUncertain: row.mintUncertain ?? 0,
+    };
+  }
+
+  /**
    * Our own posted seqs in a room, so a gap can be checked against them.
    *
    * This is the local half of the coverage question: a band that brackets one of
@@ -1326,6 +1368,10 @@ export class TradeRepository {
     return { inSweep, afterLock };
   }
 
+  all(): TradeRow[] {
+    return this.db.prepare('SELECT * FROM trades ORDER BY created_at, id').all() as TradeRow[];
+  }
+
   count(): number {
     return (this.db.prepare('SELECT COUNT(*) AS n FROM trades').get() as { n: number }).n;
   }
@@ -1349,6 +1395,162 @@ export class TradeRepository {
         .prepare("SELECT id FROM trades WHERE status IN ('settled','void')")
         .all() as Array<{ id: string }>
     ).map((row) => row.id);
+  }
+
+  /**
+   * The trading layers, counted separately.
+   *
+   * `attempts` counts every row we recorded, refusals included — a refusal is an
+   * attempt that did not become a trade, not a missing one. `posted` is what
+   * reached the book locally, `echoConfirmed` what the room acknowledged with a
+   * seq, `settled` what the referee ruled on, and `unknown` what is written but
+   * has no verdict yet. A room's seq is not a settlement, and the two are never
+   * added together.
+   */
+  outcomeCounts(): {
+    attempts: number;
+    posted: number;
+    echoConfirmed: number;
+    settled: number;
+    unknown: number;
+  } {
+    const row = this.db
+      .prepare(
+        `SELECT
+           COUNT(*) AS attempts,
+           SUM(CASE WHEN status IN ('pending','settled','void') THEN 1 ELSE 0 END) AS posted,
+           SUM(CASE WHEN seq IS NOT NULL AND status IN ('pending','settled','void')
+                    THEN 1 ELSE 0 END) AS echoConfirmed,
+           SUM(CASE WHEN status = 'settled' THEN 1 ELSE 0 END) AS settled,
+           SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS unknown
+         FROM trades`,
+      )
+      .get() as {
+      attempts: number;
+      posted: number | null;
+      echoConfirmed: number | null;
+      settled: number | null;
+      unknown: number | null;
+    };
+    return {
+      attempts: row.attempts,
+      posted: row.posted ?? 0,
+      echoConfirmed: row.echoConfirmed ?? 0,
+      settled: row.settled ?? 0,
+      unknown: row.unknown ?? 0,
+    };
+  }
+
+  /**
+   * How many trade ids this pair has already spent.
+   *
+   * Counts only the copies that reached the book or were reported `missed`:
+   * a `refused` attempt never had one, so it does not consume a generation and a
+   * retry can reuse its id. The count is what makes a re-issued participation
+   * trade land on a *fresh* id — a missed trade id may already have been read.
+   */
+  pairGenerations(makerDid: string, takerDid: string): number {
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM trades WHERE maker_did = ? AND taker_did = ?
+            AND status IN ('pending','settled','void','missed')`,
+        )
+        .get(makerDid, takerDid) as { n: number }
+    ).n;
+  }
+
+  /**
+   * Our own trade seqs that provably fall inside a recorded `close1` loss band.
+   *
+   * A public gap is a coverage fact. A gap that brackets a *trade of ours* is a
+   * fact about our own record — the referee may have read it, may not have, and
+   * re-posting it under the same id would risk settling one trade twice. This is
+   * the one gap consequence a late start must still treat as fatal.
+   */
+  seqsInBand(from: number, to: number): number[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT seq FROM trades WHERE seq IS NOT NULL AND seq >= ? AND seq <= ?
+            ORDER BY seq`,
+        )
+        .all(from, to) as Array<{ seq: number }>
+    ).map((row) => row.seq);
+  }
+
+  /**
+   * A local trade the referee reported `missed` whose fate is still unresolved.
+   *
+   * The repost queue is the record of "the referee never read this". A row left
+   * `pending` or `failed` is a trade of ours we have neither re-issued nor
+   * deliberately set aside; `posted` and `skipped` are both resolved. Only a
+   * late-start run reads this — in the strict mode a `missed` trade is re-posted
+   * verbatim and resolves on its own.
+   */
+  hasUnresolvedMissed(): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 FROM repost_queue WHERE message_kind = 'trade'
+            AND status IN ('pending','failed') LIMIT 1`,
+        )
+        .get() !== undefined
+    );
+  }
+
+  /**
+   * Whether this DID already has a trade that reached the referee's book.
+   *
+   * `pending` (written, not yet ruled on), `settled` and `void` all count: the
+   * first two are participation, and a `void` is a trade the referee *saw* and
+   * ruled on. `missed` and `refused` do not — neither ever reached the book, so
+   * neither can stand in for the participation trade a late start owes an agent.
+   */
+  hasEffectiveTradeForDid(did: string): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 FROM trades WHERE (maker_did = ? OR taker_did = ?)
+            AND status IN ('pending','settled','void') LIMIT 1`,
+        )
+        .get(did, did) !== undefined
+    );
+  }
+
+  /**
+   * Rewrite a local trade that never took effect, so it can be retried.
+   *
+   * Restricted to `refused`, `dry_run` and `failed`: a `pending`, `settled` or
+   * `void` row is a fact about the referee's room and is never rewritten by a
+   * local retry. Returns false when the row exists but is not rewritable.
+   */
+  updateUnposted(row: TradeRow): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE trades SET px = @px, qty = @qty, until_sweep = @until_sweep, side = @side,
+           maker_sig = @maker_sig, taker_sig = @taker_sig, status = @status, reason = @reason,
+           seq = @seq, posted_sweep = @posted_sweep, agent_id = @agent_id,
+           counter_agent_id = @counter_agent_id, updated_at = @updated_at
+         WHERE id = @id AND status IN ('refused','dry_run','failed')`,
+      )
+      .run({
+        id: row.id,
+        px: row.px,
+        qty: row.qty,
+        until_sweep: row.until_sweep,
+        side: row.side,
+        maker_sig: row.maker_sig,
+        taker_sig: row.taker_sig ?? null,
+        status: row.status,
+        reason: row.reason ?? null,
+        seq: row.seq ?? null,
+        posted_sweep: row.posted_sweep ?? null,
+        agent_id: row.agent_id ?? null,
+        counter_agent_id: row.counter_agent_id ?? null,
+        updated_at: nowIso(),
+      });
+    return info.changes > 0;
   }
 }
 

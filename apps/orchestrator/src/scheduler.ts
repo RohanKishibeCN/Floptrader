@@ -34,6 +34,7 @@
  *     flow leaves its mints unknown; that is recorded as `mint_unknown` and the
  *     reader goes conservative. Nothing here may ever downgrade it to `failed`.
  */
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import {
@@ -56,7 +57,13 @@ import {
 } from '@flop/close-call';
 import type { AgentKeyStore } from '@flop/identity';
 import { STRATEGY_GROUPS, signRoomMessage } from '@flop/identity';
-import type { ParticipationRow, ParticipationStatus, Repositories, SqliteDatabase } from '@flop/storage';
+import type {
+  ParticipationRow,
+  ParticipationStatus,
+  Repositories,
+  SqliteDatabase,
+  TradeRow,
+} from '@flop/storage';
 import { fileBytes } from '@flop/storage';
 import {
   GroupRunner,
@@ -75,6 +82,7 @@ import type {
   TechnocoreClient,
 } from '@flop/technocore';
 import type { ArchiveMaintenance } from './archive-maintenance.js';
+import { LATE_START_MAX_STALE_SWEEPS } from './config.js';
 import type { Config } from './config.js';
 import type { DeepSeekBudget, DeepSeekScheduler, ParameterOptimiser } from './llm.js';
 import { localDateKey } from './llm.js';
@@ -84,6 +92,11 @@ import type { LoadGuard, LoadTier } from './load-guard.js';
 import type { Logger } from './logger.js';
 import type { Close1Coverage, OrchestratorReader, ReaderStatus } from './reader.js';
 import {
+  lateStartFeedBlockerReasons,
+  lateStartFeedReadiness,
+  lateStartRegistrationReadiness,
+  lateStartTradingReadiness,
+  marketSnapshotReadiness,
   refereeFeedBlockerReasons,
   refereeFeedReadiness,
   registrationReadiness,
@@ -134,6 +147,32 @@ function advanceStatus(
 function localPostRequestId(room: string, did: string, nonce: string): string {
   return `${room}|${did}|${nonce}`;
 }
+
+/**
+ * The id of a participation trade: deterministic in the pair and the sweep.
+ *
+ * A trade id settles at most once, so the id must be reproducible: a retry of
+ * the same pair in the same sweep has to collide with the first attempt rather
+ * than create a second trade. `generation` is what separates a *retry* from a
+ * *re-issue*: a refused attempt keeps generation 0 and reuses its id, while a
+ * trade the referee reported missed moves to the next generation and therefore
+ * to a fresh id — which is what the rules require, because the original may
+ * already have been read as another sweep's copy.
+ */
+function participationTradeId(
+  makerDid: string,
+  takerDid: string,
+  forSweep: number,
+  generation: number,
+): string {
+  const digest = createHash('sha256')
+    .update(`${makerDid}|${takerDid}|${forSweep}|${generation}`, 'utf8')
+    .digest('hex');
+  return `pl${digest.slice(0, 24)}`;
+}
+
+/** The trade statuses a local retry may rewrite in place: none ever took effect. */
+const REWRITABLE_TRADE_STATUS: ReadonlySet<string> = new Set(['refused', 'dry_run', 'failed']);
 
 /**
  * How long a background task may run before the tick gives up on it.
@@ -252,6 +291,13 @@ export interface TickReport {
   participation: ParticipationOutcome;
   runs: { agents: number; candidates: number; failures: number };
   trades: { dryRun: number; posted: number; refused: number };
+  /**
+   * The late-start participation fallback, separately from the strategy's own
+   * trades. The pairing is deterministic, so "posted 75" is the whole fleet
+   * participating rather than a market event, and the two counts must never be
+   * read as one.
+   */
+  participationTrades: { pairs: number; posted: number; skipped: number; refused: number };
   repost: { queued: number; posted: number; failed: number; skipped: number };
   watchdog: { ran: boolean; backfilled: number };
   lark: { delivered: string[]; maintenance: boolean };
@@ -303,6 +349,77 @@ export interface StatusSnapshot {
   seedSource: string | null;
   /** True once a seed has been accepted, whichever way it arrived. */
   seedVerified: boolean;
+  /**
+   * Whether the contest record was replayed from its opening seed.
+   *
+   * False in a late start, and *never* set to true to make a seedless run look
+   * complete: the whole point of the mode is that it participates on a different
+   * anchor — the pinned referee's current, signed price post — and the two must
+   * stay distinguishable in the payload.
+   */
+  historicalReplayComplete: boolean;
+  /** True when a late start is running without the seed it cannot reach. */
+  historicalReplayUnavailable: boolean;
+  /** The launch configuration pins both the referee DID and the package hash. */
+  launchPinVerified: boolean;
+  /** `LATE_START_MODE` confirmed and in force. */
+  lateStartMode: boolean;
+  /** The seedless feed gate: identity, signature and pin, without the seed. */
+  lateStartFeedReady: boolean;
+  /** A current, signed, well-formed price post that may price a new trade. */
+  marketSnapshotReady: boolean;
+  /** The sweep the current published limits apply to — the price post's `for`. */
+  tradeUntilSweep: number | null;
+  /** Why `LATE_START_MODE` did not take effect, or null when it is not a factor. */
+  lateStartBlockedReason: string | null;
+  /** The late-start trading gate. Distinct from the strict `readiness.tradingReady`. */
+  lateStartTradingReady: boolean;
+  /** The first reason a late-start trade is refused, or null when none is. */
+  tradeBlockedReason: string | null;
+  /**
+   * The three registration layers, kept apart on purpose.
+   *
+   * A POST the service acknowledged is not a room echo, and a room echo is not a
+   * mint: the referee's own flow is the only thing that says it minted. Counting
+   * them together is how "150 posted" comes to be read as "150 funded".
+   */
+  registration: {
+    total: number;
+    postAcked: number;
+    roomEchoConfirmed: number;
+    mintConfirmed: number;
+    mintUncertain: number;
+  };
+  /**
+   * The trading layers, kept apart on purpose.
+   *
+   * A room seq is not a settlement. `tradeUnknown` is written-but-unruled and is
+   * never folded into `tradeSettled`.
+   */
+  trading: {
+    eligibleAgents: number;
+    tradeAttempts: number;
+    tradePosted: number;
+    tradeEchoConfirmed: number;
+    tradeSettled: number;
+    tradeUnknown: number;
+  };
+  /**
+   * The audit view of the contest record, alongside the trading view above.
+   *
+   * It reports what a late start cannot claim — a replayed history — and what it
+   * still holds. It is never a precondition of the trading view: an audit that
+   * cannot be completed is reported, not used to refuse a legal trade.
+   */
+  lateStartAudit: {
+    room: string;
+    coverage: Close1Coverage;
+    gaps: number;
+    firstSeq: number | null;
+    lastSeq: number | null;
+    generation: number | null;
+    historicalReplayComplete: boolean;
+  };
   agents: {
     total: number;
     enabled: number;
@@ -383,7 +500,7 @@ export interface StatusSnapshot {
     tradingReady: boolean;
   };
   /** Which operating posture the process is in, derived from the arming flags. */
-  operatingMode: 'dry_run' | 'live_registration_only' | 'live_trading';
+  operatingMode: OperatingMode;
   /**
    * The three readiness gates, strongest last.
    *
@@ -521,7 +638,7 @@ export interface ReaderReport {
   };
   exportRecovery: ExportRecoveryStats;
   unresolvedGapRooms: string[];
-  operatingMode: 'dry_run' | 'live_registration_only' | 'live_trading';
+  operatingMode: OperatingMode;
   close1Coverage: Close1Coverage;
   registrationPolicy: { allowWithClose1Gap: boolean };
   tradingPolicy: {
@@ -541,7 +658,66 @@ export interface ReaderReport {
     registrationReasons: string[];
     tradingReasons: string[];
   };
+  /**
+   * The seedless participation view, alongside the strict gates above.
+   *
+   * Carried on the field-acceptance report as well as `/status` so an operator on
+   * a VPS can answer "is the late start participating, and if not why" from the
+   * same document that carries the reader's throughput.
+   */
+  lateStart: {
+    mode: boolean;
+    blockedReason: string | null;
+    feedReady: boolean;
+    marketSnapshotReady: boolean;
+    launchPinVerified: boolean;
+    seedVerified: boolean;
+    historicalReplayComplete: boolean;
+    historicalReplayUnavailable: boolean;
+    currentSweep: number | null;
+    tradeUntilSweep: number | null;
+    reference: string | null;
+    limits: { low: string; high: string } | null;
+    registration: StatusSnapshot['registration'];
+    trading: StatusSnapshot['trading'];
+    tradingReady: boolean;
+    tradeBlockedReason: string | null;
+    audit: StatusSnapshot['lateStartAudit'];
+  };
   serverContract: ServerContractProbe | null;
+}
+
+/**
+ * The five postures the process can be in.
+ *
+ * `late_start_*` is deliberately not folded into `live_trading` /
+ * `live_registration_only`: the difference the operator has to see is *what the
+ * feed is trusted for*, and a seedless start is trusted for something narrower.
+ */
+export type OperatingMode =
+  | 'dry_run'
+  | 'live_registration_only'
+  | 'live_trading'
+  | 'late_start_registration_only'
+  | 'late_start_full_participation';
+
+/**
+ * The seedless participation gates, computed in every mode.
+ *
+ * `feed` / `registration` / `trading` are the *effective* gates when the mode is
+ * armed. When it is not, they are still computed and still honest — they simply
+ * have `late-start mode is not armed` as their first reason, which is what makes
+ * `/status` able to say "asked for, and here is exactly what is missing".
+ */
+export interface LateStartGates {
+  feed: Readiness;
+  registration: Readiness;
+  trading: Readiness;
+  marketSnapshot: Readiness;
+  /** The launch configuration pins both the referee DID and the package hash. */
+  launchPinVerified: boolean;
+  /** Something signed by the pinned referee has been accepted. */
+  refereeSeen: boolean;
 }
 
 export interface SchedulerOptions {
@@ -825,6 +1001,9 @@ export class OrchestratorScheduler {
     const runOutcome = this.runAgentSlices();
     this.recordRunStats(runOutcome.outcomes.map((outcome) => outcome.agentId));
     const trades = await this.executeActions(runOutcome.outcomes);
+    // The participation fallback runs *after* the strategy, so an agent the
+    // strategy already traded for is skipped rather than given a second trade.
+    const participationTrades = await this.ensureParticipationTrades();
 
     // reconcile repost queue (RecoveryService)
     const repost = await this.reconcileReposts();
@@ -857,6 +1036,7 @@ export class OrchestratorScheduler {
         failures: runOutcome.failures.length,
       },
       trades,
+      participationTrades,
       repost,
       watchdog: background.watchdog,
       lark: background.lark,
@@ -1193,6 +1373,25 @@ export class OrchestratorScheduler {
     }
 
     // 3. Post anything that has not been seen on the room yet.
+    //
+    // A late start that was asked for and did not arm is held here rather than at
+    // the live gate: its confirmations are missing, so nothing it wrote would be
+    // trustworthy, and it must not become a live process by looking like one.
+    if (this.lateStartMisconfigured) {
+      this.logger.event({
+        level: 'error',
+        source: 'scheduler',
+        code: 'late_start_not_armed',
+        message:
+          'LATE_START_MODE was requested but did not arm; owner registrations are held: ' +
+          `${this.config.lateStartBlockedReason ?? 'unknown reason'}`,
+        data: {
+          blockedReason: this.config.lateStartBlockedReason,
+          allowRegistration: this.config.allowRegistration,
+        },
+      });
+      return outcome;
+    }
     if (!this.config.allowRegistration) {
       this.logger.event({
         level: 'info',
@@ -1218,11 +1417,21 @@ export class OrchestratorScheduler {
     // posting one is noise at best and a forged-referee exposure at worst.
     if (this.config.liveArmed) {
       const gates = this.readiness();
+      // A late start is asked a different question, and `registration` already
+      // carries it: the late-start registration gate nests the late-start feed
+      // gate, whose first clause is the pin rather than the seed. Consulting the
+      // strict gate here instead would demand a seed a late start cannot reach,
+      // and the 150 registrations would be held forever.
+      const blocked = this.config.lateStartArmed
+        ? !gates.registration.ready
+        : !gates.refereeFeed.ready || !gates.registration.ready;
       // The feed gate and the registration gate are named separately: the referee
       // can be perfectly provable while our own write lane is not, and an operator
       // needs to know which of the two is holding the 150 registrations.
-      if (!gates.refereeFeed.ready || !gates.registration.ready) {
-        const reasons = [...gates.refereeFeed.reasons, ...gates.registration.reasons];
+      if (blocked) {
+        const reasons = this.config.lateStartArmed
+          ? [...gates.registration.reasons]
+          : [...gates.refereeFeed.reasons, ...gates.registration.reasons];
         this.logger.event({
           level: 'error',
           source: 'scheduler',
@@ -1748,6 +1957,41 @@ export class OrchestratorScheduler {
         continue;
       }
 
+      // A late start never re-posts a missed trade verbatim. A trade id settles
+      // at most once, so re-sending the same id is the one way a local ledger and
+      // the referee's could disagree — the original may already have been read
+      // under a sweep the summary did not show. The row is recorded as
+      // deliberately set aside, the original stops counting as participation, and
+      // the fallback re-issues the pair under a fresh id at the next sweep.
+      if (message.kind === 'trade' && this.config.lateStartArmed) {
+        const setAside = this.repositories.reposts.enqueue({
+          original_room: room,
+          original_seq: seq,
+          agent_id: agentId,
+          did,
+          message_kind: 'trade',
+          trade_id: tradeId,
+          original_text: message.text,
+          reason: 'late_start_reissue_required',
+          status: 'skipped',
+        });
+        if (tradeId !== null) {
+          const trade = this.repositories.trades.get(tradeId);
+          if (trade !== undefined && trade.status !== 'settled' && trade.status !== 'void') {
+            this.repositories.trades.updateStatus(tradeId, 'missed', 'referee_missed');
+          }
+        }
+        this.logger.event({
+          level: 'warn',
+          source: 'scheduler',
+          code: 'late_start_trade_missed',
+          message: `the referee missed trade ${tradeId ?? '(unparsed)'} at ${room}#${seq}; it will be re-issued under a new id`,
+          data: { room, seq, tradeId, agentId, originalNonce: message.nonce },
+        });
+        if (setAside) queued += 1;
+        continue;
+      }
+
       const accepted = this.repositories.reposts.enqueue({
         original_room: room,
         original_seq: seq,
@@ -1786,7 +2030,11 @@ export class OrchestratorScheduler {
    */
   private runAgentSlices(): { outcomes: RunOutcome[]; failures: Array<{ agentId: string; error: string }> } {
     const snapshot = this.reader.snapshot();
-    const offers = this.reader.externalOffers();
+    // A late start does not take strangers' offers. Counting on an unknown
+    // counterparty's collateral is the one risk this mode has no way to bound —
+    // it cannot see the history that would tell it whether the maker is funded —
+    // so the only offers an agent answers are the ones the fleet drives itself.
+    const offers = this.config.lateStartArmed ? [] : this.reader.externalOffers();
     const perGroup = Math.max(1, this.config.scheduling.agentsPerTick);
     const inputs = STRATEGY_GROUPS.flatMap((group) => {
       const agents = this.repositories.identities
@@ -1875,6 +2123,210 @@ export class OrchestratorScheduler {
   // -------------------------------------------------------------------------
 
   /**
+   * The participation trade: one small matched trade per agent, once.
+   *
+   * This serves presence, not score. Every one of the 150 owners should end the
+   * contest with at least one trade the referee actually ruled on, and the
+   * deterministic strategy cannot promise that: a flat market, a risk cap or a
+   * shed tier can each leave an agent with nothing to do. So a late start pairs
+   * the fleet into 75 fixed couples and writes one legal trade each.
+   *
+   * Everything is derived from the referee's *current* post and nothing else —
+   * the price from the published band, `until` from the band's own `for` sweep,
+   * the quantity from the rules' minimum — so the trade is bounded by exactly
+   * what the referee said, not by a local reconstruction of it. It is written
+   * only while the late-start trading gate is satisfied, and the `trades` ledger
+   * — not a counter — is what makes it at-most-once per agent.
+   */
+  private async ensureParticipationTrades(): Promise<{
+    pairs: number;
+    posted: number;
+    skipped: number;
+    refused: number;
+  }> {
+    const result = { pairs: 0, posted: 0, skipped: 0, refused: 0 };
+    // Only a late start owes this fallback. The strict mode has a replayed
+    // history and its own strategy path; it is not handed a second, blunter one.
+    if (!this.config.lateStartTradingArmed) return result;
+    if (this.loadGuard.state.paused.readsOnly) return result;
+
+    const snapshot = this.reader.snapshot();
+    const limits = snapshot.nextLimits;
+    const forSweep = snapshot.limitsForSweep;
+    // Without `for` there is no sweep for `until` to bind to, and a band the
+    // verifier marked unusable may not price a live trade. Both are recorded and
+    // reported; neither is a licence to guess.
+    if (limits === null || forSweep === null || snapshot.limitsUsable === false) return result;
+    if (snapshot.locked) return result;
+
+    // The same gate the strategy path obeys, so the two can never disagree about
+    // whether a trade may be written. A refusal here is not an error: `/status`
+    // names the reason, and the fallback simply runs again on the next tick.
+    const gates = this.readiness();
+    if (!gates.lateStart.feed.ready || !gates.lateStart.marketSnapshot.ready) return result;
+
+    const px = this.participationPrice(limits);
+    if (px === null) return result;
+    const qty = this.rules.minQty;
+
+    const agents = [...this.keyStore.agentIds].sort();
+    for (let i = 0; i + 1 < agents.length; i += 2) {
+      const makerAgentId = agents[i]!;
+      const takerAgentId = agents[i + 1]!;
+      result.pairs += 1;
+      const makerDid = this.keyStore.did(makerAgentId);
+      const takerDid = this.keyStore.did(takerAgentId);
+      if (makerDid === takerDid) {
+        result.skipped += 1;
+        continue;
+      }
+      // Registration first, structurally and not incidentally: a trade written
+      // before both owners are on the register would settle against an account
+      // the referee has not minted yet. `technocore_seq` is the room's own
+      // acknowledgement, which is what makes the registration real.
+      const registered = [makerAgentId, takerAgentId].every((id) => {
+        const row = this.repositories.participation.get(id);
+        return row !== undefined && row.technocore_seq !== null;
+      });
+      if (!registered) {
+        result.skipped += 1;
+        continue;
+      }
+      // One participation trade per agent, ever. The ledger answers this, so a
+      // restart cannot double it and a later sweep cannot repeat it.
+      if (
+        this.repositories.trades.hasEffectiveTradeForDid(makerDid) ||
+        this.repositories.trades.hasEffectiveTradeForDid(takerDid)
+      ) {
+        result.skipped += 1;
+        continue;
+      }
+      // A missed copy has already spent its id, so the re-issue moves to the
+      // next generation; a refused one never spent one, so it retries its own.
+      const id = participationTradeId(
+        makerDid,
+        takerDid,
+        forSweep,
+        this.repositories.trades.pairGenerations(makerDid, takerDid),
+      );
+      const existing = this.repositories.trades.get(id);
+      if (existing !== undefined && !REWRITABLE_TRADE_STATUS.has(existing.status)) {
+        result.skipped += 1;
+        continue;
+      }
+
+      let terms: TradeTerms;
+      let signed: SignedTrade;
+      try {
+        terms = buildTerms({
+          id,
+          maker: makerDid,
+          side: 'buy',
+          qty,
+          px,
+          until: forSweep,
+          taker: takerDid,
+        });
+        signed = this.keyStore.withSeed(makerAgentId, (makerSeed) =>
+          this.keyStore.withSeed(takerAgentId, (takerSeed) =>
+            // Both halves in one call: the maker signs the terms and the taker
+            // signs the accept payload, so the message carries a countersigned
+            // pair rather than an open offer nobody answered.
+            signTrade({ terms, taker: takerDid, makerSeed, takerSeed }),
+          ),
+        );
+      } catch (error) {
+        result.refused += 1;
+        this.logger.event({
+          level: 'error',
+          source: 'scheduler',
+          code: 'participation_trade_unbuildable',
+          message: `could not build the participation trade for ${makerAgentId}/${takerAgentId}`,
+          data: {
+            makerAgentId,
+            takerAgentId,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        });
+        continue;
+      }
+
+      const write = await this.writer.postTrade(makerAgentId, this.rules.tradingRoom, signed.text);
+      const row: TradeRow = {
+        id,
+        season: this.rules.season,
+        maker_did: makerDid,
+        taker_did: takerDid,
+        side: 'buy',
+        qty: terms.qty,
+        px: terms.px,
+        until_sweep: terms.until,
+        maker_sig: signed.maker_sig,
+        taker_sig: signed.taker_sig,
+        status: write.ok ? 'pending' : 'refused',
+        reason: write.ok ? null : (write.reason ?? 'write_failed'),
+        room: this.rules.tradingRoom,
+        seq: write.seq ?? null,
+        agent_id: makerAgentId,
+        counter_agent_id: takerAgentId,
+        posted_sweep: snapshot.sweep,
+        local_funds_side: this.localFundsSide(terms, makerDid),
+        funds_side_confidence: 'local_inference',
+      };
+      if (!this.repositories.trades.insert(row)) {
+        // The row exists but never took effect — a previous `refused`. Rewriting
+        // it in place keeps the pair on one id rather than leaking a new one.
+        this.repositories.trades.updateUnposted(row);
+      }
+      if (write.ok) {
+        result.posted += 1;
+        this.logger.event({
+          level: 'info',
+          source: 'scheduler',
+          code: 'participation_trade_posted',
+          message: `posted the participation trade for ${makerAgentId} and ${takerAgentId}`,
+          data: {
+            makerAgentId,
+            takerAgentId,
+            tradeId: id,
+            px: terms.px,
+            qty: terms.qty,
+            until: terms.until,
+            seq: write.seq ?? null,
+          },
+        });
+      } else {
+        result.refused += 1;
+        this.logger.event({
+          level: 'warn',
+          source: 'scheduler',
+          code: 'participation_trade_refused',
+          message: `the participation trade for ${makerAgentId}/${takerAgentId} was refused`,
+          data: { makerAgentId, takerAgentId, tradeId: id, reason: row.reason },
+        });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * The price a participation trade is written at: the middle of the band.
+   *
+   * The published band is the only price surface that is authoritative, and its
+   * midpoint is inside it by construction — so the trade the referee is asked to
+   * settle cannot be refused for sitting outside limits. Quantised to the two
+   * decimals the wire allows, then clamped back inside the band for the one case
+   * where quantising could push it over: a band narrower than a cent.
+   */
+  private participationPrice(limits: { low: Decimal; high: Decimal }): Decimal | null {
+    if (!limits.low.gt(0) || !limits.high.gt(0) || !limits.low.lt(limits.high)) return null;
+    const mid = limits.low.add(limits.high).div(2).quantize(2);
+    if (mid.lt(limits.low)) return limits.low;
+    if (mid.gt(limits.high)) return limits.high;
+    return mid;
+  }
+
+  /**
    * Turn this tick's candidate actions into (at most) one posted trade each.
    *
    * In dry-run mode the full path runs — validation, caps, signing — and the
@@ -1942,8 +2394,18 @@ export class OrchestratorScheduler {
           result.refused += 1;
           continue;
         }
-        if (!this.config.liveArmed) {
-          this.recordTrade(agentId, terms, 'dry_run', 'dry_run', signed.maker_sig, signed.taker_sig);
+        // A requested-but-unarmed late start is a dry run for the same reason a
+        // dry-run process is: the anchor that would make a live trade meaningful
+        // is not in place, so the trade is recorded and not posted.
+        if (!this.config.liveArmed || this.lateStartMisconfigured) {
+          this.recordTrade(
+            agentId,
+            terms,
+            'dry_run',
+            this.lateStartMisconfigured ? 'late_start_not_armed' : 'dry_run',
+            signed.maker_sig,
+            signed.taker_sig,
+          );
           result.dryRun += 1;
           continue;
         }
@@ -2092,7 +2554,14 @@ export class OrchestratorScheduler {
   /** Terms for a proposal, in canonical decimal form, or null when impossible. */
   private buildTermsFor(did: string, action: GatedAction, snapshot: MarketSnapshot): TradeTerms | null {
     if (action.side === null || action.px === null || action.qty === null) return null;
-    const until = Math.min(snapshot.sweep + DEFAULT_TRADE_HORIZON_SWEEPS, this.rules.lockSweep);
+    // A late start prices its trades from the band the referee published for one
+    // specific sweep, so `until` is that band's own `for`: the price we were
+    // bounded by is the price that holds for the trade's whole life. The local
+    // horizon is the strict mode's rule, and it is kept there.
+    const until =
+      this.config.lateStartArmed && snapshot.limitsUsable !== false && snapshot.limitsForSweep !== null
+        ? Math.min(snapshot.limitsForSweep, this.rules.lockSweep)
+        : Math.min(snapshot.sweep + DEFAULT_TRADE_HORIZON_SWEEPS, this.rules.lockSweep);
     if (until <= snapshot.sweep) return null;
     const px = action.px;
     // The referee's published band is authoritative; the local ±5% window is the
@@ -2361,7 +2830,12 @@ export class OrchestratorScheduler {
    * how a trade slips through after the referee room was recreated. `status()`
    * computes it once and shares the answer with the trade and registration paths.
    */
-  private readiness(): { refereeFeed: Readiness; registration: Readiness; trading: Readiness } {
+  private readiness(): {
+    refereeFeed: Readiness;
+    registration: Readiness;
+    trading: Readiness;
+    lateStart: LateStartGates;
+  } {
     const verifier = this.reader.verifier.state;
     const readerStatus = this.reader.readerStatus();
     const gaps = this.reader.gaps();
@@ -2473,7 +2947,142 @@ export class OrchestratorScheduler {
       allowTradingWithClose1Gap: this.config.technoCore.allowTradingWithClose1Gap,
       manualOverride: this.config.technoCore.tradingOverride,
     });
-    return { refereeFeed, registration, trading };
+
+    // ---- late start: a second, parallel set of gates ------------------------
+    //
+    // Reported always, armed or not, so `/status` can answer "is the mode on,
+    // and if not, what is it missing" without the operator reading the unit
+    // file. `refereeFeed` above stays the *strict* gate in every mode: it is
+    // the honest answer to "was the contest replayed from its seed", and a late
+    // start does not get to relabel it.
+    const launchPinVerified =
+      this.config.expectedPackageHash !== null &&
+      this.config.expectedRefereeDid !== null &&
+      this.config.requireRefereePin;
+    const refereeSeen = this.reader.verifier.lastAcceptedPostAt !== null;
+    const lateStartFeedInputs = {
+      lateStartArmed: this.config.lateStartArmed,
+      readerContinuous: readerStatus.continuousMode,
+      readerRunning: readerStatus.running,
+      refereeRoomCount: readerStatus.fixedRoomCount - (coverage.mode === null ? 0 : 1),
+      expectedRefereeRoomCount: refereeRooms.length,
+      // Only a gap that is still open can be hiding the price post the next
+      // sweep needs. A loss recorded before the late start is audit history, and
+      // `/status.lateStart.audit` reports it without holding participation.
+      refereeRoomsWithUnresolvedGap: readerStatus.unresolvedGapRooms.filter((room) =>
+        refereeSet.has(room),
+      ),
+      refereeRoomsReset: gaps.resets.filter((room) => refereeSet.has(room)),
+      launchPinVerified,
+      refereeDid: verifier.refereeDid,
+      expectedRefereeDid: this.config.expectedRefereeDid,
+      refereeFeedBlockers: lateStartFeedBlockerReasons(verifier.conservativeReasons),
+      refereeSeen,
+    } as const;
+    const lateStartFeed = lateStartFeedReadiness(lateStartFeedInputs);
+    const lateStartRegistration = lateStartRegistrationReadiness({
+      ...lateStartFeedInputs,
+      allowRegistration: this.config.allowRegistration,
+      fleetComplete,
+      writerHealthy: writesAllowed,
+      nonceStoreUsable: writesAllowed,
+    });
+    const marketSnapshot = marketSnapshotReadiness({
+      refereeSeen,
+      sweep: verifier.currentSweep,
+      reference: verifier.reference?.toString() ?? null,
+      limits:
+        verifier.limits === null
+          ? null
+          : { low: verifier.limits.low.toString(), high: verifier.limits.high.toString() },
+      limitsForSweep: verifier.limitsForSweep,
+      limitsUsable: verifier.limitsUsable,
+      locked: verifier.locked,
+      secondsSinceLastPost: this.secondsSinceRefereePost(),
+      sweepSeconds: this.rules.sweepSeconds,
+      maxStaleSweeps: LATE_START_MAX_STALE_SWEEPS,
+    });
+    const lateStartTrading = lateStartTradingReadiness({
+      lateStartFeed,
+      tradingArmed: this.config.lateStartTradingArmed,
+      marketSnapshot,
+      loadAllowsNewOffer: this.loadGuard.allow('new_offer'),
+      writerHealthy: writesAllowed,
+      nonceStoreUsable: writesAllowed,
+      packageDrift: Number(this.repositories.upstream.getPin()?.drift ?? 0) === 1,
+      fleetComplete,
+      localTradeUnresolved: this.repositories.trades.hasUnresolvedMissed(),
+      // Deliberately *trades only*. `coverage.localMessagesInGap` is derived from
+      // our owner registrations, and a late start's registration may sit in an old
+      // band the ring has already rotated past. Holding every future trade on
+      // that would be the audit view refusing the trading view — exactly the
+      // coupling a late start exists to break. A *trade* in the band is different:
+      // it may have been read, and re-issuing it risks a double settlement.
+      localMessageInGap:
+        coverage.band === null
+          ? false
+          : this.repositories.trades.seqsInBand(coverage.band.from, coverage.band.to).length > 0,
+    });
+
+    // In late-start mode the *effective* registration and trading answers come
+    // from the late-start gates; the strict feed gate keeps its own meaning.
+    if (this.config.lateStartArmed) {
+      return {
+        refereeFeed,
+        registration: lateStartRegistration,
+        trading: lateStartTrading,
+        lateStart: {
+          feed: lateStartFeed,
+          registration: lateStartRegistration,
+          trading: lateStartTrading,
+          marketSnapshot,
+          launchPinVerified,
+          refereeSeen,
+        },
+      };
+    }
+    return {
+      refereeFeed,
+      registration,
+      trading,
+      lateStart: {
+        feed: lateStartFeed,
+        registration: lateStartRegistration,
+        trading: lateStartTrading,
+        marketSnapshot,
+        launchPinVerified,
+        refereeSeen,
+      },
+    };
+  }
+
+  /**
+   * True when the operator asked for a late start that did not arm.
+   *
+   * Such a process must not write anything. Its anchor — the confirmations that
+   * make a seedless start trustworthy — is incomplete, so a registration or a
+   * trade it posted would rest on a guarantee nobody made. It keeps reading,
+   * evaluating and reporting, and `/status.lateStartBlockedReason` says which
+   * switch is missing.
+   */
+  private get lateStartMisconfigured(): boolean {
+    return this.config.lateStartRequested && !this.config.lateStartArmed;
+  }
+
+  /**
+   * How long since the referee last posted anything this verifier accepted.
+   *
+   * `null` when nothing has been accepted yet. The reader's own clock is used,
+   * so a stored history that was replayed at startup ages from the *message*,
+   * which is the honest reading: a feed that went quiet before we restarted is
+   * still quiet.
+   */
+  private secondsSinceRefereePost(): number | null {
+    const last = this.reader.verifier.lastAcceptedPostAt;
+    if (last === null) return null;
+    const at = Date.parse(last);
+    if (Number.isNaN(at)) return null;
+    return Math.max(0, (this.now().getTime() - at) / 1000);
   }
 
   /**
@@ -2482,7 +3091,20 @@ export class OrchestratorScheduler {
    * Derived from the arming flags, never from the calendar: a deadline is not an
    * operator, and "the contest is nearly over" must not be able to move this.
    */
-  private operatingMode(): 'dry_run' | 'live_registration_only' | 'live_trading' {
+  private operatingMode(): OperatingMode {
+    // Late-start is its own posture, never a variant of `live_trading`: an
+    // operator reading `/status` must be able to tell "we are trading on a
+    // replayed history that begins at the seed" from "we are participating from
+    // a late start", because the two are trusted for different reasons.
+    //
+    // A late start that was *asked for* and did not arm is a dry run: it posts
+    // nothing, and it must not look armed while it waits for a missing switch.
+    if (this.lateStartMisconfigured) return 'dry_run';
+    if (this.config.lateStartArmed) {
+      return this.config.lateStartTradingArmed
+        ? 'late_start_full_participation'
+        : 'late_start_registration_only';
+    }
     if (!this.config.liveArmed) return 'dry_run';
     return this.config.tradingArmed ? 'live_trading' : 'live_registration_only';
   }
@@ -2507,6 +3129,7 @@ export class OrchestratorScheduler {
     const memory = process.memoryUsage();
     const uptimeSeconds = Math.max(1, (Date.now() - this.startedAt) / 1000);
     const cursorGaps = this.reader.gaps();
+    const tradingRoomCursor = this.repositories.roomCursors.get(this.rules.tradingRoom);
     const readerStatus = this.reader.readerStatus();
     // The close1 policy surface: the room's coverage classification, our own seqs
     // that provably fell in the band, and the 150/150 readback progress. Computed
@@ -2527,6 +3150,7 @@ export class OrchestratorScheduler {
     const localInferred = this.repositories.trades.countLocalInference();
 
     const sweeps = this.repositories.trades.sweepCounts(verifier.currentSweep, this.rules.lockSweep);
+    const tradeOutcomes = this.repositories.trades.outcomeCounts();
 
     return {
       at: at.toISOString(),
@@ -2555,6 +3179,41 @@ export class OrchestratorScheduler {
       expectedRefereeDid: this.config.expectedRefereeDid,
       seedSource: this.reader.seedSource,
       seedVerified: this.reader.seedVerified,
+      historicalReplayComplete: this.reader.historicalReplayComplete,
+      historicalReplayUnavailable: this.reader.historicalReplayUnavailable,
+      launchPinVerified: readiness.lateStart.launchPinVerified,
+      lateStartMode: this.config.lateStartArmed,
+      lateStartFeedReady: readiness.lateStart.feed.ready,
+      marketSnapshotReady: readiness.lateStart.marketSnapshot.ready,
+      tradeUntilSweep: verifier.limitsForSweep,
+      lateStartBlockedReason: this.config.lateStartBlockedReason,
+      lateStartTradingReady: readiness.lateStart.trading.ready,
+      tradeBlockedReason:
+        this.config.lateStartArmed && !readiness.lateStart.trading.ready
+          ? (readiness.lateStart.trading.reasons[0] ?? null)
+          : readiness.trading.ready
+            ? null
+            : (readiness.trading.reasons[0] ?? null),
+      registration: this.repositories.participation.outcomeCounts(),
+      trading: {
+        eligibleAgents: this.keyStore.size,
+        tradeAttempts: tradeOutcomes.attempts,
+        tradePosted: tradeOutcomes.posted,
+        tradeEchoConfirmed: tradeOutcomes.echoConfirmed,
+        tradeSettled: tradeOutcomes.settled,
+        tradeUnknown: tradeOutcomes.unknown,
+      },
+      lateStartAudit: {
+        room: this.rules.tradingRoom,
+        coverage: coverage.coverage,
+        gaps: cursorGaps.total,
+        firstSeq: tradingRoomCursor?.first_seq ?? null,
+        lastSeq: tradingRoomCursor?.last_seq ?? null,
+        generation: tradingRoomCursor?.generation ?? null,
+        // Deliberately the reader's own verdict, which is false without a seed.
+        // This is the audit view saying what it cannot claim, not a gate.
+        historicalReplayComplete: this.reader.historicalReplayComplete,
+      },
       agents: {
         total: this.keyStore.size,
         enabled: identities.filter((row) => row.enabled === 1).length,
@@ -2767,6 +3426,25 @@ export class OrchestratorScheduler {
         refereeFeedReasons: readiness.refereeFeed.reasons,
         registrationReasons: readiness.registration.reasons,
         tradingReasons: readiness.trading.reasons,
+      },
+      lateStart: {
+        mode: status.lateStartMode,
+        blockedReason: status.lateStartBlockedReason,
+        feedReady: status.lateStartFeedReady,
+        marketSnapshotReady: status.marketSnapshotReady,
+        launchPinVerified: status.launchPinVerified,
+        seedVerified: status.seedVerified,
+        historicalReplayComplete: status.historicalReplayComplete,
+        historicalReplayUnavailable: status.historicalReplayUnavailable,
+        currentSweep: status.sweep,
+        tradeUntilSweep: status.tradeUntilSweep,
+        reference: status.reference,
+        limits: status.limits,
+        registration: status.registration,
+        trading: status.trading,
+        tradingReady: status.lateStartTradingReady,
+        tradeBlockedReason: status.tradeBlockedReason,
+        audit: status.lateStartAudit,
       },
       serverContract: reader.serverContract,
     };
@@ -3093,9 +3771,17 @@ export class OrchestratorScheduler {
           lines: [
             `total_agents: ${status.agents.total} · enabled: ${status.agents.enabled} · strategy failures: ${status.agents.failures}`,
             `groups: ${STRATEGY_GROUPS.map((group) => `${group}=${status.agents.byGroup[group] ?? 0}`).join(' ')}`,
-            `registration count: ${status.participation.total} · readback: ${status.participation.readback}`,
+            // `statuses` already carries the per-status counts, including the
+            // minted and unknown ones, so the two looser counts it used to sit
+            // beside are gone rather than repeated. The budget they free is what
+            // pays for the seedless posture: the mode, the two gates it is
+            // anchored on, what it does *not* claim, and the registration layers.
+            // The full block lives in `/status` and `/reader-report`.
             `statuses: ${participationStatuses}`,
-            `mint observed: ${status.participation.mint_observed ?? 0} · unknown: ${status.participation.mint_unknown ?? 0}`,
+            `ls: ${status.operatingMode} pin=${status.launchPinVerified} feed=${status.lateStartFeedReady}` +
+              ` snap=${status.marketSnapshotReady} seed=${status.seedVerified} replay=${status.historicalReplayComplete}` +
+              ` reg=${status.registration.postAcked}/${status.registration.roomEchoConfirmed}/${status.registration.mintConfirmed}/${status.registration.mintUncertain}` +
+              (status.lateStartBlockedReason === null ? '' : ` blocked=${status.lateStartBlockedReason}`),
           ],
         },
         {

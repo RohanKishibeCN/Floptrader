@@ -424,6 +424,109 @@ Lark report prints the two as separate lines —
 `official reason: funds official side: unknown local inferred side: … confidence:
 local_inference`.
 
+## Late start: participating without the opening seed
+
+The official seed is a **one-time** post in `d-close1-price`. A process that
+starts after the room's retained ring has rotated past it can never read it, and
+the strict mode refuses to believe a price before it has replayed the history
+from that seed — so such a process could neither register nor trade, which is
+the whole contest. Late-start mode replaces that *one* requirement with a
+different anchor: the pinned referee's **current**, signed price post.
+
+It does not relax the trust boundary. `EXPECTED_REFEREE_DID` and
+`EXPECTED_PACKAGE_HASH` must both be set, `REQUIRE_REFEREE_PIN=true`,
+`adopt_first_sender` is still refused, and every room-bound signature is still
+verified against the pin. What it drops is the demand that the history begin at
+the seed.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `LATE_START_MODE` | `false` | Ask for the seedless participation mode |
+| `LATE_START_CONFIRM` | *(empty)* | Must be exactly `close-1-late-start` |
+| `LATE_START_ALLOW_TRADING` | `false` | Second switch, on top of `FLOP_ALLOW_TRADING` |
+
+A half-configured late start is **not** a startup error: it keeps running as a
+dry run, writes nothing at all, and `/status.lateStartBlockedReason` names the
+missing switch. `FLOP_MODE=live` alone never arms it, and trading needs *both*
+trading switches — arming the mode must never be enough to write a trade.
+
+### Staged rollout
+
+```bash
+# 1. dry run — prove the fleet, the rooms and the pin
+FLOP_MODE=dry-run LATE_START_MODE=false \
+FLOP_ALLOW_REGISTRATION=false FLOP_ALLOW_TRADING=false
+
+# 2. register + watch the market
+FLOP_MODE=live FLOP_LIVE_CONFIRM=close-1 \
+LATE_START_MODE=true LATE_START_CONFIRM=close-1-late-start \
+FLOP_ALLOW_REGISTRATION=true FLOP_ALLOW_TRADING=false
+
+# 3. trade
+LATE_START_ALLOW_TRADING=true FLOP_ALLOW_TRADING=true
+```
+
+Each step is a separate restart. The process never moves between them on its
+own, and it never falls back to unrestricted trading.
+
+### What has to hold
+
+**Registration** needs the pinned referee to have been *heard from* (not merely
+declared), the writer and SQLite healthy, a usable nonce store, the full
+150-agent fleet, and `FLOP_ALLOW_REGISTRATION=true`. It does **not** need
+`historicalReplayComplete`.
+
+**A new trade** needs the same feed gate plus a *current* price post that is
+signed by the pinned referee, carries a band that may price a live trade, and
+labels the next sweep with `for == n + 1`. That band's `for` is what the trade's
+`until` is bound to; a post with no `for`, one naming another sweep, one older
+than two sweep periods, an invalid band, a signature or DID mismatch, a package
+drift, a nonce store that is unusable, a load tier that blocks new offers, a
+lock, or a local trade reported `missed` all stop a new trade. None of them stop
+registration.
+
+**The lock is absolute**: after `lock_sweep` no owner registration and no trade
+is written, whatever else is healthy.
+
+### The participation trade
+
+Every one of the 150 owners should end the contest with at least one trade the
+referee actually ruled on, and the deterministic strategy cannot promise that. So
+once registration is on the room, a late start pairs the fleet in a fixed order
+into **75 couples** and writes one small matched trade per pair: `qty` at the
+rules' minimum, `px` at the **midpoint of the published band** (inside it by
+construction), `until` equal to the band's `for` sweep, and both halves signed —
+the maker over `close-1|terms|<terms>`, the taker over
+`close-1|accept|<terms>|<taker did>`. The pair's two DIDs are always distinct and
+always both ours. The `trades` ledger, not a counter, makes it at-most-once per
+agent, and the trade is written only after both owners' registrations have a
+room-acknowledged seq.
+
+A trade the referee reports `missed` is **never** re-posted verbatim: its id may
+already have been read. It is set aside (`repost_queue` row `skipped`, reason
+`late_start_reissue_required`) and re-issued on a **fresh** id at the next sweep.
+
+### Two views, never one
+
+`/status` and `/reader-report` carry both. The **trading view** is
+`lateStartFeedReady` + `marketSnapshotReady` + the current `reference`/`limits`/
+`tradeUntilSweep`. The **audit view** is `lateStartAudit` (coverage, gaps,
+`first_seq`/`last_seq`, generation) with `historicalReplayComplete=false` and
+`historicalReplayUnavailable=true` — the honest statement that no replay is
+claimed. The audit view is never a precondition of the trading view: an audit
+that cannot be completed is *reported*, not used to refuse a legal trade.
+
+The registration and trading layers are counted separately on purpose:
+
+* `registration.postAcked` — the POST the service acknowledged;
+* `registration.roomEchoConfirmed` — the room echoing our exact bytes;
+* `registration.mintConfirmed` — the referee naming our DID in a flow's mints;
+* `registration.mintUncertain` — a sweep whose flow was omitted, so its mints are
+  unknown. Never zero, never a failure.
+
+A room echo is not a mint, and a room's seq is not a settlement: `tradeSettled`
+only moves when the referee's own flow says so.
+
 ## Degradation ladder
 
 The box is shared. Each tier is entered by measurement, and leaving it is

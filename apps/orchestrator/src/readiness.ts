@@ -168,6 +168,271 @@ export function refereeFeedBlockerReasons(reasons: readonly string[]): string[] 
 }
 
 /**
+ * The conservative reasons a *seedless* start deliberately does not act on.
+ *
+ * A late start does not need a seed, so a seed-shaped message in the wrong room
+ * says nothing about whether the price we are reading is genuine — that is the
+ * pinned referee's signature, checked on every post. They are still recorded and
+ * still reported; they are simply not a reason to refuse to participate.
+ */
+const LATE_START_IGNORED_REASONS: ReadonlySet<string> = new Set([
+  'seed_required',
+  'seed_wrong_room',
+  'seed_rooms_mismatch',
+]);
+
+/** The feed facts that still stop a seedless start: identity, signature, pin. */
+export function lateStartFeedBlockerReasons(reasons: readonly string[]): string[] {
+  return reasons.filter(
+    (reason) => !LATE_START_IGNORED_REASONS.has(reason) && REFEREE_FEED_BLOCKERS.has(reason),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Late start: participation without the opening seed
+// ---------------------------------------------------------------------------
+
+export interface LateStartFeedReadinessInputs {
+  /** `LATE_START_MODE` confirmed and in force. */
+  lateStartArmed: boolean;
+  readerContinuous: boolean;
+  readerRunning: boolean;
+  refereeRoomCount: number;
+  expectedRefereeRoomCount: number;
+  /** New losses inside the referee rooms: we may be missing the current post. */
+  refereeRoomsWithUnresolvedGap: string[];
+  refereeRoomsReset: string[];
+  /**
+   * The reviewed launch configuration pins the referee DID *and* the package.
+   *
+   * With no seed, this pin is the whole trust anchor: it is what makes "only
+   * this DID, running only this package" answerable at all. Its absence is a
+   * refusal, never a prompt to adopt whatever posts first.
+   */
+  launchPinVerified: boolean;
+  refereeDid: string | null;
+  expectedRefereeDid: string | null;
+  /** Signature / DID / package refusals from the verifier. */
+  refereeFeedBlockers: string[];
+  /** At least one post from the pinned referee has been accepted. */
+  refereeSeen: boolean;
+}
+
+/**
+ * Is the referee feed provable *without* the opening seed?
+ *
+ * The strict gate asks "did we replay the contest from its seed". This one asks
+ * the only other question that can be answered from a late start: is every post
+ * we are acting on signed by the referee the launch record pinned, and are we
+ * reading the rooms right now. A recorded loss from before the late start is
+ * reported by the audit view and does not stop us — but a loss that is *still
+ * open* does, because it could be hiding the price post the next sweep needs.
+ */
+export function lateStartFeedReadiness(input: LateStartFeedReadinessInputs): Readiness {
+  const reasons: string[] = [];
+  if (!input.lateStartArmed) reasons.push('late-start mode is not armed');
+  if (!input.readerContinuous) {
+    reasons.push('continuous reader is off; the fixed rooms are not being read');
+  } else if (!input.readerRunning) {
+    reasons.push('continuous reader is not running');
+  }
+  if (input.refereeRoomCount !== input.expectedRefereeRoomCount) {
+    reasons.push(
+      `reader owns ${input.refereeRoomCount} referee rooms, expected ${input.expectedRefereeRoomCount}`,
+    );
+  }
+  if (input.refereeRoomsWithUnresolvedGap.length > 0) {
+    reasons.push(
+      `unresolved cursor gap in referee room(s) ${input.refereeRoomsWithUnresolvedGap.join(', ')}`,
+    );
+  }
+  if (input.refereeRoomsReset.length > 0) {
+    reasons.push(`referee room recreated: ${input.refereeRoomsReset.join(', ')}`);
+  }
+  if (!input.launchPinVerified) {
+    reasons.push(
+      'the launch configuration does not pin both EXPECTED_REFEREE_DID and EXPECTED_PACKAGE_HASH',
+    );
+  }
+  if (input.expectedRefereeDid === null) {
+    reasons.push('no referee DID pinned');
+  } else if (input.refereeDid === null) {
+    reasons.push('referee DID unknown');
+  } else if (input.refereeDid !== input.expectedRefereeDid) {
+    reasons.push(`referee DID is not the pinned one (${input.refereeDid})`);
+  }
+  // Narrowed here rather than trusting the caller: the seed-shaped refusals are
+  // exactly what a late start exists to drop, and a caller that passed the
+  // verifier's raw list must not be able to reintroduce them by accident.
+  for (const blocker of lateStartFeedBlockerReasons(input.refereeFeedBlockers)) {
+    reasons.push(`referee feed blocked: ${blocker}`);
+  }
+  if (!input.refereeSeen) reasons.push('no post from the pinned referee has been accepted yet');
+  return { ready: reasons.length === 0, reasons };
+}
+
+export interface LateStartRegistrationReadinessInputs extends LateStartFeedReadinessInputs {
+  /** `FLOP_ALLOW_REGISTRATION`. */
+  allowRegistration: boolean;
+  /** Every agent in the fleet is present and enabled: 5 groups of 30. */
+  fleetComplete: boolean;
+  /** The writer is accepting work and SQLite is writable. */
+  writerHealthy: boolean;
+  /** The nonce store is usable, so no registration can reuse a counter. */
+  nonceStoreUsable: boolean;
+}
+
+/**
+ * May this process post its owner registrations from a seedless start?
+ *
+ * The feed gate plus the write lane. `historicalReplayComplete` is deliberately
+ * *not* a clause: an owner registration is a fresh message with a fresh nonce,
+ * and the referee mints it at the next sweep. Nothing about it needs the
+ * opening price.
+ */
+export function lateStartRegistrationReadiness(
+  input: LateStartRegistrationReadinessInputs,
+): Readiness {
+  const reasons = [...lateStartFeedReadiness(input).reasons];
+  if (!input.allowRegistration) {
+    reasons.push('FLOP_ALLOW_REGISTRATION is off; owner registrations are not posted');
+  }
+  if (!input.fleetComplete) reasons.push('the agent fleet is not complete (150 agents, 5 groups of 30)');
+  if (!input.writerHealthy) reasons.push('the writer cannot accept a registration post');
+  if (!input.nonceStoreUsable) {
+    reasons.push('the nonce store is not usable; a duplicate registration is possible');
+  }
+  return { ready: reasons.length === 0, reasons };
+}
+
+export interface MarketSnapshotReadinessInputs {
+  /** The pinned referee has posted something this verifier accepted. */
+  refereeSeen: boolean;
+  sweep: number | null;
+  reference: string | null;
+  /** The band the referee published for the next sweep. */
+  limits: { low: string; high: string } | null;
+  /** The sweep that band applies to — the price post's `for`. */
+  limitsForSweep: number | null;
+  /** False when the posting carried no `for`, or one that names another sweep. */
+  limitsUsable: boolean;
+  locked: boolean;
+  /** Seconds since the referee last posted anything accepted. */
+  secondsSinceLastPost: number | null;
+  sweepSeconds: number;
+  /** The widest tolerated age of the newest post, in sweeps. */
+  maxStaleSweeps: number;
+}
+
+/**
+ * May a new trade be priced from what the referee has published *now*?
+ *
+ * This is the whole replacement for the seed in a late start: a price post that
+ * is signed by the pinned referee, carries a band for the very next sweep, and
+ * is recent enough that it still describes the contest. Every clause is about
+ * the current post — none of them is about the opening.
+ */
+export function marketSnapshotReadiness(input: MarketSnapshotReadinessInputs): Readiness {
+  const reasons: string[] = [];
+  if (!input.refereeSeen) {
+    reasons.push('no post from the pinned referee has been accepted yet');
+  }
+  if (input.locked) reasons.push('the contest is locked');
+  if (input.sweep === null) reasons.push('no current sweep from the referee feed');
+  if (input.reference === null) reasons.push('no reference price from the referee feed');
+  if (input.limits === null) {
+    reasons.push('no published limits from the referee feed');
+  } else {
+    const low = Number.parseFloat(input.limits.low);
+    const high = Number.parseFloat(input.limits.high);
+    if (!(low > 0) || !(high > 0) || !(low < high)) {
+      reasons.push(`the published band ${input.limits.low}..${input.limits.high} is not usable`);
+    }
+  }
+  if (!input.limitsUsable) {
+    reasons.push('the published limits may not price a live trade');
+  }
+  if (input.limitsForSweep === null) {
+    reasons.push('the published limits carry no `for` sweep');
+  } else if (input.sweep !== null && input.limitsForSweep !== input.sweep + 1) {
+    reasons.push(`the published limits are for sweep ${input.limitsForSweep}, not ${input.sweep + 1}`);
+  }
+  const window = Math.max(1, input.maxStaleSweeps) * Math.max(1, input.sweepSeconds);
+  if (input.secondsSinceLastPost === null) {
+    reasons.push('the referee feed carries no accepted post to age');
+  } else if (input.secondsSinceLastPost > window) {
+    reasons.push(
+      `the newest referee post is ${Math.round(input.secondsSinceLastPost)}s old, past the ${window}s window`,
+    );
+  }
+  return { ready: reasons.length === 0, reasons };
+}
+
+export interface LateStartTradingReadinessInputs {
+  /** The late-start feed gate, nested: the trust boundary cannot be skipped. */
+  lateStartFeed: Readiness;
+  /** `FLOP_ALLOW_TRADING` **and** `LATE_START_ALLOW_TRADING`. */
+  tradingArmed: boolean;
+  /** The current price post: sweep, reference, band, `for`, freshness. */
+  marketSnapshot: Readiness;
+  loadAllowsNewOffer: boolean;
+  writerHealthy: boolean;
+  nonceStoreUsable: boolean;
+  packageDrift: boolean;
+  fleetComplete: boolean;
+  /**
+   * One of our own trade messages was reported `missed` and could not be
+   * re-issued. A public gap is a coverage fact; this is a fact about our trade.
+   */
+  localTradeUnresolved: boolean;
+  /** A local trade, offer or re-post provably falls inside the close1 gap. */
+  localMessageInGap: boolean;
+}
+
+/**
+ * May a trade be written from a seedless late start?
+ *
+ * Strictly a superset of the feed gate, and deliberately *not* a relaxation of
+ * the strict trading gate — it is a different gate with a different anchor. The
+ * strict one anchors on a replayed history that begins at the seed; this one
+ * anchors on the pinned referee's current, signed, well-formed price post. The
+ * things the strict gate refuses that this one does not — a coverage gap in the
+ * public room, and a reference the referee itself calls old — are the things
+ * that cannot be repaired from a late start, and treating them as fatal is how
+ * a process ends up refusing to participate at all.
+ */
+export function lateStartTradingReadiness(input: LateStartTradingReadinessInputs): Readiness {
+  const reasons: string[] = [];
+  if (!input.lateStartFeed.ready) {
+    reasons.push(...input.lateStartFeed.reasons.map((reason) => `late-start feed: ${reason}`));
+  }
+  if (!input.tradingArmed) {
+    reasons.push(
+      'trading is not armed for late-start: FLOP_ALLOW_TRADING and LATE_START_ALLOW_TRADING must both be true',
+    );
+  }
+  if (!input.marketSnapshot.ready) {
+    reasons.push(...input.marketSnapshot.reasons.map((reason) => `market snapshot: ${reason}`));
+  }
+  if (input.localMessageInGap) {
+    reasons.push('a local trade, offer or re-post message provably falls inside the close1 gap');
+  }
+  if (input.localTradeUnresolved) {
+    reasons.push('a local trade was reported missed and has not been re-issued yet');
+  }
+  if (!input.writerHealthy) {
+    reasons.push('the writer cannot accept a trade or SQLite is unwritable');
+  }
+  if (!input.nonceStoreUsable) {
+    reasons.push('the nonce store is not usable; a trade could reuse a counter');
+  }
+  if (!input.loadAllowsNewOffer) reasons.push('load guard blocks new offers');
+  if (input.packageDrift) reasons.push('package hash drift');
+  if (!input.fleetComplete) reasons.push('the fleet is not complete');
+  return { ready: reasons.length === 0, reasons };
+}
+
+/**
  * Is the referee *feed* provable?
  *
  * Every clause is a fact, never an inference: a seed we accepted, a sender that
