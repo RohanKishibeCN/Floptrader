@@ -180,7 +180,34 @@ describe('the served /status contract', () => {
     expect(report).toHaveProperty('mode');
     expect(report).toHaveProperty('catchupState');
     expect(report).toHaveProperty('unresolvedGapRooms');
-    expect(report.readiness).toHaveProperty('tradingReasons');
+
+    // The three gates travel together and are named separately: an operator has
+    // to be able to tell "the referee is not provable" from "our own write lane
+    // is not", because the two need different repairs.
+    const readiness = report.readiness as Record<string, unknown>;
+    for (const field of ['refereeFeedReady', 'registrationReady', 'tradingReady']) {
+      expect(readiness).toHaveProperty(field);
+    }
+    for (const field of ['refereeFeedReasons', 'registrationReasons', 'tradingReasons']) {
+      expect(readiness).toHaveProperty(field);
+    }
+
+    // The `close1` policy surface: the coverage classification, both operator
+    // switches, our own seqs in the band and the readback progress.
+    expect(report).toHaveProperty('operatingMode');
+    expect(report).toHaveProperty('close1Coverage');
+    expect(report).toHaveProperty('localMessagesInGap');
+    expect(report).toHaveProperty('registrationPending');
+    expect(report).toHaveProperty('registrationReadback');
+    expect(report).toHaveProperty('tradeBlockedReason');
+    const registrationPolicy = report.registrationPolicy as Record<string, unknown>;
+    expect(registrationPolicy).toHaveProperty('allowWithClose1Gap');
+    const tradingPolicy = report.tradingPolicy as Record<string, unknown>;
+    expect(tradingPolicy).toHaveProperty('allowWithClose1Gap');
+    expect(tradingPolicy).toHaveProperty('override');
+    const readback = report.registrationReadback as Record<string, unknown>;
+    for (const field of ['completed', 'pending', 'total']) expect(readback).toHaveProperty(field);
+
     const config = report.effectiveConfig as Record<string, unknown>;
     expect(config.serverLimit).toBeGreaterThan(0);
     expect(config.close1GapPolicy).toBe('block');

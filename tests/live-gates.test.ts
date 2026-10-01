@@ -438,6 +438,11 @@ describe('the lock closes registration and trading', () => {
         attempts: 1,
         last_error: null,
         updated_at: at,
+        post_request_id: null,
+        message_hash: null,
+        post_sweep: null,
+        flow_evidence_at: null,
+        state_evidence_at: null,
       });
       repositories.participation.upsert({
         agent_id: neverTried,
@@ -457,6 +462,11 @@ describe('the lock closes registration and trading', () => {
         attempts: 0,
         last_error: null,
         updated_at: at,
+        post_request_id: null,
+        message_hash: null,
+        post_sweep: null,
+        flow_evidence_at: null,
+        state_evidence_at: null,
       });
 
       harness.referee.seedPost(HARNESS_PACKAGE_HASH);

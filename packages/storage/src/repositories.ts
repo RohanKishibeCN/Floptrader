@@ -209,6 +209,16 @@ export interface ParticipationRow {
   attempts: number;
   last_error: string | null;
   updated_at: string;
+  /** The POST's own request id, so a specific write can be reconciled later. */
+  post_request_id: string | null;
+  /** sha256 of the signed body we sent, so the echo can be matched byte for byte. */
+  message_hash: string | null;
+  /** The sweep the registration was posted in. */
+  post_sweep: number | null;
+  /** When the referee's flow evidence was seen to list this registration. */
+  flow_evidence_at: string | null;
+  /** When the referee's state evidence was seen to list this registration. */
+  state_evidence_at: string | null;
 }
 
 export class ParticipationRepository {
@@ -220,10 +230,12 @@ export class ParticipationRepository {
         `INSERT INTO participation_records (
            agent_id, did, season, registration_text, registration_nonce,
            registration_signature, room, technocore_seq, technocore_ts, posted_at,
-           readback_at, package_hash, referee_did, status, attempts, last_error, updated_at)
+           readback_at, package_hash, referee_did, status, attempts, last_error, updated_at,
+           post_request_id, message_hash, post_sweep, flow_evidence_at, state_evidence_at)
          VALUES (@agent_id, @did, @season, @registration_text, @registration_nonce,
            @registration_signature, @room, @technocore_seq, @technocore_ts, @posted_at,
-           @readback_at, @package_hash, @referee_did, @status, @attempts, @last_error, @updated_at)
+           @readback_at, @package_hash, @referee_did, @status, @attempts, @last_error, @updated_at,
+           @post_request_id, @message_hash, @post_sweep, @flow_evidence_at, @state_evidence_at)
          ON CONFLICT(agent_id) DO UPDATE SET
            technocore_seq = excluded.technocore_seq,
            technocore_ts = excluded.technocore_ts,
@@ -233,7 +245,12 @@ export class ParticipationRepository {
            status = excluded.status,
            attempts = excluded.attempts,
            last_error = excluded.last_error,
-           updated_at = excluded.updated_at`,
+           updated_at = excluded.updated_at,
+           post_request_id = COALESCE(excluded.post_request_id, participation_records.post_request_id),
+           message_hash = COALESCE(excluded.message_hash, participation_records.message_hash),
+           post_sweep = COALESCE(excluded.post_sweep, participation_records.post_sweep),
+           flow_evidence_at = COALESCE(excluded.flow_evidence_at, participation_records.flow_evidence_at),
+           state_evidence_at = COALESCE(excluded.state_evidence_at, participation_records.state_evidence_at)`,
       )
       .run(row);
   }
@@ -271,6 +288,65 @@ export class ParticipationRepository {
         )
         .get() as { n: number }
     ).n;
+  }
+
+  /**
+   * Registrations posted but never read back.
+   *
+   * `technocore_seq` is set from the POST's own reply, so a row here is a write
+   * the service accepted and the room has not yet echoed. It is the "pending"
+   * set an operator watches: a pending registration is not a failure, and it is
+   * not evidence of success either.
+   */
+  pendingReadback(): ParticipationRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM participation_records
+          WHERE technocore_seq IS NOT NULL AND readback_at IS NULL
+          ORDER BY agent_id`,
+      )
+      .all() as ParticipationRow[];
+  }
+
+  /** Readback progress, for the 150/150 gate and the report. */
+  readbackProgress(): { completed: number; pending: number; total: number } {
+    const row = this.db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN readback_at IS NOT NULL AND technocore_seq IS NOT NULL THEN 1 ELSE 0 END) AS completed,
+           SUM(CASE WHEN readback_at IS NULL THEN 1 ELSE 0 END) AS pending,
+           COUNT(*) AS total
+         FROM participation_records`,
+      )
+      .get() as { completed: number | null; pending: number | null; total: number };
+    return { completed: row.completed ?? 0, pending: row.pending ?? 0, total: row.total };
+  }
+
+  /**
+   * Our own posted seqs in a room, so a gap can be checked against them.
+   *
+   * This is the local half of the coverage question: a band that brackets one of
+   * these is a band that provably swallowed one of our own writes.
+   */
+  localSeqsInRoom(room: string): Array<{ agent_id: string; seq: number }> {
+    return this.db
+      .prepare(
+        `SELECT agent_id, technocore_seq AS seq FROM participation_records
+          WHERE room = ? AND technocore_seq IS NOT NULL
+          ORDER BY technocore_seq`,
+      )
+      .all(room) as Array<{ agent_id: string; seq: number }>;
+  }
+
+  /** Record that the referee's own evidence mentions a registration. */
+  markRefereeEvidence(agentId: string, kind: 'flow' | 'state', at: string): void {
+    const column = kind === 'flow' ? 'flow_evidence_at' : 'state_evidence_at';
+    this.db
+      .prepare(
+        `UPDATE participation_records SET ${column} = COALESCE(${column}, @at), updated_at = @at
+          WHERE agent_id = @agentId`,
+      )
+      .run({ agentId, at });
   }
 
   /** Agents that have no participation row at all. */

@@ -560,6 +560,25 @@ export const MIGRATIONS: Migration[] = [
       `ALTER TABLE room_cursors ADD COLUMN last_resolved_gap_to INTEGER`,
     ],
   },
+  {
+    version: 8,
+    name: 'local-message-index',
+    statements: [
+      // The local post index: one column per fact an operator needs to answer
+      // "could the close1 gap have swallowed *our* registration".
+      //
+      // A successful POST is not evidence that the referee received anything —
+      // the reply itself says so, and only a readback of our own signed record
+      // from the room does. These columns keep the two apart, and keep the
+      // request id and the message hash so a specific post can be reconciled
+      // against what the room actually served.
+      `ALTER TABLE participation_records ADD COLUMN post_request_id TEXT`,
+      `ALTER TABLE participation_records ADD COLUMN message_hash TEXT`,
+      `ALTER TABLE participation_records ADD COLUMN post_sweep INTEGER`,
+      `ALTER TABLE participation_records ADD COLUMN flow_evidence_at TEXT`,
+      `ALTER TABLE participation_records ADD COLUMN state_evidence_at TEXT`,
+    ],
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;

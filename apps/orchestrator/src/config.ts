@@ -207,6 +207,31 @@ export const EnvSchema = z.object({
    */
   EXPORT_RECOVERY_COOLDOWN_MS: intString(60_000),
 
+  /**
+   * May owner registrations be posted while `close1` carries a plain, public
+   * coverage gap that provably holds none of our own messages?
+   *
+   * Off by default in *both* dry-run and live. It never covers a gap that could
+   * hold one of our own registrations: that is a fact about our own record, and
+   * no switch may wave it through. Turning this on is what makes the difference
+   * between `LIVE_REGISTRATION_ONLY` being reachable and the process waiting for
+   * a 17-million-message public room to drain first.
+   */
+  ALLOW_REGISTRATION_WITH_CLOSE1_GAP: boolish.default(false),
+  /**
+   * May a trade be written while `close1` carries a plain coverage gap?
+   *
+   * Off by default, and setting it to `true` is *not* sufficient on its own: the
+   * trade stays blocked until a deliberate override is recorded with an operator
+   * identity, a reason and a time. A config value with no author is not a
+   * decision, and a deadline must never be able to write one by itself.
+   */
+  ALLOW_TRADING_WITH_CLOSE1_GAP: boolish.default(false),
+  /** The operator who recorded the override; empty means no override exists. */
+  TRADING_OVERRIDE_OPERATOR: z.string().default(''),
+  /** Why the override was recorded. Required with the operator. */
+  TRADING_OVERRIDE_REASON: z.string().default(''),
+
   // ---- deepseek -----------------------------------------------------------
   DEEPSEEK_BASE_URL: z.string().default('https://api.deepseek.com'),
   DEEPSEEK_API_KEY: z.string().default(''),
@@ -456,6 +481,18 @@ export interface Config {
      * reporting while trading stays refused. It never marks the room as covered.
      */
     close1GapPolicy: 'block' | 'degraded_readonly';
+    /** `ALLOW_REGISTRATION_WITH_CLOSE1_GAP`, resolved. */
+    allowRegistrationWithClose1Gap: boolean;
+    /** `ALLOW_TRADING_WITH_CLOSE1_GAP`, resolved. Never sufficient alone. */
+    allowTradingWithClose1Gap: boolean;
+    /**
+     * The recorded manual override, or null when none exists.
+     *
+     * `at` is stamped when the configuration is loaded — the moment the operator
+     * declared the override — because a config value with no author, no reason
+     * and no time is not a decision anybody can be held to.
+     */
+    tradingOverride: { operator: string; reason: string; at: string } | null;
     /** Whether export-assisted recovery may run after a recorded gap. */
     exportRecovery: boolean;
     exportMaxBytes: number;
@@ -808,6 +845,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       catchupMaxSeconds: Math.max(0, raw.CLOSE1_CATCHUP_MAX_SECONDS),
       fairnessMaxSilenceMs: Math.max(0, raw.READER_FAIRNESS_MAX_SILENCE_MS),
       close1GapPolicy: raw.CLOSE1_GAP_POLICY,
+      allowRegistrationWithClose1Gap: raw.ALLOW_REGISTRATION_WITH_CLOSE1_GAP,
+      allowTradingWithClose1Gap: raw.ALLOW_TRADING_WITH_CLOSE1_GAP,
+      // An override exists only when an operator and a reason are both present:
+      // half a record is not a decision, and the gate treats it as absent.
+      tradingOverride:
+        raw.TRADING_OVERRIDE_OPERATOR.trim().length > 0 && raw.TRADING_OVERRIDE_REASON.trim().length > 0
+          ? {
+              operator: raw.TRADING_OVERRIDE_OPERATOR.trim(),
+              reason: raw.TRADING_OVERRIDE_REASON.trim(),
+              at: new Date().toISOString(),
+            }
+          : null,
       exportRecovery: raw.EXPORT_RECOVERY_ENABLED,
       exportMaxBytes: Math.max(1_024, raw.EXPORT_RECOVERY_MAX_BYTES),
       exportTimeoutMs: Math.max(1_000, raw.EXPORT_RECOVERY_TIMEOUT_MS),

@@ -185,6 +185,58 @@ export function roomsFor(rules: Rules): string[] {
   return [...new Set([...ordered, rules.tradingRoom || TRADING_ROOM])];
 }
 
+/**
+ * The six states `close1` can be in, strongest claim first.
+ *
+ * The point of naming them is that "close1 has a gap" and "close1 is unusable"
+ * are different findings, and only the second one should stop the process from
+ * registering. `close1` is a high-traffic public room with a 17-million-message
+ * history; it will gap, and treating every gap as a reason not to register is how
+ * a process ends up never making the contest record at all.
+ *
+ *   - `fully_covered` — no gap, at the retained head, two clean pages behind it,
+ *     and a backlog that is not widening. The only state that may trade.
+ *   - `degraded_public_coverage` — a historical gap, with no evidence that any of
+ *     our own messages fell into it and nothing of ours provably there. Report
+ *     and registration-only are permitted, and trading is not.
+ *   - `local_message_uncertain` — the band *could* hold one of our messages and
+ *     nothing proves it does not. Registration and trading are both refused: an
+ *     unprovable participation record is not something to build on.
+ *   - `local_message_in_gap` — one of our own seqs provably falls inside the
+ *     band. Refused outright, and critical.
+ *   - `upstream_gap` — an open gap in the public room with no local risk yet.
+ *   - `unattainable` — measured arithmetic: the public room produces faster than
+ *     we can store, so no amount of reading will catch it up.
+ */
+export type Close1Coverage =
+  | 'fully_covered'
+  | 'degraded_public_coverage'
+  | 'local_message_uncertain'
+  | 'local_message_in_gap'
+  | 'upstream_gap'
+  | 'unattainable';
+
+/** Which of the six states the inputs describe. */
+export function classifyClose1Coverage(input: {
+  hasGap: boolean;
+  open: boolean;
+  localMessagesInGap: boolean;
+  localMessageUncertain: boolean;
+  fullyCaughtUp: boolean;
+  unattainable: boolean;
+  netPersistBacklogRate: number;
+}): Close1Coverage {
+  // Arithmetic first: a room we cannot catch is not a room we can reason about.
+  if (input.unattainable) return 'unattainable';
+  if (input.localMessagesInGap) return 'local_message_in_gap';
+  if (input.localMessageUncertain) return 'local_message_uncertain';
+  if (input.open) return 'upstream_gap';
+  if (input.hasGap) return 'degraded_public_coverage';
+  return input.fullyCaughtUp && input.netPersistBacklogRate <= 0
+    ? 'fully_covered'
+    : 'degraded_public_coverage';
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -760,6 +812,14 @@ export class OrchestratorReader {
     unattainable: boolean;
     netPersistBacklogRate: number;
     mode: string | null;
+    /** Which of the six coverage states the trading room is in. */
+    coverage: Close1Coverage;
+    /** Our own seqs that provably fall inside the recorded band. */
+    localSeqsInGap: number[];
+    /** Agent ids whose registration seq is inside the band. */
+    localAgentsInGap: string[];
+    /** A local trade/offer/re-post message is stored inside the band. */
+    localMessagesInGap: boolean;
   } {
     const room = this.tradingRoomName;
     const status = this.roomReader.readerThroughputFor(room);
@@ -767,20 +827,51 @@ export class OrchestratorReader {
     const gapCount = cursor?.gap_count ?? 0;
     const hasGap = (cursor?.gap ?? 0) > 0 || gapCount > 0;
     const open = gapCount > 0 && (cursor?.gap_resolved_at ?? null) === null;
+    const from = cursor?.last_gap_from ?? null;
+    const to = cursor?.last_gap_to ?? null;
     const criticalRooms: string[] = [];
-    if (open && cursor?.last_gap_from != null && cursor?.last_gap_to != null) {
-      if (this.gapMayHoldLocalMessages(room, cursor.last_gap_from, cursor.last_gap_to)) {
-        criticalRooms.push(room);
+    // The band is a permanent fact: a local seq inside it was lost whether or not
+    // a later contiguous read closed the cursor's gap, so the check is not
+    // restricted to open gaps.
+    const localSeqsInGap: number[] = [];
+    const localAgentsInGap: string[] = [];
+    if (from !== null && to !== null && to >= from) {
+      for (const row of this.repositories.participation.localSeqsInRoom(room)) {
+        if (row.seq >= from && row.seq <= to) {
+          localSeqsInGap.push(row.seq);
+          localAgentsInGap.push(row.agent_id);
+        }
+      }
+      if (open) {
+        if (this.gapMayHoldLocalMessages(room, from, to)) criticalRooms.push(room);
       }
     }
+    const localMessagesInGap = localSeqsInGap.length > 0;
+    const criticalGap = criticalRooms.length > 0;
+    const fullyCaughtUp = status?.mode === 'fully_caught_up';
+    const unattainable = status?.mode === 'unattainable';
+    const netPersistBacklogRate = status?.netPersistBacklogRate ?? 0;
+    const coverage = classifyClose1Coverage({
+      hasGap,
+      open,
+      localMessagesInGap,
+      localMessageUncertain: criticalGap,
+      fullyCaughtUp,
+      unattainable,
+      netPersistBacklogRate,
+    });
     return {
       hasGap,
-      criticalGap: criticalRooms.length > 0,
+      criticalGap,
       criticalRooms,
-      fullyCaughtUp: status?.mode === 'fully_caught_up',
-      unattainable: status?.mode === 'unattainable',
-      netPersistBacklogRate: status?.netPersistBacklogRate ?? 0,
+      fullyCaughtUp,
+      unattainable,
+      netPersistBacklogRate,
       mode: status?.mode ?? null,
+      coverage,
+      localSeqsInGap,
+      localAgentsInGap,
+      localMessagesInGap,
     };
   }
 

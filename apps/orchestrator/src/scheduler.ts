@@ -34,6 +34,7 @@
  *     flow leaves its mints unknown; that is recorded as `mint_unknown` and the
  *     reader goes conservative. Nothing here may ever downgrade it to `failed`.
  */
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import {
@@ -81,8 +82,13 @@ import { localDateKey } from './llm.js';
 import type { LarkStack } from './lark.js';
 import type { LoadGuard, LoadTier } from './load-guard.js';
 import type { Logger } from './logger.js';
-import type { OrchestratorReader, ReaderStatus } from './reader.js';
-import { refereeReadiness, tradingReadiness, type Readiness } from './readiness.js';
+import type { Close1Coverage, OrchestratorReader, ReaderStatus } from './reader.js';
+import {
+  refereeFeedReadiness,
+  registrationReadiness,
+  tradingReadiness,
+  type Readiness,
+} from './readiness.js';
 import { runtimeEventSummary, type RuntimeEventNotifier } from './runtime-events.js';
 import { ownerRegistrationText, type OrchestratorWriter } from './writer.js';
 import type { UpstreamMonitor } from './upstream-monitor.js';
@@ -113,6 +119,30 @@ function advanceStatus(
   next: ParticipationStatus,
 ): ParticipationStatus {
   return PARTICIPATION_RANK[next] > PARTICIPATION_RANK[current] ? next : current;
+}
+
+/**
+ * A stable correlation id for one POST of ours.
+ *
+ * The service's own reply does not carry a request id, so the identity of the
+ * write has to come from what we control: the room, the signer and the nonce the
+ * writer reserved immediately before signing. Those three are exactly what makes
+ * the write distinct, and a later readback — or a gap that might have swallowed
+ * it — can be reconciled against this string without guessing.
+ */
+function localPostRequestId(room: string, did: string, nonce: string): string {
+  return `${room}|${did}|${nonce}`;
+}
+
+/**
+ * `sha256:<hex>` over the signed body.
+ *
+ * The room echoes the body text back, so hashing it (rather than the whole
+ * envelope) gives a value that can be re-derived from either side — which is
+ * what makes "is this echo ours?" answerable rather than assumed.
+ */
+function messageHash(text: string): string {
+  return `sha256:${createHash('sha256').update(text, 'utf8').digest('hex')}`;
 }
 
 /**
@@ -271,6 +301,8 @@ export interface StatusSnapshot {
   expectedPackageHash: string | null;
   packageDrift: boolean;
   refereeDid: string | null;
+  /** The DID pinned at launch, so a mismatch is a finding rather than a guess. */
+  expectedRefereeDid: string | null;
   agents: {
     total: number;
     enabled: number;
@@ -347,19 +379,50 @@ export interface StatusSnapshot {
     bootstrap: string[];
     /** Rooms with a genuine mid-run cursor gap. */
     gaps: string[];
-    refereeReady: boolean;
+    registrationReady: boolean;
     tradingReady: boolean;
   };
+  /** Which operating posture the process is in, derived from the arming flags. */
+  operatingMode: 'dry_run' | 'live_registration_only' | 'live_trading';
   /**
-   * The two readiness gates. `refereeReady` gates live registration,
-   * `tradingReady` gates live trading; both carry the reasons they failed so a
-   * report never has to guess why a trade was refused.
+   * The three readiness gates, strongest last.
+   *
+   * `refereeFeedReady` is about the five structured rooms being provable,
+   * `registrationReady` adds what posting 150 registrations needs, and
+   * `tradingReady` adds what pricing and writing a trade needs. Each carries the
+   * reasons it failed, so a report never has to guess why something was refused
+   * — and so `registrationReady` can never be read as `tradingReady`.
    */
   readiness: {
-    refereeReady: boolean;
+    refereeFeedReady: boolean;
+    registrationReady: boolean;
     tradingReady: boolean;
-    refereeReasons: string[];
+    refereeFeedReasons: string[];
+    registrationReasons: string[];
     tradingReasons: string[];
+  };
+  /**
+   * The `close1` policy surface: what the room's coverage is, which switches are
+   * set, and — when trading is refused — why.
+   */
+  close1: {
+    coverage: Close1Coverage;
+    gapPolicy: 'block' | 'degraded_readonly';
+    registrationPolicy: { allowWithClose1Gap: boolean };
+    tradingPolicy: {
+      allowWithClose1Gap: boolean;
+      override: { operator: string; reason: string; at: string } | null;
+    };
+    /** Our own seqs that provably fall inside the recorded band. */
+    localMessagesInGap: number[];
+    /** Agents whose registration seq is inside the band. */
+    localAgentsInGap: string[];
+    unresolvedGapRooms: string[];
+    /** Registrations posted but not yet read back. */
+    registrationPending: number;
+    registrationReadback: { completed: number; pending: number; total: number };
+    /** The first reason trading is refused, or null when it is not. */
+    tradeBlockedReason: string | null;
   };
   cors: { gaps: number; gapRooms: string[]; resets: string[]; bootstrap: string[] };
   /**
@@ -458,10 +521,24 @@ export interface ReaderReport {
   };
   exportRecovery: ExportRecoveryStats;
   unresolvedGapRooms: string[];
+  operatingMode: 'dry_run' | 'live_registration_only' | 'live_trading';
+  close1Coverage: Close1Coverage;
+  registrationPolicy: { allowWithClose1Gap: boolean };
+  tradingPolicy: {
+    allowWithClose1Gap: boolean;
+    override: { operator: string; reason: string; at: string } | null;
+  };
+  /** Our own registration seqs that provably fell inside the recorded band. */
+  localMessagesInGap: number[];
+  registrationPending: number;
+  registrationReadback: { completed: number; pending: number; total: number };
+  tradeBlockedReason: string | null;
   readiness: {
-    refereeReady: boolean;
+    refereeFeedReady: boolean;
+    registrationReady: boolean;
     tradingReady: boolean;
-    refereeReasons: string[];
+    refereeFeedReasons: string[];
+    registrationReasons: string[];
     tradingReasons: string[];
   };
   serverContract: ServerContractProbe | null;
@@ -998,6 +1075,46 @@ export class OrchestratorScheduler {
     return mints;
   }
 
+  /**
+   * Every DID the referee's own `state` listing carries.
+   *
+   * The `owners` field of a state post is not shape-pinned by the published
+   * schema, so this reads it defensively — an array of DIDs, an object keyed by
+   * DID, or nested strings — and claims nothing when it cannot read it. A DID it
+   * cannot find is simply absent, which is the honest outcome: no evidence
+   * rather than assumed evidence.
+   */
+  stateListedDids(): Set<string> {
+    const listed = new Set<string>();
+    const visit = (value: unknown, depth: number): void => {
+      if (depth > 4) return;
+      if (typeof value === 'string') {
+        if (value.startsWith('did:')) listed.add(value);
+        return;
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) visit(item, depth + 1);
+        return;
+      }
+      if (typeof value === 'object' && value !== null) {
+        for (const [key, item] of Object.entries(value)) {
+          if (key.startsWith('did:')) listed.add(key);
+          visit(item, depth + 1);
+        }
+      }
+    };
+    for (const row of this.repositories.referee.snapshotsSince('state', 0)) {
+      let payload: unknown;
+      try {
+        payload = JSON.parse(row.payload);
+      } catch {
+        continue;
+      }
+      visit((payload as { owners?: unknown }).owners, 0);
+    }
+    return listed;
+  }
+
   /** Sweeps that produced a price but no flow: their mints are unknown, not zero. */
   sweepsWithMissingFlow(): number[] {
     const priceSweeps = new Set<number>();
@@ -1100,14 +1217,22 @@ export class OrchestratorScheduler {
     // yet proven. Until the seed, the pin and the stored history all agree,
     // posting one is noise at best and a forged-referee exposure at worst.
     if (this.config.liveArmed) {
-      const refereeReadinessNow = this.readiness().referee;
-      if (!refereeReadinessNow.ready) {
+      const gates = this.readiness();
+      // The feed gate and the registration gate are named separately: the referee
+      // can be perfectly provable while our own write lane is not, and an operator
+      // needs to know which of the two is holding the 150 registrations.
+      if (!gates.refereeFeed.ready || !gates.registration.ready) {
+        const reasons = [...gates.refereeFeed.reasons, ...gates.registration.reasons];
         this.logger.event({
           level: 'error',
           source: 'scheduler',
-          code: 'registration_blocked_referee_not_ready',
-          message: `referee is not ready; owner registrations are held: ${refereeReadinessNow.reasons.join('; ')}`,
-          data: { reasons: refereeReadinessNow.reasons },
+          code: 'registration_blocked',
+          message: `registration is not ready; owner registrations are held: ${reasons.join('; ')}`,
+          data: {
+            refereeFeedReady: gates.refereeFeed.ready,
+            registrationReady: gates.registration.ready,
+            reasons,
+          },
         });
         return outcome;
       }
@@ -1197,6 +1322,14 @@ export class OrchestratorScheduler {
         attempts,
         last_error: result.ok ? null : (result.reason ?? `status ${result.status ?? 0}`),
         updated_at: this.now().toISOString(),
+        // The local half of "was this write actually recorded": the POST's own
+        // correlation id and a hash of the exact body, so a room echo can be
+        // matched to the write that produced it rather than assumed.
+        post_request_id: localPostRequestId(room, did, result.nonce),
+        message_hash: messageHash(text),
+        post_sweep: this.reader.verifier.state.currentSweep,
+        flow_evidence_at: null,
+        state_evidence_at: null,
       });
       if (result.ok) {
         this.logger.event({
@@ -1227,6 +1360,13 @@ export class OrchestratorScheduler {
         attempts,
         last_error: error instanceof Error ? error.message : String(error),
         updated_at: this.now().toISOString(),
+        // No POST was accepted, so there is nothing to reconcile: a failed write
+        // leaves no request id and no body hash behind.
+        post_request_id: null,
+        message_hash: null,
+        post_sweep: this.reader.verifier.state.currentSweep,
+        flow_evidence_at: null,
+        state_evidence_at: null,
       });
       this.logger.event({
         level: 'error',
@@ -1274,6 +1414,13 @@ export class OrchestratorScheduler {
       attempts: existing?.attempts ?? 1,
       last_error: null,
       updated_at: at,
+      // The readback is the room echoing our bytes: it does not invent a request
+      // id, so whatever the POST recorded is carried through untouched.
+      post_request_id: existing?.post_request_id ?? null,
+      message_hash: existing?.message_hash ?? messageHash(existing?.registration_text ?? ownerRegistrationText(did)),
+      post_sweep: existing?.post_sweep ?? null,
+      flow_evidence_at: existing?.flow_evidence_at ?? null,
+      state_evidence_at: existing?.state_evidence_at ?? null,
     });
 
     // The durable evidence copy. INSERT OR IGNORE on agent_id: the first
@@ -1318,11 +1465,23 @@ export class OrchestratorScheduler {
   reconcileMints(): { minted: number; unknown: number } {
     const mints = this.mintedDids();
     const missingFlow = this.sweepsWithMissingFlow();
+    const stateListed = this.stateListedDids();
     const current = this.reader.verifier.state.currentSweep;
+    const at = this.now().toISOString();
     let minted = 0;
     let unknown = 0;
 
     for (const row of this.repositories.participation.all()) {
+      // The referee's own evidence, recorded before anything is concluded from
+      // it: a DID in a flow's mints or a state listing is the referee saying it
+      // saw our registration, which is a different fact from the room echoing
+      // our bytes and is kept in its own column.
+      if (mints.has(row.did) && row.flow_evidence_at === null) {
+        this.repositories.participation.markRefereeEvidence(row.agent_id, 'flow', at);
+      }
+      if (stateListed.has(row.did) && row.state_evidence_at === null) {
+        this.repositories.participation.markRefereeEvidence(row.agent_id, 'state', at);
+      }
       let status = row.status;
       if (mints.has(row.did)) {
         status = advanceStatus(status, 'mint_observed');
@@ -2202,7 +2361,7 @@ export class OrchestratorScheduler {
    * how a trade slips through after the referee room was recreated. `status()`
    * computes it once and shares the answer with the trade and registration paths.
    */
-  private readiness(): { referee: Readiness; trading: Readiness } {
+  private readiness(): { refereeFeed: Readiness; registration: Readiness; trading: Readiness } {
     const verifier = this.reader.verifier.state;
     const readerStatus = this.reader.readerStatus();
     const gaps = this.reader.gaps();
@@ -2227,7 +2386,15 @@ export class OrchestratorScheduler {
     const enabled = identities.filter((row) => row.enabled === 1).length;
     const total = this.keyStore.size;
     const fleetComplete = total > 0 && enabled === total;
-    const referee = refereeReadiness({
+    // A disk-protection tier refuses writes, so it refuses a registration post
+    // just as squarely as it refuses a trade. Derived from the load guard rather
+    // than from a write attempt, because the gate must answer *before* anything
+    // is committed.
+    const writesAllowed = !this.loadGuard.state.paused.readsOnly;
+    const readback = this.repositories.participation.readbackProgress();
+    // The feed gate's inputs, shared by all three gates so the three can never
+    // disagree about the feed itself.
+    const feedInputs = {
       readerContinuous: readerStatus.continuousMode,
       readerRunning: readerStatus.running,
       refereeRoomCount: readerStatus.fixedRoomCount - (coverage.mode === null ? 0 : 1),
@@ -2239,13 +2406,7 @@ export class OrchestratorScheduler {
         refereeSet.has(room),
       ),
       refereeRoomsReset: gaps.resets.filter((room) => refereeSet.has(room)),
-      tradingRoomHasCoverageGap: coverage.hasGap,
-      tradingRoomCriticalGap: coverage.criticalGap,
-      tradingRoomCriticalGapRooms: coverage.criticalRooms,
-      tradingRoomUnattainable: coverage.unattainable,
-      close1GapPolicy: this.config.technoCore.close1GapPolicy,
       profileLaneOk,
-      fleetComplete,
       seedSeen: verifier.seedSeen,
       refereeDid: verifier.refereeDid,
       expectedRefereeDid: this.config.expectedRefereeDid,
@@ -2253,10 +2414,28 @@ export class OrchestratorScheduler {
       expectedPackageHash: verifier.expectedPackageHash,
       hydrated: this.reader.isHydrated,
       requirePin: this.config.requireRefereePin,
+      currentSweepRecoverable: verifier.currentSweep !== null,
+    } as const;
+
+    const refereeFeed = refereeFeedReadiness(feedInputs);
+
+    const registration = registrationReadiness({
+      ...feedInputs,
+      tradingRoomHasCoverageGap: coverage.hasGap,
+      tradingRoomCriticalGap: coverage.criticalGap,
+      tradingRoomCriticalGapRooms: coverage.criticalRooms,
+      tradingRoomUnattainable: coverage.unattainable,
+      close1GapPolicy: this.config.technoCore.close1GapPolicy,
+      allowRegistrationWithClose1Gap: this.config.technoCore.allowRegistrationWithClose1Gap,
+      localMessageInGap: coverage.localMessagesInGap,
+      fleetComplete,
+      writerHealthy: writesAllowed,
+      nonceStoreUsable: writesAllowed,
+      durableEvidenceWritable: writesAllowed,
     });
 
     const trading = tradingReadiness({
-      referee,
+      registration,
       conservative: verifier.conservative,
       conservativeReasons: verifier.conservativeReasons,
       sweep: verifier.currentSweep,
@@ -2273,15 +2452,32 @@ export class OrchestratorScheduler {
       packageDrift: Number(this.repositories.upstream.getPin()?.drift ?? 0) === 1,
       fleetComplete,
       registrationRequired: this.config.liveArmed,
-      registrationReadbackComplete: this.repositories.participation.countWithReadback() >= total,
+      registrationReadbackComplete: readback.completed >= total,
       close1GapPolicy: this.config.technoCore.close1GapPolicy,
       // Only the full caught-up test satisfies this. `degraded_readonly` never
-      // does: it keeps observation and registration alive and no more.
+      // does, and the operator switch only ever covers a *plain coverage* gap:
+      // it is waived nowhere else, and only with a recorded override.
       close1FullyCaughtUp: coverage.fullyCaughtUp,
       close1NetPersistBacklogRate: coverage.netPersistBacklogRate,
       unresolvedGap: readerStatus.unresolvedGap,
+      close1Unattainable: coverage.unattainable,
+      localMessageInGap: coverage.localMessagesInGap,
+      writerHealthy: writesAllowed,
+      allowTradingWithClose1Gap: this.config.technoCore.allowTradingWithClose1Gap,
+      manualOverride: this.config.technoCore.tradingOverride,
     });
-    return { referee, trading };
+    return { refereeFeed, registration, trading };
+  }
+
+  /**
+   * Which of the three operating postures the process is in.
+   *
+   * Derived from the arming flags, never from the calendar: a deadline is not an
+   * operator, and "the contest is nearly over" must not be able to move this.
+   */
+  private operatingMode(): 'dry_run' | 'live_registration_only' | 'live_trading' {
+    if (!this.config.liveArmed) return 'dry_run';
+    return this.config.tradingArmed ? 'live_trading' : 'live_registration_only';
   }
 
   status(): StatusSnapshot {
@@ -2305,6 +2501,11 @@ export class OrchestratorScheduler {
     const uptimeSeconds = Math.max(1, (Date.now() - this.startedAt) / 1000);
     const cursorGaps = this.reader.gaps();
     const readerStatus = this.reader.readerStatus();
+    // The close1 policy surface: the room's coverage classification, our own seqs
+    // that provably fell in the band, and the 150/150 readback progress. Computed
+    // from the same reader/DB facts the gates use, so the two cannot disagree.
+    const coverage = this.reader.tradingRoomCoverage();
+    const feedback = this.repositories.participation.readbackProgress();
     const wsStatus = this.lark?.websocket.status;
     const archiveState = this.repositories.archiveState.get();
     const archiveBySweep = this.repositories.archiveSweeps.all();
@@ -2344,6 +2545,7 @@ export class OrchestratorScheduler {
       expectedPackageHash: verifier.expectedPackageHash,
       packageDrift: Number(pin?.drift ?? 0) === 1,
       refereeDid: verifier.refereeDid,
+      expectedRefereeDid: this.config.expectedRefereeDid,
       agents: {
         total: this.keyStore.size,
         enabled: identities.filter((row) => row.enabled === 1).length,
@@ -2414,14 +2616,34 @@ export class OrchestratorScheduler {
         cap: this.config.roomDiscovery.maxRooms,
         bootstrap: cursorGaps.bootstrap,
         gaps: cursorGaps.rooms,
-        refereeReady: readiness.referee.ready,
+        registrationReady: readiness.registration.ready,
         tradingReady: readiness.trading.ready,
       },
+      operatingMode: this.operatingMode(),
       readiness: {
-        refereeReady: readiness.referee.ready,
+        refereeFeedReady: readiness.refereeFeed.ready,
+        registrationReady: readiness.registration.ready,
         tradingReady: readiness.trading.ready,
-        refereeReasons: readiness.referee.reasons,
+        refereeFeedReasons: readiness.refereeFeed.reasons,
+        registrationReasons: readiness.registration.reasons,
         tradingReasons: readiness.trading.reasons,
+      },
+      close1: {
+        coverage: coverage.coverage,
+        gapPolicy: this.config.technoCore.close1GapPolicy,
+        registrationPolicy: {
+          allowWithClose1Gap: this.config.technoCore.allowRegistrationWithClose1Gap,
+        },
+        tradingPolicy: {
+          allowWithClose1Gap: this.config.technoCore.allowTradingWithClose1Gap,
+          override: this.config.technoCore.tradingOverride,
+        },
+        localMessagesInGap: coverage.localSeqsInGap,
+        localAgentsInGap: coverage.localAgentsInGap,
+        unresolvedGapRooms: readerStatus.unresolvedGapRooms,
+        registrationPending: feedback.pending,
+        registrationReadback: feedback,
+        tradeBlockedReason: readiness.trading.ready ? null : (readiness.trading.reasons[0] ?? null),
       },
       cors: {
         gaps: cursorGaps.total,
@@ -2521,10 +2743,20 @@ export class OrchestratorScheduler {
       },
       exportRecovery: reader.exportRecovery,
       unresolvedGapRooms: reader.unresolvedGapRooms,
+      operatingMode: status.operatingMode,
+      close1Coverage: status.close1.coverage,
+      registrationPolicy: status.close1.registrationPolicy,
+      tradingPolicy: status.close1.tradingPolicy,
+      localMessagesInGap: status.close1.localMessagesInGap,
+      registrationPending: status.close1.registrationPending,
+      registrationReadback: status.close1.registrationReadback,
+      tradeBlockedReason: status.close1.tradeBlockedReason,
       readiness: {
-        refereeReady: readiness.referee.ready,
+        refereeFeedReady: readiness.refereeFeed.ready,
+        registrationReady: readiness.registration.ready,
         tradingReady: readiness.trading.ready,
-        refereeReasons: readiness.referee.reasons,
+        refereeFeedReasons: readiness.refereeFeed.reasons,
+        registrationReasons: readiness.registration.reasons,
         tradingReasons: readiness.trading.reasons,
       },
       serverContract: reader.serverContract,
@@ -2548,6 +2780,17 @@ export class OrchestratorScheduler {
     if (status.packageDrift) {
       critical.push(
         `package hash drift: expected ${status.expectedPackageHash ?? '<unset>'}, seed says ${status.packageHash ?? '<none>'} — active trading is paused`,
+      );
+    }
+    // The seed's signer is the referee's identity: a seed signed by anyone other
+    // than the pinned DID is a different contest, so it is never a warning.
+    if (
+      status.refereeDid !== null &&
+      status.expectedRefereeDid !== null &&
+      status.refereeDid !== status.expectedRefereeDid
+    ) {
+      critical.push(
+        `referee seed mismatch: the seed is signed by ${status.refereeDid}, not the pinned ${status.expectedRefereeDid}`,
       );
     }
     if (status.conservative) {
@@ -2589,9 +2832,9 @@ export class OrchestratorScheduler {
       );
     }
     // The reader is off the scheduler's cadence now, so "is it actually running"
-    // is a finding in its own right. It is already carried by the referee gate
-    // above — a reader that is not continuous makes `refereeReady` false with
-    // that exact reason — so it is not repeated here as a separate warning.
+    // is a finding in its own right. It is already carried by the referee feed
+    // gate above — a reader that is not continuous makes `refereeFeedReady` false
+    // with that exact reason — so it is not repeated here as a separate warning.
     // A saturated page means the service had more than one page waiting, so the
     // reader is behind — nothing more. It is never a health signal, and it must
     // not read as "catching up".
@@ -2633,7 +2876,18 @@ export class OrchestratorScheduler {
           ? 'contiguous resume observed; historical gap remains'
           : 'unresolved gap remains';
       const line = `${note}: ${rooms}`;
-      if (status.reader.unattainableRooms.length > 0 || status.reader.netBacklogIncreasing) {
+      // A loss in a *referee* room is a hole in the contest record itself, so it
+      // is always critical. A loss in the public trading room is graded by the
+      // coverage classification below, and is critical only when the room is
+      // measured unattainable or its backlog is still widening.
+      const refereeGap = status.reader.unresolvedGapRooms.some((room) =>
+        this.reader.refereeRoomList.includes(room),
+      );
+      if (
+        refereeGap ||
+        status.reader.unattainableRooms.length > 0 ||
+        status.reader.netBacklogIncreasing
+      ) {
         critical.push(line);
       } else {
         warning.push(line);
@@ -2665,14 +2919,24 @@ export class OrchestratorScheduler {
     // section: repeating a multi-clause list here is what pushes a rendered
     // message past its character budget and buries the sections an operator
     // reads first.
-    if (!status.readiness.refereeReady) {
-      const detail = status.readiness.refereeReasons.join('; ') || 'reason unlabelled';
+    if (!status.readiness.refereeFeedReady) {
+      const detail = status.readiness.refereeFeedReasons.join('; ') || 'reason unlabelled';
       if (this.config.liveArmed) {
         blocking.push(`referee not ready — registration and trading are held: ${detail}`);
       } else if (this.config.expectedRefereeDid === null) {
         info.push('dry-run: referee DID not pinned; observation only, not a live gate');
       } else {
         warning.push('referee seed not verified');
+      }
+    } else if (!status.readiness.registrationReady) {
+      // Distinct from the feed gate on purpose: the referee can be perfectly
+      // provable while our own write lane is not, and the two need different
+      // sentences or an operator cannot tell which one to fix.
+      const detail = status.readiness.registrationReasons.join('; ') || 'reason unlabelled';
+      if (this.config.liveArmed) {
+        blocking.push(`registration not ready — the 150 owner registrations are held: ${detail}`);
+      } else {
+        info.push(`dry-run: registration not ready (${detail})`);
       }
     }
     if (!status.readiness.tradingReady) {
@@ -2684,7 +2948,52 @@ export class OrchestratorScheduler {
       }
     }
 
+    // ---- the close1 coverage posture, named explicitly ----------------------
+    //
+    // A registration-only launch over a degraded public room is a *chosen*,
+    // bounded posture: reads and reports keep working, registration is permitted
+    // by an explicit switch, and no trade is possible. It is a warning, and it
+    // says all four of those things rather than leaving an operator to infer them
+    // from an absence of criticals.
+    if (status.operatingMode === 'live_registration_only' && status.close1.coverage !== 'fully_covered') {
+      warning.push('registration-only degraded coverage');
+      warning.push('trading remains blocked');
+      if (
+        status.close1.coverage === 'degraded_public_coverage' ||
+        status.close1.coverage === 'upstream_gap'
+      ) {
+        warning.push('close1 historical coverage incomplete');
+      }
+    }
+    if (this.config.liveArmed && status.close1.registrationPending > 0) {
+      warning.push(
+        `local registration readback pending: ${status.close1.registrationPending} of ${status.close1.registrationReadback.total}`,
+      );
+    }
+    // A local seq inside the band is proof, not suspicion: the message was
+    // written and the room's own record of it was lost.
+    if (status.close1.localMessagesInGap.length > 0) {
+      critical.push(
+        `local message provably inside the close1 gap: seq ${status.close1.localMessagesInGap.join(', ')}`,
+      );
+    }
+    if (status.close1.coverage === 'local_message_in_gap') {
+      critical.push('a local trade, offer or re-post message falls inside the close1 gap');
+    }
+    if (status.close1.coverage === 'unattainable') {
+      critical.push('close1 is measured unattainable: the public room outruns what can be stored');
+    }
+
     const groupStats = this.runner.groupStats();
+    // The first reason trading is refused, shortened for the message budget. The
+    // full sentence stays in `/status` and in the alerts bands; this line only
+    // has to say *that* a trade is blocked and roughly why.
+    const blockedReason =
+      status.close1.tradeBlockedReason === null
+        ? 'none'
+        : status.close1.tradeBlockedReason.length > 60
+          ? `${status.close1.tradeBlockedReason.slice(0, 60)}…`
+          : status.close1.tradeBlockedReason;
     const participationStatuses = Object.entries(status.participation)
       .filter(([key]) => key !== 'total' && key !== 'readback')
       .map(([key, value]) => `${key}=${value}`)
@@ -2703,20 +3012,17 @@ export class OrchestratorScheduler {
             `process_uptime: ${status.system.uptimeSeconds}s`,
             `profile: ${status.profile}`,
             `current_mode: ${status.mode}${status.liveArmed ? ' (live armed)' : ' (dry-run)'}`,
-            `current_sweep: ${status.sweep ?? '-'} · locked: ${status.locked} · conservative: ${status.conservative}${
-              status.conservative
-                ? ` (${status.conservativeReasons.join('; ') || 'reason unlabelled'})`
-                : ''
-            }`,
+            `current_sweep: ${status.sweep ?? '-'}`,
             // The package hash, the referee DID, the lock and conservative mode
             // are all printed in 比赛状态 below; repeating them here would spend
             // report budget on the same four facts.
-            `referee_ready: ${status.readiness.refereeReady}${
-              status.readiness.refereeReady ? '' : ` (${status.readiness.refereeReasons.join('; ') || 'reason unlabelled'})`
-            }`,
-            `trading_ready: ${status.readiness.tradingReady}${
-              status.readiness.tradingReady ? '' : ` (${status.readiness.tradingReasons.join('; ') || 'awaiting seed'})`
-            }`,
+            //
+            // The gate posture is one line, and deliberately without the reasons:
+            // the alerts bands carry those in full, and this message is truncated
+            // past 4000 characters, so a repeated multi-clause list is what costs
+            // a section its middle.
+            `operating_mode: ${status.operatingMode} · close1_coverage: ${status.close1.coverage} · close1_gap_policy: ${status.close1.gapPolicy}`,
+            `gates: referee_feed ${status.readiness.refereeFeedReady} · registration ${status.readiness.registrationReady} · trading ${status.readiness.tradingReady} · readback ${status.close1.registrationReadback.completed}/${status.close1.registrationReadback.total} pending ${status.close1.registrationPending} in-gap ${status.close1.localMessagesInGap.length} · blocked: ${blockedReason}`,
             `bootstrap state: ${
               status.cors.bootstrap.length > 0
                 ? `bootstrap_truncated in ${status.cors.bootstrap.join(', ')}`

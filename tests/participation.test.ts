@@ -166,8 +166,32 @@ describe('mint reconciliation', () => {
     const rows = harness.runtime.repositories.participation.all();
     const minted = rows.filter((row) => row.status === 'mint_observed');
     expect(minted.length).toBeGreaterThanOrEqual(3);
+    // The referee's own flow evidence is recorded in its own column, separately
+    // from the room's echo: "the referee listed us" and "the room returned our
+    // bytes" are different facts and one is never inferred from the other.
+    const flowEvidence = rows.filter((row) => row.flow_evidence_at !== null);
+    expect(flowEvidence.length).toBeGreaterThanOrEqual(3);
     // The observer's own local risk mirror only ever holds minted DIDs.
     expect(harness.runtime.scheduler.mintedDids().size).toBeGreaterThanOrEqual(3);
+  }, 120_000);
+
+  it('records state-listing evidence from the referee state room', async () => {
+    await harness.runtime.scheduler.ensureParticipation();
+    await harness.runtime.scheduler.runTick();
+
+    const dids = harness.runtime.keyStore.agentIds.map((agentId) =>
+      harness.runtime.keyStore.did(agentId),
+    );
+    // The `owners` shape is not pinned by the published schema, so the state post
+    // is read defensively; what must hold is that a DID it does list is recorded
+    // as *state* evidence and not as flow evidence.
+    harness.referee.post('d-close1-state', { t: 'state', n: 1, owners: [dids[0]!, dids[1]!] });
+    await harness.runtime.scheduler.runTick();
+
+    const rows = harness.runtime.repositories.participation.all();
+    const stateEvidence = rows.filter((row) => row.state_evidence_at !== null);
+    expect(stateEvidence.map((row) => row.did).sort()).toEqual([dids[0]!, dids[1]!].sort());
+    expect(rows.every((row) => row.flow_evidence_at === null)).toBe(true);
   }, 120_000);
 
   it('records mint_unknown, never failed, when a sweep posted a price but no flow', async () => {

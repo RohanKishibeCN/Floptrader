@@ -132,6 +132,11 @@ function seedEvidence(ctx: Ctx): void {
     attempts: 1,
     last_error: null,
     updated_at: NOW,
+    post_request_id: null,
+    message_hash: null,
+    post_sweep: null,
+    flow_evidence_at: null,
+    state_evidence_at: null,
   });
   repositories.controlProofs.upsert({
     agent_id: 'agent-1',

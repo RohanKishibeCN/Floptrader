@@ -281,7 +281,7 @@ describe('close1 catch-up, in a whole runtime', () => {
     expect(status.reader.cursorAdvancesPerMinute).toBeGreaterThanOrEqual(6);
     expect(status.reader.gaps.unresolved).not.toContain('close1');
     // A dry run with no seed is still not ready: catching up does not arm live.
-    expect(status.readiness.refereeReady).toBe(false);
+    expect(status.readiness.refereeFeedReady).toBe(false);
 
     await h.runtime.reader.stopContinuous();
   });
@@ -320,7 +320,7 @@ describe('close1 catch-up, in a whole runtime', () => {
     // Second process over the same files: the resolution is durable, so a restart
     // cannot turn a caught-up room back into an unresolved one.
     const reopened = openDatabase({ path: cursorPath() });
-    expect(reopened.pragma('user_version', { simple: true })).toBe(7);
+    expect(reopened.pragma('user_version', { simple: true })).toBe(8);
     const store = new SqliteCursorStore({ db: reopened, repositories: createRepositories(reopened) });
     const row = store.load('close1');
     expect(row.gapCount).toBe(1);

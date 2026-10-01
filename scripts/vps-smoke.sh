@@ -356,6 +356,39 @@ else
   fail "status does not expose consumerRate"
 fi
 
+# The three readiness gates, named separately. A bundle that predates the
+# three-gate split cannot answer with them, which is the same "stale dist"
+# failure the schema-version check above exists to catch — and it is the failure
+# that matters most here, because a process that cannot say *which* gate is
+# holding the registrations cannot be operated live.
+GATES_MISSING=""
+for field in refereeFeedReady registrationReady tradingReady; do
+  printf '%s' "$STATUS_BODY" | grep -q "\"$field\"" || GATES_MISSING="$GATES_MISSING $field"
+done
+if [[ -z "$GATES_MISSING" ]]; then
+  pass "status exposes all three readiness gates"
+else
+  fail "status is missing readiness gate(s):$GATES_MISSING"
+fi
+
+# The `close1` policy surface: the coverage classification, our own seqs in the
+# band, and the readback progress the 150/150 gate is derived from.
+CLOSE1_MISSING=""
+for field in coverage gapPolicy localMessagesInGap registrationReadback tradeBlockedReason; do
+  printf '%s' "$STATUS_BODY" | grep -q "\"$field\"" || CLOSE1_MISSING="$CLOSE1_MISSING $field"
+done
+if [[ -z "$CLOSE1_MISSING" ]]; then
+  pass "status exposes the close1 coverage and policy surface"
+else
+  fail "status is missing close1 field(s):$CLOSE1_MISSING"
+fi
+
+if printf '%s' "$STATUS_BODY" | grep -q '"operatingMode"'; then
+  pass "status names the operating mode"
+else
+  fail "status does not expose operatingMode"
+fi
+
 # The acceptance block, the same view an operator reads to decide whether a room
 # is catching up or unable to.
 READER_REPORT_BODY="$(http_body "http://$HEALTH_HOST:$HEALTH_PORT/reader-report" || true)"
