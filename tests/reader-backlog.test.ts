@@ -149,7 +149,7 @@ describe('reader backlog accounting', () => {
     await waitFor(
       () => {
         const row = tradingRoom(reader);
-        return reader.throughputStats().fullyCaughtUp && row.producerRate > 0 && row.consumerRate > 0;
+        return reader.throughputStats().fullyCaughtUp && row.producerRate > 0 && row.persistedRate > 0;
       },
       'a sealed window on a reader that is level',
       20_000,
@@ -161,8 +161,8 @@ describe('reader backlog accounting', () => {
     expect(stats.catchupState).toBe('fully_caught_up');
     expect(stats.unresolvedGap).toBe(false);
     expect(trading.producerRate).toBeGreaterThan(0);
-    expect(trading.consumerRate).toBeGreaterThan(0);
-    expect(trading.netBacklogRate).toBeLessThanOrEqual(0);
+    expect(trading.persistedRate).toBeGreaterThan(0);
+    expect(trading.netPersistBacklogRate).toBeLessThanOrEqual(0);
     expect(trading.pageSaturated).toBe(false);
     expect(trading.mode).toBe('fully_caught_up');
 
@@ -187,13 +187,14 @@ describe('reader backlog accounting', () => {
 
     const stats = reader.throughputStats();
     const trading = tradingRoom(reader);
-    expect(trading.producerRate).toBeGreaterThan(trading.consumerRate);
-    expect(trading.netBacklogRate).toBeGreaterThan(0);
+    expect(trading.producerRate).toBeGreaterThan(trading.persistedRate);
+    expect(trading.netPersistBacklogRate).toBeGreaterThan(0);
     expect(trading.pageSaturated).toBe(true);
-    expect(trading.mode).toBe('catching_up');
+    expect(trading.mode).toBe('unattainable');
     expect(stats.netBacklogIncreasing).toBe(true);
     expect(stats.catchupState).toBe('unattainable');
-    expect(stats.estimatedProducerRate).toBeGreaterThan(stats.estimatedConsumerRate);
+    expect(stats.unattainableRooms).toContain(TRADING);
+    expect(stats.estimatedProducerRate).toBeGreaterThan(stats.estimatedPersistedRate);
 
     await reader.stopContinuous();
   });
@@ -347,14 +348,17 @@ describe('the page-size ceiling', () => {
     await client.readRoom(TRADING, { limit: 1_000 });
     expect(new URL(transport.requests[0]!.url).searchParams.get('limit')).toBe('200');
 
-    // An operator who has confirmed a larger ceiling gets it — and nothing above
-    // it, however large the caller's own ask is.
+    // The documented protocol maximum is the hard ceiling, and a client-side
+    // config change is not evidence: `TECHNOCORE_SERVER_LIMIT=500` does not make
+    // the service serve 500, and a `limit` it refused would turn every read into
+    // a 400. Only a real server response could justify raising this.
     const wider = new TechnocoreClient({
       baseUrl: BASE,
       fetchImpl: transport.fetchImpl,
       serverLimit: 500,
     });
+    expect(wider.limitCeiling).toBe(200);
     await wider.readRoom(TRADING, { limit: 2_000 });
-    expect(new URL(transport.requests[1]!.url).searchParams.get('limit')).toBe('500');
+    expect(new URL(transport.requests[1]!.url).searchParams.get('limit')).toBe('200');
   });
 });

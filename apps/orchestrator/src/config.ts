@@ -175,6 +175,29 @@ export const EnvSchema = z.object({
   CLOSE1_CATCHUP_MAX_SECONDS: intString(900),
   /** How long a fixed room may go unread before a fairness warning is recorded. */
   READER_FAIRNESS_MAX_SILENCE_MS: intString(120_000),
+  /**
+   * What a gap in the trading room (`close1`) does to the live gate.
+   *
+   * `block` — the default — refuses live trading on any gap, exactly as the five
+   * referee rooms do. `degraded_readonly` keeps reading and reporting while the
+   * gate stays closed for trading; it exists only for a case where the contest's
+   * own semantics have been confirmed to tolerate it, and even then it must still
+   * block when the gap could contain one of our own messages. It never lets the
+   * room be described as fully covered.
+   */
+  CLOSE1_GAP_POLICY: z.enum(['block', 'degraded_readonly']).default('block'),
+  /**
+   * Allow export-assisted recovery for a room that has recorded a gap.
+   *
+   * Off by default. The export is one unbounded read of the retained ring: it can
+   * close a backlog faster than `limit` messages per round trip, and it can never
+   * bring back a range the ring already dropped.
+   */
+  EXPORT_RECOVERY_ENABLED: boolish.default(false),
+  /** Byte ceiling for a single export, so a large ring cannot be read unbounded. */
+  EXPORT_RECOVERY_MAX_BYTES: intString(12 * 1024 * 1024),
+  /** Wall-clock ceiling for a single export, in milliseconds. */
+  EXPORT_RECOVERY_TIMEOUT_MS: intString(20_000),
 
   // ---- deepseek -----------------------------------------------------------
   DEEPSEEK_BASE_URL: z.string().default('https://api.deepseek.com'),
@@ -418,6 +441,17 @@ export interface Config {
     catchupMaxSeconds: number;
     /** How long a fixed room may go unread before a fairness warning. */
     fairnessMaxSilenceMs: number;
+    /**
+     * What a gap in the trading room does to the live gate.
+     *
+     * `block` refuses trading outright; `degraded_readonly` keeps reading and
+     * reporting while trading stays refused. It never marks the room as covered.
+     */
+    close1GapPolicy: 'block' | 'degraded_readonly';
+    /** Whether export-assisted recovery may run after a recorded gap. */
+    exportRecovery: boolean;
+    exportMaxBytes: number;
+    exportTimeoutMs: number;
   };
   deepseek: {
     /** Whether any model call may happen. Off by default. */
@@ -764,6 +798,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       catchupMaxRequestsPerSecond: Math.max(0, raw.CLOSE1_CATCHUP_MAX_REQUESTS_PER_SECOND),
       catchupMaxSeconds: Math.max(0, raw.CLOSE1_CATCHUP_MAX_SECONDS),
       fairnessMaxSilenceMs: Math.max(0, raw.READER_FAIRNESS_MAX_SILENCE_MS),
+      close1GapPolicy: raw.CLOSE1_GAP_POLICY,
+      exportRecovery: raw.EXPORT_RECOVERY_ENABLED,
+      exportMaxBytes: Math.max(1_024, raw.EXPORT_RECOVERY_MAX_BYTES),
+      exportTimeoutMs: Math.max(1_000, raw.EXPORT_RECOVERY_TIMEOUT_MS),
     },
     deepseek: {
       enabled: deepseekEnabled,

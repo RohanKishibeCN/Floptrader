@@ -15,13 +15,18 @@ import { waitFor } from './support/harness.js';
 const READY_REFEREE: RefereeReadinessInputs = {
   readerContinuous: true,
   readerRunning: true,
-  fixedRoomCount: 6,
-  expectedFixedRoomCount: 6,
-  roomsWithGap: [],
-  roomsWithUnresolvedGap: [],
-  netBacklogIncreasing: false,
-  catchupState: 'fully_caught_up',
-  roomsReset: [],
+  refereeRoomCount: 5,
+  expectedRefereeRoomCount: 5,
+  refereeRoomsWithGap: [],
+  refereeRoomsWithUnresolvedGap: [],
+  refereeRoomsReset: [],
+  tradingRoomHasCoverageGap: false,
+  tradingRoomCriticalGap: false,
+  tradingRoomCriticalGapRooms: [],
+  tradingRoomUnattainable: false,
+  close1GapPolicy: 'block',
+  profileLaneOk: true,
+  fleetComplete: true,
   seedSeen: true,
   refereeDid: 'did:key:z6Mkreferee',
   expectedRefereeDid: 'did:key:z6Mkreferee',
@@ -51,6 +56,10 @@ const READY_TRADING = {
   fleetComplete: true,
   registrationRequired: true,
   registrationReadbackComplete: true,
+  close1GapPolicy: 'block' as const,
+  close1FullyCaughtUp: true,
+  close1NetPersistBacklogRate: 0,
+  unresolvedGap: false,
 };
 
 describe('refereeReadiness', () => {
@@ -83,12 +92,12 @@ describe('refereeReadiness', () => {
   });
 
   it('is not ready when a room was recreated underneath us', () => {
-    const result = referee({ roomsReset: ['d-close1-state'] });
+    const result = referee({ refereeRoomsReset: ['d-close1-state'] });
     expect(result.ready).toBe(false);
     expect(result.reasons.join(' ')).toContain('d-close1-state');
   });
 
-  it('is not ready while the reader is off, stopping, or missing fixed rooms', () => {
+  it('is not ready while the reader is off, stopping, or missing referee rooms', () => {
     const off = referee({ readerContinuous: false });
     expect(off.ready).toBe(false);
     expect(off.reasons.join(' ')).toContain('continuous reader is off');
@@ -97,25 +106,56 @@ describe('refereeReadiness', () => {
     expect(stopping.ready).toBe(false);
     expect(stopping.reasons.join(' ')).toContain('not running');
 
-    const short = referee({ fixedRoomCount: 5 });
+    const short = referee({ refereeRoomCount: 4 });
     expect(short.ready).toBe(false);
-    expect(short.reasons.join(' ')).toContain('reader owns 5 fixed rooms, expected 6');
+    expect(short.reasons.join(' ')).toContain('reader owns 4 referee rooms, expected 5');
   });
 
-  it('stays not-ready while any fixed room carries a cursor gap', () => {
+  it('stays not-ready while any referee room carries a cursor gap', () => {
     // Still losing: the gate names the room as an *unresolved* gap.
-    const open = referee({ roomsWithGap: ['close1'], roomsWithUnresolvedGap: ['close1'] });
+    const open = referee({
+      refereeRoomsWithGap: ['d-close1-state'],
+      refereeRoomsWithUnresolvedGap: ['d-close1-state'],
+    });
     expect(open.ready).toBe(false);
-    expect(open.reasons.join(' ')).toContain('unresolved cursor gap in close1');
+    expect(open.reasons.join(' ')).toContain('unresolved cursor gap in referee room(s) d-close1-state');
 
     // Caught up, but a loss still happened: a refusal either way, reported as
     // recovered so an operator can tell "still losing" from "lost, then caught up".
-    const recovered = referee({ roomsWithGap: ['close1'], roomsWithUnresolvedGap: [] });
+    const recovered = referee({ refereeRoomsWithGap: ['d-close1-state'] });
     expect(recovered.ready).toBe(false);
     expect(recovered.reasons.join(' ')).toContain('recovered, still on the record');
 
     // An empty list is the only acceptable value: a gap is never silently cleared.
-    expect(referee({ roomsWithGap: [], roomsWithUnresolvedGap: [] }).ready).toBe(true);
+    expect(referee({ refereeRoomsWithGap: [], refereeRoomsWithUnresolvedGap: [] }).ready).toBe(true);
+  });
+
+  it('grades the trading room separately, and never lets a critical gap through', () => {
+    // A plain coverage gap under the default policy blocks registration outright.
+    const blocked = referee({ tradingRoomHasCoverageGap: true });
+    expect(blocked.ready).toBe(false);
+    expect(blocked.reasons.join(' ')).toContain('CLOSE1_GAP_POLICY=block');
+
+    // `degraded_readonly` keeps observation and registration alive for a plain
+    // coverage gap — and still refuses to call the room covered.
+    const degraded = referee({
+      tradingRoomHasCoverageGap: true,
+      close1GapPolicy: 'degraded_readonly',
+    });
+    expect(degraded.ready).toBe(true);
+
+    // A gap that could hold one of our own posts is refused by *both* policies:
+    // no setting may make an incomplete participation record acceptable.
+    for (const policy of ['block', 'degraded_readonly'] as const) {
+      const critical = referee({
+        tradingRoomHasCoverageGap: true,
+        tradingRoomCriticalGap: true,
+        tradingRoomCriticalGapRooms: ['close1'],
+        close1GapPolicy: policy,
+      });
+      expect(critical.ready).toBe(false);
+      expect(critical.reasons.join(' ')).toContain('may contain one of our own messages');
+    }
   });
 
   it('refuses to call an unpinned referee established when a pin is required', () => {
@@ -124,20 +164,14 @@ describe('refereeReadiness', () => {
     expect(result.reasons.join(' ')).toContain('no referee DID pinned');
   });
 
-  it('refuses live while the reader is measurably losing ground', () => {
-    // A widening backlog is a refusal on its own, and a different one from a gap:
-    // it is the reader saying "messages will be lost", before any has been.
-    const widening = referee({ netBacklogIncreasing: true });
-    expect(widening.ready).toBe(false);
-    expect(widening.reasons.join(' ')).toContain('net backlog is increasing over two consecutive windows');
-
-    // And once catch-up is unattainable it is named as capacity, not as a
-    // temporary state that will clear on its own.
-    const unattainable = referee({ netBacklogIncreasing: true, catchupState: 'unattainable' });
+  it('refuses live while the trading room is measurably unattainable', () => {
+    // Unattainable is arithmetic, not a temporary state that will clear on its
+    // own, so it is a refusal in its own right and a different one from a gap.
+    const unattainable = referee({ tradingRoomUnattainable: true });
     expect(unattainable.ready).toBe(false);
     expect(unattainable.reasons.join(' ')).toContain('catch-up unattainable');
 
-    // Both propagate: trading is strictly downstream of the referee gate, so a
+    // It propagates: trading is strictly downstream of the referee gate, so a
     // reader that cannot keep up stops registration *and* trading.
     const trading = tradingReadiness({
       ...READY_TRADING,
@@ -194,6 +228,35 @@ describe('tradingReadiness', () => {
     const result = tradingReadiness({ ...ready, conservative: true, conservativeReasons: ['limits_for_missing'] });
     expect(result.ready).toBe(false);
     expect(result.reasons.join(' ')).toContain('limits_for_missing');
+  });
+
+  it('refuses trading on a plain close1 coverage gap under either policy', () => {
+    // The coverage clause is satisfied by `fully_caught_up` alone. A gap in the
+    // trading room is never a trade, and `degraded_readonly` — which exists to
+    // keep observation and registration alive — must not become a back door.
+    const blocked = tradingReadiness({ ...ready, close1FullyCaughtUp: false });
+    expect(blocked.ready).toBe(false);
+    expect(blocked.reasons.join(' ')).toContain('CLOSE1_GAP_POLICY=block');
+
+    const degraded = tradingReadiness({
+      ...ready,
+      close1FullyCaughtUp: false,
+      close1GapPolicy: 'degraded_readonly',
+    });
+    expect(degraded.ready).toBe(false);
+    expect(degraded.reasons.join(' ')).toContain('degraded_readonly permits observation only');
+  });
+
+  it('refuses trading while the close1 persisted backlog is still widening', () => {
+    const result = tradingReadiness({ ...ready, close1NetPersistBacklogRate: 42.5 });
+    expect(result.ready).toBe(false);
+    expect(result.reasons.join(' ')).toContain('net persisted backlog is positive');
+  });
+
+  it('refuses trading while an unresolved gap remains on the record', () => {
+    const result = tradingReadiness({ ...ready, unresolvedGap: true });
+    expect(result.ready).toBe(false);
+    expect(result.reasons.join(' ')).toContain('unresolved cursor gap remains');
   });
 });
 
@@ -292,5 +355,62 @@ describe('the live gates are wired', () => {
     expect(report.alerts.blocking).toEqual([]);
     expect(report.alerts.critical.join(' ')).not.toContain('without readback');
     expect(report.alerts.info.join(' ')).toContain('registration disabled / not expected');
+  });
+
+  it('grades a close1 gap by what it could hide, not by its size', async () => {
+    harness = await buildHarness({ agentCount: 8 });
+    const h = harness;
+
+    // Nothing has been registered or posted into close1 yet, so there is nothing
+    // of ours a band could hold: a coverage gap is real and is not critical.
+    h.runtime.repositories.roomCursors.update('close1', {
+      gap: 2,
+      gap_count: 1,
+      last_gap_from: 6,
+      last_gap_to: 7,
+      gap_resolved_at: null,
+    });
+    const plain = h.runtime.reader.tradingRoomCoverage();
+    expect(plain.hasGap).toBe(true);
+    expect(plain.criticalGap).toBe(false);
+
+    // Once registrations have been posted, the same band is no longer provably
+    // free of our work: an unread post of ours could sit anywhere in it, and
+    // "unprovable" is refused.
+    await h.runtime.scheduler.ensureParticipation();
+    const unproven = h.runtime.reader.tradingRoomCoverage();
+    expect(unproven.criticalGap).toBe(true);
+
+    const status = h.runtime.scheduler.status();
+    expect(status.readiness.refereeReady).toBe(false);
+    expect(status.readiness.refereeReasons.join(' ')).toContain('may contain one of our own messages');
+
+    // And a band that is provably below the oldest post of ours we have read back
+    // is a plain coverage gap again — the refusal is about evidence, not alarm.
+    const localDids = [...h.runtime.keyStore.didSet()];
+    h.runtime.repositories.messages.insert({
+      room: 'close1',
+      seq: 900,
+      ts: new Date().toISOString(),
+      sender_did: localDids[0]!,
+      nonce: 'n',
+      sig: 's',
+      text: 'own-post',
+      kind: 'owner',
+      signature_valid: 1,
+      ingested_at: new Date().toISOString(),
+    });
+    h.runtime.repositories.roomCursors.update('close1', {
+      last_gap_from: 6,
+      last_gap_to: 7,
+    });
+    expect(h.runtime.reader.tradingRoomCoverage().criticalGap).toBe(false);
+
+    // A band that reaches our own posts is refused again.
+    h.runtime.repositories.roomCursors.update('close1', {
+      last_gap_from: 899,
+      last_gap_to: 901,
+    });
+    expect(h.runtime.reader.tradingRoomCoverage().criticalGap).toBe(true);
   });
 });

@@ -163,6 +163,19 @@ export class FakeTransport {
    */
   readDelayMs: number;
 
+  /**
+   * Override the `/export` response.
+   *
+   * The real endpoint serves a byte-exact snapshot of the retained ring stamped
+   * with `X-Room-Generation`. The default below does exactly that; a recovery
+   * test needs to model the cases the snapshot itself can be wrong in — malformed
+   * JSONL, a snapshot taken in another generation, a body that hits the caller's
+   * byte ceiling, or one that never arrives at all.
+   */
+  exportImpl:
+    | ((room: FakeRoom, init?: Parameters<typeof fetch>[1]) => Response | Promise<Response>)
+    | null = null;
+
   private readonly forced: ForcedAction[] = [];
   private readonly dupeFilters = new Map<string, DuplicateFilter>();
 
@@ -330,8 +343,18 @@ export class FakeTransport {
       const room = this.room(roomName);
 
       if (exported && method === 'GET') {
+        if (this.exportImpl !== null) return await this.exportImpl(room, init);
         const body = room.retained().map((message) => JSON.stringify(message)).join('\n');
-        return this.response(body, 200, 'application/jsonl');
+        return new Response(body, {
+          status: 200,
+          headers: {
+            'content-type': 'application/jsonl',
+            // The service stamps the snapshot with the epoch it was taken in, and
+            // that stamp is the only thing that makes its seqs comparable with a
+            // cursor at all.
+            'x-room-generation': String(room.generation),
+          },
+        });
       }
       if (method === 'GET') return this.readRoom(room, parsed.searchParams);
       if (method === 'POST') {

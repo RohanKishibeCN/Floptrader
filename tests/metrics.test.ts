@@ -150,12 +150,12 @@ describe('run accounting in a live harness', () => {
     const coverage = report.sections.find((section) => section.heading.includes('运行覆盖'));
     const text = coverage?.lines.join('\n') ?? '';
 
-    expect(text).toContain('runs since startup (this process)');
+    expect(text).toContain('runs since startup');
     expect(text).toContain('agent_runs rows today (durable, spans restarts)');
     expect(text).toContain('watchdog passes');
     expect(text).toContain('full fleet cycles');
     expect(text).toContain('last tick');
-    expect(text).toContain('next tick');
+    expect(text).toContain('next:');
 
     const runtimeSection = report.sections.find((section) => section.heading.includes('运行状态'));
     const runtimeText = runtimeSection?.lines.join('\n') ?? '';

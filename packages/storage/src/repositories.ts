@@ -798,6 +798,40 @@ export class MessageRepository {
   }
 
   /**
+   * Messages of one room inside an inclusive seq range, oldest first.
+   *
+   * This exists for one question only: does a recorded loss band contain
+   * anything of *ours*. `limit` is required to be small because a mid-run gap
+   * can span millions of seqs, and the answer has to be cheap enough to ask on
+   * every report.
+   */
+  inRange(room: string, from: number, to: number, limit = 1): MessageRow[] {
+    if (to < from) return [];
+    return this.db
+      .prepare('SELECT * FROM messages WHERE room = ? AND seq BETWEEN ? AND ? ORDER BY seq ASC LIMIT ?')
+      .all(room, from, to, limit) as MessageRow[];
+  }
+
+  /**
+   * The oldest seq in one room sent by any of `dids`, or null if none is stored.
+   *
+   * This is the sound half of "can this loss band contain one of ours". Our own
+   * posts are strictly ordered by seq, so if the whole band sits *below* the
+   * oldest post of ours we have ever read back, no post of ours can be inside it.
+   * Nothing weaker than that is proof: an unread post could sit anywhere.
+   */
+  earliestSeqFromSenders(room: string, dids: string[]): number | null {
+    if (dids.length === 0) return null;
+    const placeholders = dids.map(() => '?').join(',');
+    const row = this.db
+      .prepare(
+        `SELECT MIN(seq) AS seq FROM messages WHERE room = ? AND sender_did IN (${placeholders})`,
+      )
+      .get(room, ...dids) as { seq: number | null } | undefined;
+    return row?.seq ?? null;
+  }
+
+  /**
    * The newest message of one kind in a room.
    *
    * `signedOnly` restricts it to rows whose room signature verified, which is

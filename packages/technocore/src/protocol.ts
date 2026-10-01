@@ -123,25 +123,84 @@ export function parseTextRoomRead(text: string, room: string): RoomRead {
  */
 export const ASSUMED_SERVER_LIMIT = 200;
 
-/** The query string for a read, including a long poll when `since` is given. */
+/** The documented long-poll ceiling, in seconds. */
+export const MAX_WAIT_SECONDS = 10;
+
+/** The documented page-size ceiling, in messages. */
+export const MAX_PAGE_SIZE = 200;
+
+/**
+ * The query string for a read.
+ *
+ * Three things here are not conveniences:
+ *
+ *   - **`since` is always sent.** A bare `GET /r/<room>` is the documented case
+ *     that "often returns cached bytes" — an agent harness caches per URL, so a
+ *     request without a cursor can be answered from a 15-minute-old copy. `since=0`
+ *     is a valid cursor meaning "everything retained", so there is never a reason
+ *     to omit it.
+ *   - **`n` is always sent.** The service ignores it; its whole purpose is to vary
+ *     the URL so a response cache cannot answer a repeat of the same cursor. The
+ *     manual is explicit: "If you must re-poll an unchanged URL, add a throwaway
+ *     `&n=<counter>`."
+ *   - **`limit` is clamped to the documented 200**, not to a configured number.
+ *     The value is advisory to the server — it clamps rather than refuses — but a
+ *     caller asking for more than the service will ever return only hides a bug.
+ */
 export function readQuery(options: {
   since?: number;
   limit?: number;
   waitSeconds?: number;
   /** The service's own ceiling; `ASSUMED_SERVER_LIMIT` unless configured. */
   maxLimit?: number;
+  /** A throwaway counter that varies the URL past a response cache. */
+  cacheBust?: number | string;
 }): string {
   const params = new URLSearchParams();
-  if (options.since !== undefined) params.set('since', String(options.since));
+  params.set('since', String(Math.max(0, Math.trunc(options.since ?? 0))));
   if (options.limit !== undefined) {
-    const ceiling = Math.max(1, options.maxLimit ?? ASSUMED_SERVER_LIMIT);
+    const ceiling = Math.min(MAX_PAGE_SIZE, Math.max(1, options.maxLimit ?? ASSUMED_SERVER_LIMIT));
     params.set('limit', String(Math.min(ceiling, Math.max(1, options.limit))));
   }
-  if (options.waitSeconds !== undefined && options.since !== undefined) {
-    params.set('wait', String(Math.min(10, Math.max(0, options.waitSeconds))));
+  // `wait` requires `since`, which is now always present.
+  if (options.waitSeconds !== undefined) {
+    params.set('wait', String(Math.min(MAX_WAIT_SECONDS, Math.max(0, options.waitSeconds))));
   }
+  if (options.cacheBust !== undefined) params.set('n', String(options.cacheBust));
   params.set('format', 'json');
   return params.toString();
+}
+
+/**
+ * The `# budget: N of M reads left this minute` footer.
+ *
+ * The service appends it once a bucket drops below a quarter, so a reader can
+ * pace itself instead of discovering the limit by being throttled.
+ */
+export function parseBudgetFooter(body: string): { remaining: number; limit: number } | null {
+  const match = /#\s*budget:\s*(\d+)\s+of\s+(\d+)\s+reads\s+left/i.exec(body);
+  if (!match) return null;
+  return { remaining: Number.parseInt(match[1]!, 10), limit: Number.parseInt(match[2]!, 10) };
+}
+
+/**
+ * The seconds to wait from a 429.
+ *
+ * The body is the authority here, not the header: an agent harness shows the
+ * caller the body and not the headers, so the service puts the retry delay, the
+ * bucket and its refill rate in the text.
+ */
+export function parseRetryAfter(body: string, header: string | null): number | null {
+  const fromBody = /(\d+(?:\.\d+)?)\s*(?:s\b|seconds?)/i.exec(body);
+  if (fromBody) {
+    const seconds = Number.parseFloat(fromBody[1]!);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds;
+  }
+  if (header !== null) {
+    const seconds = Number.parseInt(header, 10);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds;
+  }
+  return null;
 }
 
 export interface RoomCursorView {
@@ -182,7 +241,22 @@ export interface CursorAdvance {
   lastSeq: number | null;
   gap: number;
   roomReset: boolean;
-  reason: 'ok' | 'room_reset' | 'gap' | 'first_read' | 'empty' | 'bootstrap_truncated';
+  /**
+   * Why the cursor moved the way it did.
+   *
+   * `export_recovery` is deliberately distinct from `ok`: it says the cursor was
+   * moved by a *snapshot of the retained ring*, not by a contiguous read. The
+   * cursor store treats it as progress and refuses to let it resolve a gap, which
+   * is the whole point of keeping it separate.
+   */
+  reason:
+    | 'ok'
+    | 'room_reset'
+    | 'gap'
+    | 'first_read'
+    | 'empty'
+    | 'bootstrap_truncated'
+    | 'export_recovery';
   missedFrom?: number;
   missedTo?: number;
 }

@@ -83,6 +83,10 @@ export interface ReaderOptions {
   catchupMaxSeconds?: number;
   /** How long a fixed room may go unread before a fairness warning. */
   fairnessMaxSilenceMs?: number;
+  /** Whether export-assisted recovery may run for a room that recorded a gap. */
+  exportRecovery?: boolean;
+  exportMaxBytes?: number;
+  exportTimeoutMs?: number;
   /**
    * How long a continuous room loop waits after a failed read before retrying.
    * A successful read never waits: the long poll is the pacing.
@@ -313,6 +317,9 @@ export class OrchestratorReader {
       catchingUpMaxRequestsPerSecond: Math.max(0, options.catchupMaxRequestsPerSecond ?? 0),
       catchingUpMaxSeconds: Math.max(0, options.catchupMaxSeconds ?? 0),
       fairnessMaxSilenceMs: Math.max(0, options.fairnessMaxSilenceMs ?? 120_000),
+      exportRecovery: options.exportRecovery === true,
+      ...(options.exportMaxBytes === undefined ? {} : { exportMaxBytes: options.exportMaxBytes }),
+      ...(options.exportTimeoutMs === undefined ? {} : { exportTimeoutMs: options.exportTimeoutMs }),
       localDids: options.localDids,
       // The continuous loops own the fixed rooms, so the durable evidence a read
       // produces — referee snapshots, flow/price anomalies and our own messages —
@@ -362,6 +369,23 @@ export class OrchestratorReader {
    */
   get fixedRoomList(): string[] {
     return [...this.fixedRooms];
+  }
+
+  /**
+   * The five referee rooms, without the trading room.
+   *
+   * The two sets are held to different rules: a gap in any referee room blocks
+   * the referee feed outright, while a gap in `close1` is governed by
+   * `CLOSE1_GAP_POLICY`. Everything that grades a room has to know which set it
+   * is grading, so the split is exposed rather than re-derived by prefix.
+   */
+  get refereeRoomList(): string[] {
+    return this.fixedRooms.filter((room) => room !== this.tradingRoomName);
+  }
+
+  /** The trading room (`close1` unless the rules name another). */
+  get tradingRoomName(): string {
+    return this.rules.tradingRoom || TRADING_ROOM;
   }
 
   /**
@@ -684,6 +708,71 @@ export class OrchestratorReader {
   /** True once the reader has completed a first pass over every room. */
   get warmedUp(): boolean {
     return this.roomReader.warmedUp;
+  }
+
+  /**
+   * How the trading room's coverage looks to the two gates.
+   *
+   * The split matters. A *plain coverage* gap — one we can prove holds nothing of
+   * ours — degrades the report and, under `CLOSE1_GAP_POLICY=degraded_readonly`,
+   * does not hold registration. A *critical* gap is one that could hold one of
+   * our own owner registrations, trades or re-posts, and nothing may wave that
+   * through: the participation record itself would be wrong.
+   *
+   * "Could hold one of ours" is decided from data, never from optimism. Our posts
+   * are strictly ordered by seq, so the only proof that none of ours is inside a
+   * band is that the band ends before the oldest post of ours we have ever read
+   * back. Anything else — a stored local message inside the band, no readback to
+   * compare against, a band that reaches our posts — counts as critical.
+   */
+  tradingRoomCoverage(): {
+    hasGap: boolean;
+    criticalGap: boolean;
+    criticalRooms: string[];
+    fullyCaughtUp: boolean;
+    unattainable: boolean;
+    netPersistBacklogRate: number;
+    mode: string | null;
+  } {
+    const room = this.tradingRoomName;
+    const status = this.roomReader.readerThroughputFor(room);
+    const cursor = this.repositories.roomCursors.get(room);
+    const gapCount = cursor?.gap_count ?? 0;
+    const hasGap = (cursor?.gap ?? 0) > 0 || gapCount > 0;
+    const open = gapCount > 0 && (cursor?.gap_resolved_at ?? null) === null;
+    const criticalRooms: string[] = [];
+    if (open && cursor?.last_gap_from != null && cursor?.last_gap_to != null) {
+      if (this.gapMayHoldLocalMessages(room, cursor.last_gap_from, cursor.last_gap_to)) {
+        criticalRooms.push(room);
+      }
+    }
+    return {
+      hasGap,
+      criticalGap: criticalRooms.length > 0,
+      criticalRooms,
+      fullyCaughtUp: status?.mode === 'fully_caught_up',
+      unattainable: status?.mode === 'unattainable',
+      netPersistBacklogRate: status?.netPersistBacklogRate ?? 0,
+      mode: status?.mode ?? null,
+    };
+  }
+
+  /** Whether a recorded loss band could contain one of our own messages. */
+  private gapMayHoldLocalMessages(room: string, from: number, to: number): boolean {
+    const local = this.localDids();
+    // (1) A local message already stored inside the band settles it outright.
+    for (const row of this.repositories.messages.inRange(room, from, to, 500)) {
+      if (row.sender_did !== null && local.has(row.sender_did)) return true;
+    }
+    // (2) Our own posts are strictly ordered by seq, so a band that ends before
+    //     the oldest post of ours we have ever read back cannot contain one.
+    const earliest = this.repositories.messages.earliestSeqFromSenders(room, [...local]);
+    if (earliest !== null && to < earliest) return false;
+    // (3) Nothing of ours has ever been posted into this room, so there is
+    //     nothing here for the band to hold.
+    if (this.repositories.participation.count() === 0) return false;
+    // (4) Otherwise it cannot be proven, and unprovable is refused.
+    return true;
   }
 
   /**

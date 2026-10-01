@@ -112,7 +112,7 @@ describe('close1 catch-up', () => {
     const stats = reader.throughputStats();
     // Measured on the reader's own rolling window: this is the throughput that
     // decides whether the deployed process can keep up.
-    expect(stats.messagesPerMinute).toBeGreaterThanOrEqual(1_200);
+    expect(stats.returnedPerMinute).toBeGreaterThanOrEqual(1_200);
     expect(stats.cursorAdvancesPerMinute).toBeGreaterThanOrEqual(6);
     expect(stats.cursorAdvances).toBeGreaterThanOrEqual(6);
 
@@ -277,7 +277,7 @@ describe('close1 catch-up, in a whole runtime', () => {
     // The reader writes synchronously inside its own transaction, so a burst of
     // reads must never build a backlog in the writer's queue.
     expect(h.runtime.writer.depth).toBe(0);
-    expect(status.reader.messagesPerMinute).toBeGreaterThanOrEqual(1_200);
+    expect(status.reader.returnedPerMinute).toBeGreaterThanOrEqual(1_200);
     expect(status.reader.cursorAdvancesPerMinute).toBeGreaterThanOrEqual(6);
     expect(status.reader.gaps.unresolved).not.toContain('close1');
     // A dry run with no seed is still not ready: catching up does not arm live.

@@ -2106,18 +2106,46 @@ export class OrchestratorScheduler {
     const verifier = this.reader.verifier.state;
     const readerStatus = this.reader.readerStatus();
     const gaps = this.reader.gaps();
+    // The five referee rooms and `close1` are graded by different rules, so the
+    // sets are split before anything is decided about them: a gap in a referee
+    // room is a hole in the contest record, while a gap in `close1` is graded by
+    // `CLOSE1_GAP_POLICY` — and never waved through when it might hide our own
+    // posts.
+    const refereeRooms = this.reader.refereeRoomList;
+    const refereeSet = new Set(refereeRooms);
+    const coverage = this.reader.tradingRoomCoverage();
+    const lite = this.config.profile === 'lite';
+    // The profile resolves the non-core lanes; this asserts the resolution
+    // actually happened rather than trusting that it did.
+    const profileLaneOk =
+      !lite ||
+      (this.config.technoCore.readerEnabled &&
+        !this.config.deepseek.enabled &&
+        !this.config.externalOfferTakerEnabled &&
+        this.config.roomDiscovery.maxRooms === 0);
+    const identities = this.repositories.identities.all();
+    const enabled = identities.filter((row) => row.enabled === 1).length;
+    const total = this.keyStore.size;
+    const fleetComplete = total > 0 && enabled === total;
     const referee = refereeReadiness({
       readerContinuous: readerStatus.continuousMode,
       readerRunning: readerStatus.running,
-      fixedRoomCount: readerStatus.fixedRoomCount,
-      expectedFixedRoomCount: this.reader.fixedRoomList.length,
-      roomsWithGap: gaps.rooms,
+      refereeRoomCount: readerStatus.fixedRoomCount - (coverage.mode === null ? 0 : 1),
+      expectedRefereeRoomCount: refereeRooms.length,
+      refereeRoomsWithGap: gaps.rooms.filter((room) => refereeSet.has(room)),
       // The reader's own verdict, not the durable `gap_resolved_at` flag: a room
       // whose cursor resumed while it is still behind is not resolved.
-      roomsWithUnresolvedGap: readerStatus.unresolvedGapRooms,
-      netBacklogIncreasing: readerStatus.netBacklogIncreasing,
-      catchupState: readerStatus.catchupState,
-      roomsReset: gaps.resets,
+      refereeRoomsWithUnresolvedGap: readerStatus.unresolvedGapRooms.filter((room) =>
+        refereeSet.has(room),
+      ),
+      refereeRoomsReset: gaps.resets.filter((room) => refereeSet.has(room)),
+      tradingRoomHasCoverageGap: coverage.hasGap,
+      tradingRoomCriticalGap: coverage.criticalGap,
+      tradingRoomCriticalGapRooms: coverage.criticalRooms,
+      tradingRoomUnattainable: coverage.unattainable,
+      close1GapPolicy: this.config.technoCore.close1GapPolicy,
+      profileLaneOk,
+      fleetComplete,
       seedSeen: verifier.seedSeen,
       refereeDid: verifier.refereeDid,
       expectedRefereeDid: this.config.expectedRefereeDid,
@@ -2127,9 +2155,6 @@ export class OrchestratorScheduler {
       requirePin: this.config.requireRefereePin,
     });
 
-    const identities = this.repositories.identities.all();
-    const enabled = identities.filter((row) => row.enabled === 1).length;
-    const total = this.keyStore.size;
     const trading = tradingReadiness({
       referee,
       conservative: verifier.conservative,
@@ -2146,9 +2171,15 @@ export class OrchestratorScheduler {
       locked: verifier.locked,
       loadAllowsNewOffer: this.loadGuard.allow('new_offer'),
       packageDrift: Number(this.repositories.upstream.getPin()?.drift ?? 0) === 1,
-      fleetComplete: total > 0 && enabled === total,
+      fleetComplete,
       registrationRequired: this.config.liveArmed,
       registrationReadbackComplete: this.repositories.participation.countWithReadback() >= total,
+      close1GapPolicy: this.config.technoCore.close1GapPolicy,
+      // Only the full caught-up test satisfies this. `degraded_readonly` never
+      // does: it keeps observation and registration alive and no more.
+      close1FullyCaughtUp: coverage.fullyCaughtUp,
+      close1NetPersistBacklogRate: coverage.netPersistBacklogRate,
+      unresolvedGap: readerStatus.unresolvedGap,
     });
     return { referee, trading };
   }
@@ -2410,10 +2441,35 @@ export class OrchestratorScheduler {
     // as "catching up".
     if (status.reader.netBacklogIncreasing || status.reader.catchupState === 'unattainable') {
       critical.push(
-        `close1 ingest rate exceeds reader capacity: producer ${status.reader.estimatedProducerRate}/min vs consumer ` +
-          `${status.reader.estimatedConsumerRate}/min, net backlog ${status.reader.estimatedBacklogRate}/min, ` +
+        'catch-up unattainable under current API capacity: producer ' +
+          `${status.reader.estimatedProducerRate}/min vs persisted ${status.reader.estimatedPersistedRate}/min ` +
+          `(cursor advance ${status.reader.estimatedCursorAdvanceRate}/min), ` +
+          `net persisted backlog ${status.reader.estimatedBacklogRate}/min, ` +
           `limit ${status.reader.limit} (server ${status.reader.serverLimit}), read concurrency ${status.reader.concurrency}`,
       );
+    } else if (status.reader.estimatedBacklogRate > 0) {
+      // The weaker, one-window statement. It is deliberately a different sentence
+      // from the two-window verdict above, because "behind this minute" and "cannot
+      // win" are different findings and only one of them is a capacity problem.
+      warning.push(
+        'producer rate exceeds persisted consumer rate: producer ' +
+          `${status.reader.estimatedProducerRate}/min vs persisted ${status.reader.estimatedPersistedRate}/min over the last window`,
+      );
+    }
+    if (status.reader.unresolvedGap) {
+      const rooms = status.reader.unresolvedGapRooms.join(', ') || 'unlabelled';
+      // Worded exactly, never "caught up again": a contiguous resume is not
+      // recovery, and the historical gap stays on the record either way.
+      const note =
+        status.reader.contiguousResumeCount > 0
+          ? 'contiguous resume observed; historical gap remains'
+          : 'unresolved gap remains';
+      const line = `${note}: ${rooms}`;
+      if (status.reader.unattainableRooms.length > 0 || status.reader.netBacklogIncreasing) {
+        critical.push(line);
+      } else {
+        warning.push(line);
+      }
     }
     if (status.tier === 'critical' || status.tier === 'readonly') {
       critical.push(`load tier ${status.tier}: ${status.tierReasons.join('; ')}`);
@@ -2479,15 +2535,14 @@ export class OrchestratorScheduler {
             `process_uptime: ${status.system.uptimeSeconds}s`,
             `profile: ${status.profile}`,
             `current_mode: ${status.mode}${status.liveArmed ? ' (live armed)' : ' (dry-run)'}`,
-            `current_sweep: ${status.sweep ?? '-'}`,
-            `locked: ${status.locked}`,
-            `conservative: ${status.conservative}${
+            `current_sweep: ${status.sweep ?? '-'} · locked: ${status.locked} · conservative: ${status.conservative}${
               status.conservative
                 ? ` (${status.conservativeReasons.join('; ') || 'reason unlabelled'})`
                 : ''
             }`,
-            `package_hash: ${status.packageHash ?? '-'}`,
-            `referee_did: ${status.refereeDid ?? '-'}`,
+            // The package hash, the referee DID, the lock and conservative mode
+            // are all printed in 比赛状态 below; repeating them here would spend
+            // report budget on the same four facts.
             `referee_ready: ${status.readiness.refereeReady}${
               status.readiness.refereeReady ? '' : ` (${status.readiness.refereeReasons.join('; ') || 'reason unlabelled'})`
             }`,
@@ -2499,10 +2554,8 @@ export class OrchestratorScheduler {
                 ? `bootstrap_truncated in ${status.cors.bootstrap.join(', ')}`
                 : 'ready (no room opened with truncated history)'
             }`,
-            `cursor gaps: ${status.cors.gaps}${status.cors.gapRooms.length ? ` (${status.cors.gapRooms.join(', ')})` : ''}`,
-            `room_scope: ${status.rooms.scope}`,
-            `load tier: ${status.tier}${status.tierReasons.length ? ` (${status.tierReasons.join('; ')})` : ''}`,
-            `process CPU: ${
+            `cursor gaps: ${status.cors.gaps}${status.cors.gapRooms.length ? ` (${status.cors.gapRooms.join(', ')})` : ''} · room_scope: ${status.rooms.scope}`,
+            `load tier: ${status.tier}${status.tierReasons.length ? ` (${status.tierReasons.join('; ')})` : ''} · process CPU: ${
               status.system.cpuPercent === null
                 ? 'warming_up (needs two tick samples)'
                 : `${status.system.cpuPercent}% of one core over the last tick`
@@ -2513,22 +2566,29 @@ export class OrchestratorScheduler {
         {
           heading: '读取器 (reader)',
           lines: [
-            // Deliberately compact: the rendered message has a hard character
-            // budget, so the section carries exactly the fields an operator needs
-            // to judge throughput — mode, catch-up state, the page size and its
-            // ceiling, the producer/consumer/net rates, and the gap/health view
-            // with the unresolved gap named separately from the permanent record.
-            // The rest of the reader's throughput lives in `status()`.
-            `mode: ${status.reader.continuousMode ? 'continuous' : 'scheduler tick'} · rooms: ${status.reader.fixedRoomCount} · active: ${status.reader.activeRequests} · catch-up state: ${status.reader.catchupState}`,
-            `reads/min: ${status.reader.readsPerMinute} · messages/min: ${status.reader.messagesPerMinute} · cursor adv/min: ${status.reader.cursorAdvancesPerMinute} · limit: ${status.reader.limit} (server ${status.reader.serverLimit})`,
-            // The three rates are the honest answer to "are we keeping up". They
-            // are separate figures on purpose: `messages/min` alone cannot tell a
-            // reader that keeps up from one that is being left behind, because a
-            // producer that outruns us produces the same consumption number.
-            `producer/min: ${status.reader.estimatedProducerRate} · consumer/min: ${status.reader.estimatedConsumerRate} · net backlog/min: ${status.reader.estimatedBacklogRate}${status.reader.netBacklogIncreasing ? ' (INCREASING over 2 windows)' : ''} · resumes: ${status.reader.contiguousResumeCount} · recoveries: ${status.reader.gapRecoveryCount}`,
+            // Deliberately compact — the rendered message has a hard character
+            // budget. Exactly the fields an operator needs to judge throughput:
+            // the mode of every room (quiet rooms summarised), the page size and
+            // its ceiling, the three *separate* rates, the coverage verdict, the
+            // lifetime totals, the export result and the service's own pacing.
+            `mode: ${status.reader.continuousMode ? 'continuous' : 'scheduler tick'} · rooms: ${status.reader.fixedRoomCount} · active: ${status.reader.activeRequests} · catch-up: ${status.reader.catchupState} · limit: ${status.reader.limit}/${status.reader.serverLimit}`,
+            `room modes: ${Object.entries(status.reader.modeByRoom)
+              .filter(([, mode]) => mode !== 'normal')
+              .map(([room, mode]) => `${room.replace(/^d-close1-/, '')}=${mode}`)
+              .join(' ') || 'all normal'}`,
+            // The rates are the honest answer to "are we keeping up", and two of
+            // them are deliberately separate from the third: `persisted/min` is
+            // consumption, while `cursor-adv/min` is only how far the cursor
+            // *number* moved — a cursor steps over a gap nobody stored, so showing
+            // it alone is how a reader that is losing ground comes to look healthy.
+            `rates/min: reads ${status.reader.readsPerMinute} · returned ${status.reader.returnedPerMinute} · producer ${status.reader.estimatedProducerRate} · persisted ${status.reader.estimatedPersistedRate} · cursor-adv ${status.reader.estimatedCursorAdvanceRate} · lost-gap ${status.reader.estimatedLostGapRate} · req ${Math.round(status.reader.rooms.reduce((sum, row) => sum + row.avgRequestDurationMs, 0) / Math.max(1, status.reader.rooms.length))}ms`,
+            `net persisted backlog/min: ${status.reader.estimatedBacklogRate}${status.reader.netBacklogIncreasing ? ' (INCREASING over 2 windows)' : ''} · page-saturated: ${status.reader.pageSaturated} · fully-caught-up: ${status.reader.fullyCaughtUp} · unattainable: ${status.reader.unattainableRooms.join(', ') || 'none'}`,
+            `totals: returned ${status.reader.returnedMessages} · persisted ${status.reader.persistedMessages} · duplicate ${status.reader.duplicateMessages} · rejected ${status.reader.rejectedMessages} · signed ${status.reader.signedMessages} · bad-sig ${status.reader.invalidSignatureMessages} · cursor-adv ${status.reader.cursorSequenceAdvance} · gap ${status.reader.gapMessages}`,
+            `export: attempts ${status.reader.exportRecovery.attempts} · ok ${status.reader.exportRecovery.succeeded} · failed ${status.reader.exportRecovery.failed} · gen-mismatch ${status.reader.exportRecovery.generationMismatch} · recovered ${status.reader.exportRecovery.recoveredMessages} · malformed ${status.reader.exportRecovery.malformedRecords} · 429 ${status.reader.throttledReads} · timeout ${status.reader.timeoutReads} · wait-not-held ${status.reader.waitNotHeld} · budget ${status.reader.budgetRemaining ?? '-'}/${status.reader.budgetLimit ?? '-'}`,
             `health: ${status.reader.healthy ? 'healthy' : status.reader.healthReasons.join('; ')} · recorded gaps: ${status.reader.gaps.total}${
               status.reader.gaps.rooms.length ? ` (${status.reader.gaps.rooms.join(', ')})` : ''
-            } · unresolved gap: ${status.reader.unresolvedGapRooms.join(', ') || 'none'} · page saturated: ${status.reader.pageSaturated} · silent: ${status.reader.silentRooms.join(', ') || 'none'} · error: ${status.reader.lastError ?? 'none'}`,
+            } · unresolved gap: ${status.reader.unresolvedGapRooms.join(', ') || 'none'} · resumes: ${status.reader.contiguousResumeCount} · recoveries: ${status.reader.gapRecoveryCount}`,
+            `fairness: silent ${status.reader.silentRooms.join(', ') || 'none'} · warned ${status.reader.rooms.filter((row) => row.fairnessWarning).map((row) => row.room).join(', ') || 'none'} · bound ${status.reader.rooms[0]?.fairnessBudgetMs ?? '-'}ms · error: ${status.reader.lastError ?? 'none'}`,
           ],
         },
         {
@@ -2548,43 +2608,35 @@ export class OrchestratorScheduler {
         {
           heading: '参赛证据',
           lines: [
-            `total_agents: ${status.agents.total}`,
-            `enabled_agents: ${status.agents.enabled}`,
+            `total_agents: ${status.agents.total} · enabled: ${status.agents.enabled} · strategy failures: ${status.agents.failures}`,
             `groups: ${STRATEGY_GROUPS.map((group) => `${group}=${status.agents.byGroup[group] ?? 0}`).join(' ')}`,
-            `strategy failures: ${status.agents.failures}`,
-            `registration count: ${status.participation.total}`,
-            `registration readback count: ${status.participation.readback}`,
+            `registration count: ${status.participation.total} · readback: ${status.participation.readback}`,
             `statuses: ${participationStatuses}`,
-            `mint_observed: ${status.participation.mint_observed ?? 0}`,
-            `mint_unknown: ${status.participation.mint_unknown ?? 0}`,
+            `mint observed: ${status.participation.mint_observed ?? 0} · unknown: ${status.participation.mint_unknown ?? 0}`,
           ],
         },
         {
           heading: '运行覆盖 (7x24h)',
           lines: [
-            `runs since startup (this process): ${status.runs.sinceStartup}`,
-            `scheduler ticks (this process): ${status.runs.schedulerTicks}`,
-            `unique agents evaluated (this process): ${status.runs.uniqueAgents}/${status.agents.total}`,
+            `runs since startup: ${status.runs.sinceStartup} · scheduler ticks: ${status.runs.schedulerTicks} · unique agents: ${status.runs.uniqueAgents}/${status.agents.total}`,
             `full fleet cycles: ${status.runs.fullFleetCycles}`,
-            `agents run in current tick: ${status.runs.agentsInCurrentTick}`,
-            `watchdog passes: ${status.runs.watchdogRuns}`,
-            `last tick: ${status.runs.lastTickAt ?? 'never'}`,
-            `next tick: ${status.runs.nextTickAt ?? '-'}`,
+            `watchdog passes: ${status.runs.watchdogRuns} · last tick: ${status.runs.lastTickAt ?? 'never'} · next: ${status.runs.nextTickAt ?? '-'} · this tick: ${status.runs.agentsInCurrentTick}`,
             // The durable count spans every process that ran today, so it sits
             // next to the process's own figures rather than replacing them.
-            `agent_runs rows today (durable, spans restarts): ${status.runs.today}`,
-            `agent_runs rows in window (durable): ${status.runs.window}`,
-            `agents_run_in_last_window: ${status.agents.total - status.agents.staleCount}`,
-            `agents_not_run_in_last_window: ${status.agents.staleCount}`,
-            `last_agent_run_at: ${status.agents.lastRunAt ?? 'never'}`,
-            `missing agent ids: ${status.agents.staleSample.join(', ') || 'none'}`,
+            `agent_runs rows today (durable, spans restarts): ${status.runs.today} · in window: ${status.runs.window}`,
+            `agents_run_in_last_window: ${status.agents.total - status.agents.staleCount} · not run: ${status.agents.staleCount} · last run: ${status.agents.lastRunAt ?? 'never'} · missing ids: ${status.agents.staleSample.join(', ') || 'none'}`,
           ],
         },
         {
           heading: '策略分组',
-          lines: groupStats.map(
-            (entry) => `${entry.group}: runs ${entry.runs} agents ${entry.agents}/${status.agents.byGroup[entry.group] ?? 0}`,
-          ),
+          // One line rather than five: the per-group agent counts already appear
+          // above, so repeating them here would spend report budget on the same
+          // five numbers.
+          lines: [
+            groupStats
+              .map((entry) => `${entry.group} ${entry.runs}/${entry.agents}`)
+              .join(' · '),
+          ],
         },
         {
           heading: '交易',
@@ -2594,14 +2646,9 @@ export class OrchestratorScheduler {
             `trades in current sweep: ${status.tradeSweeps.inCurrent}`,
             `trades after lock (should be 0): ${status.tradeSweeps.afterLock}`,
             `duplicate trade attempts: ${status.tradeSweeps.duplicateAttempts}`,
-            `by status: ${Object.entries(status.trades)
-              .filter(([key]) => key !== 'total')
-              .map(([key, value]) => `${key}=${value}`)
-              .join(' ') || 'none'}`,
-            // The cursor-gap and bootstrap lines live in 运行状态; repeating them
-            // here would spend report budget on the same two facts.
+            // The cursor-gap, bootstrap and readiness lines live in 运行状态;
+            // repeating them here would spend report budget on the same facts.
             `room resets: ${status.cors.resets.join(', ') || 'none'}`,
-            `referee_ready: ${status.readiness.refereeReady} trading_ready: ${status.readiness.tradingReady}`,
           ],
         },
         {
@@ -2610,7 +2657,7 @@ export class OrchestratorScheduler {
             `official reasons: ${Object.entries(status.funds.officialReasons)
               .map(([key, value]) => `${key}=${value}`)
               .join(' ') || 'none'}`,
-            `official reason: funds — official side: unknown (the referee names a reason, never a side)`,
+            `official side: unknown (the referee names a reason, never a side)`,
             `local inferred side: ${this.localFundsSideSummary()} — confidence: local_inference`,
             `funds verdicts (official): ${status.funds.fundsVerdicts}`,
             `trades carrying a local inference: ${status.funds.localInferred}`,
@@ -2623,7 +2670,6 @@ export class OrchestratorScheduler {
             `dynamic rooms (${status.rooms.dynamic.length}/${status.rooms.cap}): ${
               status.rooms.dynamic.join(', ') || 'none'
             }`,
-            `MAX_DISCOVERED_ROOMS: ${status.rooms.cap}`,
           ],
         },
         {

@@ -211,13 +211,19 @@ describe('a lite runtime', () => {
     expect(rendered).toContain('total_agents: 6');
     // The reader's throughput has to be legible in the report, and the two
     // figures that answer "are we keeping up" have to be separate ones: the
-    // producer rate is the room's own growth, the consumer rate is what we
-    // stored, and the gap that is still open is named on its own.
-    expect(rendered).toContain('producer/min:');
-    expect(rendered).toContain('consumer/min:');
-    expect(rendered).toContain('net backlog/min:');
-    expect(rendered).toContain('catch-up state:');
+    // producer rate is the room's own growth, the persisted rate is what reached
+    // SQLite, the cursor-advance rate is only how far the cursor *number* moved,
+    // and the gap that is still open is named on its own.
+    expect(rendered).toContain('rates/min:');
+    expect(rendered).toContain('producer');
+    expect(rendered).toContain('persisted');
+    expect(rendered).toContain('cursor-adv');
+    expect(rendered).toContain('net persisted backlog/min:');
+    expect(rendered).toContain('catch-up:');
     expect(rendered).toContain('unresolved gap:');
+    expect(rendered).toContain('fully-caught-up:');
+    expect(rendered).toContain('export:');
+    expect(rendered).toContain('fairness:');
 
     // Nothing secret may survive into the report: not the Lark app secret, not
     // the model key, not a seed, not the private key.

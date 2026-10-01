@@ -209,7 +209,7 @@ describe('RoomReader continuous mode', () => {
     expect(transport.requestCount('close1')).toBeGreaterThanOrEqual(3);
     expect(reader.gaps().rooms).not.toContain('close1');
     expect(reader.gaps().total).toBe(0);
-    expect(reader.throughputStats().messagesPerMinute).toBeGreaterThanOrEqual(500);
+    expect(reader.throughputStats().returnedPerMinute).toBeGreaterThanOrEqual(500);
   });
 
   it('reports a sustained page as backlog, and a backlog is not a gap', async () => {

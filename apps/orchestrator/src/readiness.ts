@@ -24,24 +24,49 @@ export interface RefereeReadinessInputs {
   readerContinuous: boolean;
   /** Those loops are actually running (not stopping, not failed to start). */
   readerRunning: boolean;
-  fixedRoomCount: number;
-  expectedFixedRoomCount: number;
-  /** Fixed rooms carrying a recorded cursor gap: a real mid-run loss. */
-  roomsWithGap: string[];
+  /** The five referee rooms, without the trading room. */
+  refereeRoomCount: number;
+  expectedRefereeRoomCount: number;
+  /** Referee rooms carrying a recorded cursor gap: a real mid-run loss. */
+  refereeRoomsWithGap: string[];
   /** Of those, the ones still *open*: no contiguous read has resumed past them. */
-  roomsWithUnresolvedGap: string[];
+  refereeRoomsWithUnresolvedGap: string[];
+  /** Referee rooms whose generation was reset. */
+  refereeRoomsReset: string[];
+  /** The trading room carries *some* recorded gap, open or recovered. */
+  tradingRoomHasCoverageGap: boolean;
   /**
-   * Two consecutive 60-second windows with the producer outrunning the reader.
+   * An unresolved gap in the trading room that may contain one of our own posts.
    *
-   * This is the fact that says "we are losing messages faster than we can store
-   * them" without waiting for the loss to appear in `gap`. Recording a gap is
-   * the consequence, not the evidence.
+   * `close1` is where our own owner registrations, trades and re-posts live. A
+   * gap there is not merely a hole in the feed: if the missing range could hold
+   * one of our messages, the participation record itself is incomplete, and no
+   * policy setting may wave that through.
    */
-  netBacklogIncreasing: boolean;
-  /** The reader's own catch-up verdict, including `unattainable`. */
-  catchupState: 'normal' | 'catching_up' | 'unattainable' | 'fully_caught_up';
-  /** Fixed rooms whose generation was reset. */
-  roomsReset: string[];
+  tradingRoomCriticalGap: boolean;
+  /** The rooms behind `tradingRoomCriticalGap`, for the message. */
+  tradingRoomCriticalGapRooms: string[];
+  /**
+   * The trading room's catch-up is measured to be unattainable.
+   *
+   * This is arithmetic, not effort: the producer has outrun what we can store
+   * across whole windows, so the feed will keep losing messages however hard the
+   * reader works. It blocks registration as well as trading.
+   */
+  tradingRoomUnattainable: boolean;
+  /**
+   * What a trading-room gap does to this gate.
+   *
+   * `block` refuses outright. `degraded_readonly` keeps reading and reporting —
+   * registration is not held by a *plain coverage* gap — while trading stays
+   * refused and the coverage is never reported as complete. Neither value
+   * unblocks a critical gap or an unattainable room.
+   */
+  close1GapPolicy: 'block' | 'degraded_readonly';
+  /** The profile and lane configuration match the profile being run. */
+  profileLaneOk: boolean;
+  /** Every agent in the fleet is present and enabled. */
+  fleetComplete: boolean;
   /** A seed post was read, signature-checked and accepted. */
   seedSeen: boolean;
   refereeDid: string | null;
@@ -57,19 +82,18 @@ export interface RefereeReadinessInputs {
 }
 
 /**
- * May this process treat the referee as established?
+ * May this process treat the referee as established, and post its registrations?
  *
  * Every clause is a fact, never an inference: a seed we accepted, a sender that
  * matches the pin, a package that matches the pin, a verifier rebuilt from
- * durable history, and no fixed room carrying a recorded loss. Nothing here
- * "adopts the first sender" — an unpinned process fails the gate, which is the
- * point.
+ * durable history, and no referee room carrying a recorded loss.
  *
- * The reader clauses are part of the same gate because they are the same
- * question. A process that cannot read `close1` fast enough to stay inside the
- * retained window is losing messages it will trade on, so "the reader is
- * continuous, it owns all six rooms, and none of them carries a gap" has to hold
- * before a live registration is posted.
+ * The five referee rooms and the trading room are graded separately, because
+ * they are genuinely different questions. A gap in any referee room means the
+ * referee feed itself is incomplete, and there is no policy under which that is
+ * acceptable — the whole contest record comes from those five rooms. A gap in
+ * `close1` is graded by `CLOSE1_GAP_POLICY`, and it can never be waved through
+ * when it might hide one of our own messages.
  */
 export function refereeReadiness(input: RefereeReadinessInputs): Readiness {
   const reasons: string[] = [];
@@ -78,32 +102,37 @@ export function refereeReadiness(input: RefereeReadinessInputs): Readiness {
   } else if (!input.readerRunning) {
     reasons.push('continuous reader is not running');
   }
-  if (input.fixedRoomCount !== input.expectedFixedRoomCount) {
+  if (input.refereeRoomCount !== input.expectedRefereeRoomCount) {
     reasons.push(
-      `reader owns ${input.fixedRoomCount} fixed rooms, expected ${input.expectedFixedRoomCount}`,
+      `reader owns ${input.refereeRoomCount} referee rooms, expected ${input.expectedRefereeRoomCount}`,
     );
   }
-  if (input.roomsWithUnresolvedGap.length > 0) {
-    reasons.push(`unresolved cursor gap in ${input.roomsWithUnresolvedGap.join(', ')}`);
-  } else if (input.roomsWithGap.length > 0) {
-    // Still a refusal: a recorded loss is permanent evidence and is never cleared
-    // by a recovery. The distinction is only in *what the operator is told* — an
-    // open gap means the reader is still losing, a recovered one means it caught
-    // up but the loss happened and a human has to decide about it.
+  if (input.refereeRoomsWithUnresolvedGap.length > 0) {
     reasons.push(
-      `recorded cursor gap in ${input.roomsWithGap.join(', ')} (recovered, still on the record)`,
+      `unresolved cursor gap in referee room(s) ${input.refereeRoomsWithUnresolvedGap.join(', ')}`,
+    );
+  } else if (input.refereeRoomsWithGap.length > 0) {
+    // Still a refusal: a recorded loss in a referee room is permanent evidence
+    // and is never cleared by a recovery. The distinction is only in *what the
+    // operator is told* — an open gap means the reader is still losing, a
+    // recovered one means it caught up but the loss happened.
+    reasons.push(
+      `recorded cursor gap in referee room(s) ${input.refereeRoomsWithGap.join(', ')} (recovered, still on the record)`,
     );
   }
-  // A reader that is measured to be losing ground is a refusal in its own right,
-  // and a separate one from the gap: the backlog can widen for whole windows
-  // before the first message is actually dropped from the retained ring.
-  if (input.catchupState === 'unattainable') {
-    reasons.push('the trading room ingest rate exceeds reader capacity (catch-up unattainable)');
-  } else if (input.netBacklogIncreasing) {
-    reasons.push('reader net backlog is increasing over two consecutive windows');
+  if (input.refereeRoomsReset.length > 0) {
+    reasons.push(`referee room recreated: ${input.refereeRoomsReset.join(', ')}`);
   }
-  if (input.roomsReset.length > 0) {
-    reasons.push(`room recreated: ${input.roomsReset.join(', ')}`);
+  if (input.tradingRoomCriticalGap) {
+    reasons.push(
+      `close1 gap may contain one of our own messages: ${input.tradingRoomCriticalGapRooms.join(', ') || 'close1'}`,
+    );
+  }
+  if (input.tradingRoomUnattainable) {
+    reasons.push('close1 catch-up unattainable under current API capacity');
+  }
+  if (input.tradingRoomHasCoverageGap && input.close1GapPolicy === 'block') {
+    reasons.push('close1 carries a recorded gap and CLOSE1_GAP_POLICY=block');
   }
   if (!input.seedSeen) reasons.push('referee seed not read');
   if (input.refereeDid === null) {
@@ -118,6 +147,8 @@ export function refereeReadiness(input: RefereeReadinessInputs): Readiness {
   } else if (input.expectedPackageHash !== null && input.packageHash !== input.expectedPackageHash) {
     reasons.push('seed package hash differs from the pinned package');
   }
+  if (!input.profileLaneOk) reasons.push('profile/lane configuration does not match the profile');
+  if (!input.fleetComplete) reasons.push('the agent fleet is not complete');
   if (!input.hydrated) reasons.push('verifier not hydrated from stored referee history');
   return { ready: reasons.length === 0, reasons };
 }
@@ -139,6 +170,20 @@ export interface TradingReadinessInputs {
   /** Live, with registration enabled: every agent must be read back first. */
   registrationRequired: boolean;
   registrationReadbackComplete: boolean;
+  /** `CLOSE1_GAP_POLICY`, so the refusal can name which rule produced it. */
+  close1GapPolicy: 'block' | 'degraded_readonly';
+  /**
+   * The trading room passed the full caught-up test.
+   *
+   * This is the only thing that satisfies the coverage clause. `degraded_readonly`
+   * does *not*: it keeps reading, reporting and registration alive, and it never
+   * permits a trade — `close1 普通 coverage gap 时 degraded_readonly 仍禁止 trading`.
+   */
+  close1FullyCaughtUp: boolean;
+  /** The trading room's measured `producer - persisted` backlog, messages/minute. */
+  close1NetPersistBacklogRate: number;
+  /** At least one room has a recorded gap that is not operationally closed. */
+  unresolvedGap: boolean;
 }
 
 /**
@@ -146,9 +191,12 @@ export interface TradingReadinessInputs {
  *
  * This mirrors, in one place, every condition the trade path already enforced
  * separately — the referee gate, the lock, the package pin, the load guard, the
- * `for` label and the stale clock — plus the two whole-fleet conditions a live
- * launch needs. The trade path still checks what it must; this is the single
- * answer the report and the operator can both read.
+ * `for` label and the stale clock — plus the three coverage conditions a live
+ * trade needs: the trading room fully caught up, a backlog that is not widening,
+ * and a gap policy that permits trading at all. `degraded_readonly` never does:
+ * the coverage clause is satisfied by `fully_caught_up` alone, so a gap in
+ * `close1` refuses every trade whichever policy is set, and the report says so
+ * rather than calling the room covered.
  */
 export function tradingReadiness(input: TradingReadinessInputs): Readiness {
   const reasons: string[] = [];
@@ -157,6 +205,23 @@ export function tradingReadiness(input: TradingReadinessInputs): Readiness {
   }
   if (input.conservative) {
     reasons.push(`conservative mode: ${input.conservativeReasons.join('; ') || 'unlabelled'}`);
+  }
+  if (!input.close1FullyCaughtUp) {
+    // Named by policy so an operator can tell "the room is behind" from "the room
+    // is behind and we deliberately chose to keep observing anyway".
+    reasons.push(
+      input.close1GapPolicy === 'degraded_readonly'
+        ? 'close1 is not fully caught up; degraded_readonly permits observation only, never a trade'
+        : 'close1 is not fully caught up (CLOSE1_GAP_POLICY=block)',
+    );
+  }
+  if (input.unresolvedGap) {
+    reasons.push('an unresolved cursor gap remains on the record');
+  }
+  if (input.close1NetPersistBacklogRate > 0) {
+    reasons.push(
+      `close1 net persisted backlog is positive (${input.close1NetPersistBacklogRate}/min): the producer outruns what reaches SQLite`,
+    );
   }
   if (input.sweep === null) reasons.push('no current sweep');
   if (!input.hasReference) reasons.push('no reference price');

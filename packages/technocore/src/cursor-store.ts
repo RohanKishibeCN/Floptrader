@@ -90,24 +90,67 @@ export function nextBootstrapState(
         ? 'cursor_gap'
         : reason === 'room_reset'
           ? 'cursor_reset'
-          : 'ready';
+          : // `export_recovery` is progress, not an incident: it moves the cursor
+            // from a snapshot of the retained ring and must not escalate the state.
+            'ready';
   return BOOTSTRAP_RANK[candidate] > BOOTSTRAP_RANK[current] ? candidate : current;
+}
+
+/**
+ * What one commit actually did, in the four counts that cannot be conflated.
+ *
+ * `returned` is what the service sent, `inserted` is what reached SQLite, and
+ * the difference is duplicates — the same seq arriving twice, which is what a
+ * cached reply or a re-read produces. Only `inserted` may be called consumption.
+ */
+export interface CommitResult {
+  /** Messages the caller offered to the commit. */
+  returned: number;
+  /** Rows actually written. A seq already stored is not counted again. */
+  inserted: number;
+  /** Offered messages whose seq was already stored. */
+  duplicates: number;
+  /** Offered messages carrying a signature that verified against the sender. */
+  signed: number;
+  /** Offered messages carrying a signature that did NOT verify. */
+  invalidSignature: number;
+  /**
+   * Offered messages that were neither stored nor recognised as duplicates.
+   *
+   * Structurally zero on the current path — every well-formed message is stored
+   * and every repeat is a duplicate — and kept so a future rejection cannot go
+   * uncounted. It is derived, never asserted.
+   */
+  rejected: number;
 }
 
 export interface CursorStore {
   load(room: string): CursorRecord;
   /**
-   * Persist the messages and the advanced cursor atomically. Returns the number
-   * of newly inserted messages. Implementations MUST NOT advance the cursor when
-   * the message insert failed.
+   * Persist the messages and the advanced cursor atomically.
+   *
+   * Implementations MUST NOT advance the cursor when the message insert failed,
+   * and must report what they actually wrote rather than what they were handed:
+   * a caller that equates the two is exactly how a re-read of the same page
+   * masquerades as consumption.
    */
   commit(
     room: string,
     messages: RoomMessage[],
     advance: CursorAdvance,
     ingestedAt: string,
-  ): number;
+  ): CommitResult;
   recordError(room: string, message: string, at: string): void;
+  /**
+   * Close an open gap on evidence, not on the passage of time.
+   *
+   * Called only when the message store has been shown to hold every seq in the
+   * recorded gap range. A contiguous read does not qualify (that is what the
+   * ordinary commit decides), and neither does an export: a snapshot of the
+   * retained ring can never contain a range the ring dropped, so it can never
+   * close the very gap it is used to work around.
+   */
+  markGapResolved(room: string, at: string): void;
   all(): CursorRecord[];
 }
 
@@ -140,10 +183,13 @@ export class SqliteCursorStore implements CursorStore {
     return toCursorRecord(this.repositories.roomCursors.ensure(room));
   }
 
-  commit(room: string, messages: RoomMessage[], advance: CursorAdvance, ingestedAt: string): number {
+  commit(room: string, messages: RoomMessage[], advance: CursorAdvance, ingestedAt: string): CommitResult {
     const repositories = this.repositories;
     const map = this.mapMessage;
     let inserted = 0;
+    let duplicates = 0;
+    let signed = 0;
+    let invalidSignature = 0;
 
     // One transaction: either the messages land and the cursor moves, or neither
     // happens. A cursor that outran its messages is a silent data loss.
@@ -152,6 +198,8 @@ export class SqliteCursorStore implements CursorStore {
         const classified = map
           ? map(room, message, ingestedAt)
           : { senderDid: message.from ?? null, nonce: null, sig: null, kind: 'chatter', signatureValid: null };
+        if (classified.signatureValid === true) signed += 1;
+        if (classified.signatureValid === false) invalidSignature += 1;
         const wasInserted = repositories.messages.insert({
           room,
           seq: message.seq,
@@ -170,6 +218,7 @@ export class SqliteCursorStore implements CursorStore {
           ingested_at: ingestedAt,
         });
         if (wasInserted) inserted += 1;
+        else duplicates += 1;
       }
       const current = repositories.roomCursors.ensure(room);
       const isGap = advance.reason === 'gap';
@@ -215,7 +264,14 @@ export class SqliteCursorStore implements CursorStore {
       });
     });
     transaction();
-    return inserted;
+    return {
+      returned: messages.length,
+      inserted,
+      duplicates,
+      signed,
+      invalidSignature,
+      rejected: messages.length - inserted - duplicates,
+    };
   }
 
   recordError(room: string, message: string, at: string): void {
@@ -231,6 +287,17 @@ export class SqliteCursorStore implements CursorStore {
       message,
       data: JSON.stringify({ room }),
     });
+  }
+
+  markGapResolved(room: string, at: string): void {
+    const current = this.repositories.roomCursors.ensure(room);
+    if (current.gap_resolved_at !== null) return;
+    this.repositories.roomCursors.update(room, {
+      gap_resolved_at: at,
+      last_resolved_gap_to: current.last_gap_to ?? current.last_resolved_gap_to,
+    });
+    // The gap count, the recorded range and the total are deliberately untouched:
+    // a resolved gap is still a gap that happened, and the record is permanent.
   }
 
   all(): CursorRecord[] {
