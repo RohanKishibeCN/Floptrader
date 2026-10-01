@@ -101,6 +101,22 @@ export interface ClientReadResult {
   waitHeld: boolean | null;
   /** The query the request actually carried, for logs. Never the body. */
   query: Record<string, string>;
+  /**
+   * The response's own `content-type`.
+   *
+   * Exposed for the contract probe: JSON is the documented shape, and the
+   * text/plain fallback is the degraded one. A probe that reported only the
+   * parsed result could not tell the two apart.
+   */
+  contentType: string;
+  /**
+   * Whether the response carried an `x-room-generation` header.
+   *
+   * The header is the service's own epoch stamp, volunteered on a read only when
+   * the room has been rebuilt. Its presence is contract evidence; its value is
+   * not parsed here because a read's generation is not the export's.
+   */
+  generationHeader: boolean;
 }
 
 /** The retained ring, as the export endpoint serves it. */
@@ -275,13 +291,14 @@ export class TechnocoreClient {
     const url = `${this.baseUrl}/r/${encodeURIComponent(room)}?${query}`;
     const requestQuery = Object.fromEntries(new URLSearchParams(query));
     this.counters.reads += 1;
-    const { status, body, contentType } = await this.request(url, {
+    const { status, body, contentType, headers } = await this.request(url, {
       method: 'GET',
       headers: this.headers(),
       // A long poll needs its own, longer deadline.
       timeoutMs: (options.waitSeconds ?? 0) * 1000 + this.timeoutMs,
       signal: options.signal,
     });
+    const generationHeader = headers.get('x-room-generation') !== null;
 
     if (status === 304) {
       // A 304 is not a read we can act on: it says "unchanged", which against a
@@ -294,6 +311,8 @@ export class TechnocoreClient {
         degraded: false,
         waitHeld: null,
         query: requestQuery,
+        contentType,
+        generationHeader,
       };
     }
     if (status >= 400) {
@@ -305,7 +324,15 @@ export class TechnocoreClient {
       const parsed = parseRoomRead(JSON.parse(body));
       const waitHeld = parsed.wait_held ?? null;
       if (waitHeld === false) this.counters.waitNotHeld += 1;
-      return { read: parsed, status, degraded: false, waitHeld, query: requestQuery };
+      return {
+        read: parsed,
+        status,
+        degraded: false,
+        waitHeld,
+        query: requestQuery,
+        contentType,
+        generationHeader,
+      };
     }
     // Text fallback: the service prepends an untrusted-content banner, and senders
     // are abbreviated, so the result is flagged as degraded and its messages carry
@@ -313,7 +340,7 @@ export class TechnocoreClient {
     const read = parseTextRoomRead(body, room);
     const waitHeld = /wait: not held/.test(body) ? false : null;
     if (waitHeld === false) this.counters.waitNotHeld += 1;
-    return { read, status, degraded: true, waitHeld, query: requestQuery };
+    return { read, status, degraded: true, waitHeld, query: requestQuery, contentType, generationHeader };
   }
 
   /**

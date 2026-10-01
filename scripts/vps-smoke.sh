@@ -340,6 +340,37 @@ else
   fail "reader does not own six fixed rooms"
 fi
 
+# The schema version and the rate fields are the contract added for the field. A
+# bundle that predates them cannot answer with them, so their absence here is
+# exactly the "stale dist" failure this gate exists to catch: metrics present in
+# the source and absent from the running process.
+if printf '%s' "$STATUS_BODY" | grep -q '"statusSchemaVersion"'; then
+  pass "status carries a schema version (a stale bundle is detectable)"
+else
+  fail "status has no statusSchemaVersion: the running bundle predates this source"
+fi
+
+if printf '%s' "$STATUS_BODY" | grep -q '"consumerRate"'; then
+  pass "status exposes the persisted consumer rate"
+else
+  fail "status does not expose consumerRate"
+fi
+
+# The acceptance block, the same view an operator reads to decide whether a room
+# is catching up or unable to.
+READER_REPORT_BODY="$(http_body "http://$HEALTH_HOST:$HEALTH_PORT/reader-report" || true)"
+if printf '%s' "$READER_REPORT_BODY" | grep -q '"effectiveConfig"'; then
+  pass "/reader-report serves the effective configuration block"
+else
+  fail "/reader-report did not serve the acceptance block"
+fi
+
+if printf '%s' "$READER_REPORT_BODY" | grep -q '"persistedConsumerRate"'; then
+  pass "/reader-report separates the persisted consumer rate from the cursor"
+else
+  fail "/reader-report did not expose persistedConsumerRate"
+fi
+
 # WAL is the journal mode the crash-recovery story depends on.
 DB_FILE="$DATA_DIR/app.db"
 if [[ -f "$DB_FILE" ]]; then

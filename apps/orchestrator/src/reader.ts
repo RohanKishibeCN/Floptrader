@@ -39,11 +39,13 @@ import type { ExternalOffer } from '@flop/strategy';
 import {
   RefereeVerifier,
   RoomReader,
+  type EffectiveReaderConfig,
   type ReaderThroughputStats,
   type RefereeObservation,
   type RoomMessage,
   type RoomReadOutcome,
   type RoomTick,
+  type ServerContractProbe,
   type TechnocoreClient,
   type TickSummary,
 } from '@flop/technocore';
@@ -87,6 +89,10 @@ export interface ReaderOptions {
   exportRecovery?: boolean;
   exportMaxBytes?: number;
   exportTimeoutMs?: number;
+  /** The minimum interval between export attempts for the same room. */
+  exportCooldownMs?: number;
+  /** `CLOSE1_GAP_POLICY`, echoed into the effective-config block for `/status`. */
+  close1GapPolicy?: 'block' | 'degraded_readonly';
   /**
    * How long a continuous room loop waits after a failed read before retrying.
    * A successful read never waits: the long poll is the pacing.
@@ -320,6 +326,12 @@ export class OrchestratorReader {
       exportRecovery: options.exportRecovery === true,
       ...(options.exportMaxBytes === undefined ? {} : { exportMaxBytes: options.exportMaxBytes }),
       ...(options.exportTimeoutMs === undefined ? {} : { exportTimeoutMs: options.exportTimeoutMs }),
+      ...(options.exportCooldownMs === undefined ? {} : { exportCooldownMs: options.exportCooldownMs }),
+      // The effective-config block names the trading room and the policy that
+      // governs it, so `/status` can answer "what is close1 doing" without the
+      // operator cross-referencing the unit file.
+      tradingRoom,
+      ...(options.close1GapPolicy === undefined ? {} : { close1GapPolicy: options.close1GapPolicy }),
       localDids: options.localDids,
       // The continuous loops own the fixed rooms, so the durable evidence a read
       // produces — referee snapshots, flow/price anomalies and our own messages —
@@ -481,6 +493,21 @@ export class OrchestratorReader {
       snapshot,
       externalOffers: this.externalOffers(),
     };
+  }
+
+  /**
+   * Probe the live service contract, read-only, through the fixed reader.
+   *
+   * It sends no write and commits no cursor, so calling it can never change the
+   * reader's state; only the probe's own result is stored, for `/status`.
+   */
+  async probeServerContract(room?: string): Promise<ServerContractProbe> {
+    return this.roomReader.contractProbe(room);
+  }
+
+  /** The reader's effective, resolved configuration, for the report. */
+  readerEffectiveConfig(): EffectiveReaderConfig {
+    return this.roomReader.effectiveConfig();
   }
 
   /** The reader's throughput, health and gap view, for `status()` and the report. */

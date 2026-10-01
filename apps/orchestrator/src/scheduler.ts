@@ -66,7 +66,14 @@ import {
   type RunOutcome,
   type StrategyGroupName,
 } from '@flop/strategy';
-import type { TechnocoreClient } from '@flop/technocore';
+import { READER_METRICS_VERSION, STATUS_SCHEMA_VERSION } from '@flop/technocore';
+import type {
+  EffectiveReaderConfig,
+  ExportRecoveryStats,
+  RoomMode,
+  ServerContractProbe,
+  TechnocoreClient,
+} from '@flop/technocore';
 import type { ArchiveMaintenance } from './archive-maintenance.js';
 import type { Config } from './config.js';
 import type { DeepSeekBudget, DeepSeekScheduler, ParameterOptimiser } from './llm.js';
@@ -234,6 +241,19 @@ export interface TickReport {
 
 export interface StatusSnapshot {
   at: string;
+  /**
+   * The `/status` document contract this payload conforms to.
+   *
+   * Together with `commit` it is how a stale deployment is recognised from the
+   * outside: a process reporting an older schema version than the source is a
+   * process running an older bundle, which is exactly the failure that made
+   * metrics present in the source appear absent from a live `/status`.
+   */
+  statusSchemaVersion: number;
+  /** The reader metric contract inside `reader`. */
+  readerMetricsVersion: number;
+  /** The build commit, when the environment supplies one; null otherwise. */
+  commit: string | null;
   /** Which operating profile the process was started under. */
   profile: 'lite' | 'full';
   mode: 'dry-run' | 'live';
@@ -380,6 +400,73 @@ export interface StatusSnapshot {
   };
 }
 
+/**
+ * The field acceptance view of the reader: what it is doing, room by room.
+ *
+ * Built from the same facts `status()` reports, arranged so an operator on a VPS
+ * can answer "is close1 catching up, falling behind, or unable to catch up"
+ * without reading the whole status document. Every number here has a definition:
+ * `persistedConsumerRate` is what reached SQLite, `cursorAdvanceRate` is how far
+ * the cursor number moved and is never consumption, and `netBacklogRate` is the
+ * difference. Nothing secret is in it — no key, no seed, no token, no message
+ * body — and it is served from `/reader-report`.
+ */
+export interface ReaderReport {
+  at: string;
+  commit: string | null;
+  statusSchemaVersion: number;
+  readerMetricsVersion: number;
+  mode: 'continuous' | 'scheduler_tick';
+  running: boolean;
+  catchupState: ReaderStatus['catchupState'];
+  fullyCaughtUp: boolean;
+  netBacklogIncreasing: boolean;
+  pageSaturated: boolean;
+  consecutiveShortPages: number;
+  effectiveConfig: EffectiveReaderConfig;
+  rooms: Array<{
+    room: string;
+    mode: RoomMode;
+    /** The room's own growth, messages/minute, from the ring's head. */
+    producerRate: number;
+    /** What reached SQLite, messages/minute. The consumer figure. */
+    persistedConsumerRate: number;
+    /** How far the cursor number moved, messages/minute. A protocol metric only. */
+    cursorAdvanceRate: number;
+    /** Messages the ring dropped unread, per minute. */
+    lostGapRate: number;
+    /** `producerRate - persistedConsumerRate`. */
+    netPersistBacklogRate: number;
+    cursorLag: number | null;
+    waitSeconds: number;
+    lastLimitUsed: number;
+    lastReturnedCount: number;
+    pageSaturated: boolean;
+    catchingUpForMs: number;
+    lastSuccessAt: string | null;
+    silenceMs: number;
+  }>;
+  totals: {
+    producerRate: number;
+    persistedConsumerRate: number;
+    cursorAdvanceRate: number;
+    lostGapRate: number;
+    netBacklogRate: number;
+    persistedMessages: number;
+    duplicateMessages: number;
+    gapMessages: number;
+  };
+  exportRecovery: ExportRecoveryStats;
+  unresolvedGapRooms: string[];
+  readiness: {
+    refereeReady: boolean;
+    tradingReady: boolean;
+    refereeReasons: string[];
+    tradingReasons: string[];
+  };
+  serverContract: ServerContractProbe | null;
+}
+
 export interface SchedulerOptions {
   config: Config;
   logger: Logger;
@@ -407,6 +494,19 @@ export interface SchedulerOptions {
 export interface CpuSample {
   cpuUs: number;
   wallMs: number;
+}
+
+/**
+ * The build commit, read from the environment.
+ *
+ * The bundle is not rebuilt with the commit baked in, so this is whatever the
+ * supervisor exported. `null` when nothing did — an unknown commit is reported
+ * as unknown rather than as a plausible-looking hash, which is what keeps
+ * "which bundle is running" answerable instead of guessable.
+ */
+export function buildCommit(env: NodeJS.ProcessEnv = process.env): string | null {
+  const value = env.GIT_COMMIT ?? env.SOURCE_COMMIT ?? env.BUILD_COMMIT;
+  return value !== undefined && value.trim().length > 0 ? value.trim() : null;
 }
 
 /**
@@ -2222,6 +2322,9 @@ export class OrchestratorScheduler {
 
     return {
       at: at.toISOString(),
+      statusSchemaVersion: STATUS_SCHEMA_VERSION,
+      readerMetricsVersion: READER_METRICS_VERSION,
+      commit: buildCommit(),
       profile: this.config.profile,
       mode: this.config.mode,
       liveArmed: this.config.liveArmed,
@@ -2366,6 +2469,68 @@ export class OrchestratorScheduler {
     };
   }
 
+  /**
+   * The field acceptance view of the reader, for `/reader-report`.
+   *
+   * Read-only and secret-free by construction: it is a projection of `status()`,
+   * so it can only contain what `/status` already carries.
+   */
+  readerReport(): ReaderReport {
+    const status = this.status();
+    const reader = status.reader;
+    const readiness = this.readiness();
+    return {
+      at: status.at,
+      commit: status.commit,
+      statusSchemaVersion: status.statusSchemaVersion,
+      readerMetricsVersion: status.readerMetricsVersion,
+      mode: reader.continuousMode ? 'continuous' : 'scheduler_tick',
+      running: reader.running,
+      catchupState: reader.catchupState,
+      fullyCaughtUp: reader.fullyCaughtUp,
+      netBacklogIncreasing: reader.netBacklogIncreasing,
+      pageSaturated: reader.pageSaturated,
+      consecutiveShortPages: reader.consecutiveShortPages,
+      effectiveConfig: reader.effectiveConfig,
+      rooms: reader.rooms.map((row) => ({
+        room: row.room,
+        mode: row.mode,
+        producerRate: row.producerRate,
+        persistedConsumerRate: row.persistedRate,
+        cursorAdvanceRate: row.cursorAdvanceRate,
+        lostGapRate: row.lostGapRate,
+        netPersistBacklogRate: row.netPersistBacklogRate,
+        cursorLag: row.cursorLag,
+        waitSeconds: row.waitSeconds,
+        lastLimitUsed: row.lastLimitUsed,
+        lastReturnedCount: row.lastReturnedCount,
+        pageSaturated: row.pageSaturated,
+        catchingUpForMs: row.catchingUpForMs,
+        lastSuccessAt: row.lastSuccessAt,
+        silenceMs: row.silenceMs,
+      })),
+      totals: {
+        producerRate: reader.producerRate,
+        persistedConsumerRate: reader.persistedConsumerRate,
+        cursorAdvanceRate: reader.cursorAdvancePerMinute,
+        lostGapRate: reader.lostGapRate,
+        netBacklogRate: reader.netBacklogRate,
+        persistedMessages: reader.persistedMessages,
+        duplicateMessages: reader.duplicateMessages,
+        gapMessages: reader.gapMessages,
+      },
+      exportRecovery: reader.exportRecovery,
+      unresolvedGapRooms: reader.unresolvedGapRooms,
+      readiness: {
+        refereeReady: readiness.referee.ready,
+        tradingReady: readiness.trading.ready,
+        refereeReasons: readiness.referee.reasons,
+        tradingReasons: readiness.trading.reasons,
+      },
+      serverContract: reader.serverContract,
+    };
+  }
+
   /** The Lark report body: local SQLite and process metrics only, no model call. */
   async buildReport(): Promise<{
     reportId: string;
@@ -2441,10 +2606,12 @@ export class OrchestratorScheduler {
     // as "catching up".
     if (status.reader.netBacklogIncreasing || status.reader.catchupState === 'unattainable') {
       critical.push(
-        'catch-up unattainable under current API capacity: producer ' +
-          `${status.reader.estimatedProducerRate}/min vs persisted ${status.reader.estimatedPersistedRate}/min ` +
-          `(cursor advance ${status.reader.estimatedCursorAdvanceRate}/min), ` +
-          `net persisted backlog ${status.reader.estimatedBacklogRate}/min, ` +
+        'catch-up unattainable under current API capacity: producer > persisted consumer — ' +
+          `producer ${status.reader.estimatedProducerRate}/min vs persisted consumer ` +
+          `${status.reader.estimatedPersistedRate}/min (cursor advance ` +
+          `${status.reader.estimatedCursorAdvanceRate}/min, a protocol metric only), ` +
+          `net persisted backlog ${status.reader.estimatedBacklogRate}/min over ` +
+          `${status.reader.rooms[0]?.positiveBacklogWindows ?? 0}+ whole windows, ` +
           `limit ${status.reader.limit} (server ${status.reader.serverLimit}), read concurrency ${status.reader.concurrency}`,
       );
     } else if (status.reader.estimatedBacklogRate > 0) {
@@ -2452,8 +2619,9 @@ export class OrchestratorScheduler {
       // from the two-window verdict above, because "behind this minute" and "cannot
       // win" are different findings and only one of them is a capacity problem.
       warning.push(
-        'producer rate exceeds persisted consumer rate: producer ' +
-          `${status.reader.estimatedProducerRate}/min vs persisted ${status.reader.estimatedPersistedRate}/min over the last window`,
+        'producer > persisted consumer over the last window: producer ' +
+          `${status.reader.estimatedProducerRate}/min vs persisted consumer ` +
+          `${status.reader.estimatedPersistedRate}/min`,
       );
     }
     if (status.reader.unresolvedGap) {
@@ -2584,7 +2752,7 @@ export class OrchestratorScheduler {
             `rates/min: reads ${status.reader.readsPerMinute} · returned ${status.reader.returnedPerMinute} · producer ${status.reader.estimatedProducerRate} · persisted ${status.reader.estimatedPersistedRate} · cursor-adv ${status.reader.estimatedCursorAdvanceRate} · lost-gap ${status.reader.estimatedLostGapRate} · req ${Math.round(status.reader.rooms.reduce((sum, row) => sum + row.avgRequestDurationMs, 0) / Math.max(1, status.reader.rooms.length))}ms`,
             `net persisted backlog/min: ${status.reader.estimatedBacklogRate}${status.reader.netBacklogIncreasing ? ' (INCREASING over 2 windows)' : ''} · page-saturated: ${status.reader.pageSaturated} · fully-caught-up: ${status.reader.fullyCaughtUp} · unattainable: ${status.reader.unattainableRooms.join(', ') || 'none'}`,
             `totals: returned ${status.reader.returnedMessages} · persisted ${status.reader.persistedMessages} · duplicate ${status.reader.duplicateMessages} · rejected ${status.reader.rejectedMessages} · signed ${status.reader.signedMessages} · bad-sig ${status.reader.invalidSignatureMessages} · cursor-adv ${status.reader.cursorSequenceAdvance} · gap ${status.reader.gapMessages}`,
-            `export: attempts ${status.reader.exportRecovery.attempts} · ok ${status.reader.exportRecovery.succeeded} · failed ${status.reader.exportRecovery.failed} · gen-mismatch ${status.reader.exportRecovery.generationMismatch} · recovered ${status.reader.exportRecovery.recoveredMessages} · malformed ${status.reader.exportRecovery.malformedRecords} · 429 ${status.reader.throttledReads} · timeout ${status.reader.timeoutReads} · wait-not-held ${status.reader.waitNotHeld} · budget ${status.reader.budgetRemaining ?? '-'}/${status.reader.budgetLimit ?? '-'}`,
+            `export: ${status.reader.exportRecovery.enabled ? 'on' : 'off'}${status.reader.exportRecovery.skippedReason === null ? '' : ` (skipped: ${status.reader.exportRecovery.skippedReason})`} · attempts ${status.reader.exportRecovery.attempts} · ok ${status.reader.exportRecovery.succeeded} · failed ${status.reader.exportRecovery.failed} · gen-mismatch ${status.reader.exportRecovery.generationMismatch} · recovered ${status.reader.exportRecovery.recoveredMessages} · malformed ${status.reader.exportRecovery.malformedRecords} · 429 ${status.reader.throttledReads} · timeout ${status.reader.timeoutReads} · wait-not-held ${status.reader.waitNotHeld}`,
             `health: ${status.reader.healthy ? 'healthy' : status.reader.healthReasons.join('; ')} · recorded gaps: ${status.reader.gaps.total}${
               status.reader.gaps.rooms.length ? ` (${status.reader.gaps.rooms.join(', ')})` : ''
             } · unresolved gap: ${status.reader.unresolvedGapRooms.join(', ') || 'none'} · resumes: ${status.reader.contiguousResumeCount} · recoveries: ${status.reader.gapRecoveryCount}`,

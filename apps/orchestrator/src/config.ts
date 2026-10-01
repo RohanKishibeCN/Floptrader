@@ -198,6 +198,14 @@ export const EnvSchema = z.object({
   EXPORT_RECOVERY_MAX_BYTES: intString(12 * 1024 * 1024),
   /** Wall-clock ceiling for a single export, in milliseconds. */
   EXPORT_RECOVERY_TIMEOUT_MS: intString(20_000),
+  /**
+   * The minimum interval between export attempts for the same room.
+   *
+   * A gap that repeats on every poll is one fact, not a stream of them. Without
+   * a cooldown a permanently-gapping room would export on every read; the
+   * cooldown bounds that to one attempt per interval.
+   */
+  EXPORT_RECOVERY_COOLDOWN_MS: intString(60_000),
 
   // ---- deepseek -----------------------------------------------------------
   DEEPSEEK_BASE_URL: z.string().default('https://api.deepseek.com'),
@@ -452,6 +460,7 @@ export interface Config {
     exportRecovery: boolean;
     exportMaxBytes: number;
     exportTimeoutMs: number;
+    exportCooldownMs: number;
   };
   deepseek: {
     /** Whether any model call may happen. Off by default. */
@@ -802,6 +811,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       exportRecovery: raw.EXPORT_RECOVERY_ENABLED,
       exportMaxBytes: Math.max(1_024, raw.EXPORT_RECOVERY_MAX_BYTES),
       exportTimeoutMs: Math.max(1_000, raw.EXPORT_RECOVERY_TIMEOUT_MS),
+      exportCooldownMs: Math.max(0, raw.EXPORT_RECOVERY_COOLDOWN_MS),
     },
     deepseek: {
       enabled: deepseekEnabled,

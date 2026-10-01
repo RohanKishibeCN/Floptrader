@@ -279,7 +279,11 @@ describe('export-assisted recovery', () => {
     closeDatabase(db);
   });
 
-  function makeReader(transport: FakeTransport, exportRecovery = true) {
+  function makeReader(
+    transport: FakeTransport,
+    exportRecovery = true,
+    extra: { exportCooldownMs?: number } = {},
+  ) {
     return new RoomReader({
       client: new TechnocoreClient({ baseUrl: BASE, fetchImpl: transport.fetchImpl }),
       db,
@@ -298,6 +302,7 @@ describe('export-assisted recovery', () => {
       exportRecovery,
       exportMaxBytes: 1_000_000,
       exportTimeoutMs: 1_000,
+      ...extra,
     });
   }
 
@@ -439,14 +444,48 @@ describe('export-assisted recovery', () => {
     await reader.stopContinuous();
   });
 
-  it('does not run at all unless an operator asked for it', async () => {
+  it('does not run at all unless an operator asked for it, and says why', async () => {
     const transport = new FakeTransport({ readDelayMs: 5 });
     const reader = makeReader(transport, false);
 
     await driveIntoGap(transport, reader);
     await reader.stopContinuous();
 
-    expect(reader.throughputStats().exportRecovery.attempts).toBe(0);
+    const stats = reader.throughputStats();
+    expect(stats.exportRecovery.enabled).toBe(false);
+    expect(stats.exportRecovery.attempts).toBe(0);
+    // An operator looking at an open gap with no `room_export_*` event must be
+    // able to tell that the export was simply off.
+    expect(stats.exportRecovery.skippedReason).toBe('disabled');
     expect(transport.requests.some((request) => request.url.includes('/export'))).toBe(false);
+  });
+
+  it('attempts one export per gap, then reports the cooldown instead of repeating it', async () => {
+    const transport = new FakeTransport({ readDelayMs: 5 });
+    const reader = makeReader(transport, true, { exportCooldownMs: 60_000 });
+    await driveIntoGap(transport, reader);
+    await waitFor(
+      () => reader.throughputStats().exportRecovery.attempts >= 1,
+      'the first export attempt',
+      10_000,
+    );
+    const attemptsAfterFirst = reader.throughputStats().exportRecovery.attempts;
+
+    // A second, distinct loss, while the cooldown is still running. A gap that
+    // repeats is one fact, not a stream of them: the export must not run again.
+    transport.room(ROOM).firstSeqRetained = 200;
+    for (let seq = 200; seq <= 220; seq += 1) transport.enqueue(ROOM, { text: `m${seq}`, seq });
+    await waitFor(
+      () => (repositories.roomCursors.get(ROOM)?.gap_count ?? 0) >= 2,
+      'a second recorded gap',
+      10_000,
+    );
+    // Give the loop a moment to have made further attempts, were it going to.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const stats = reader.throughputStats();
+    expect(stats.exportRecovery.attempts).toBe(attemptsAfterFirst);
+    expect(stats.exportRecovery.skippedReason).toBe('cooldown');
+    await reader.stopContinuous();
   });
 });

@@ -589,6 +589,8 @@ export async function createRuntime(
     exportRecovery: config.technoCore.exportRecovery,
     exportMaxBytes: config.technoCore.exportMaxBytes,
     exportTimeoutMs: config.technoCore.exportTimeoutMs,
+    exportCooldownMs: config.technoCore.exportCooldownMs,
+    close1GapPolicy: config.technoCore.close1GapPolicy,
     expectedPackageHash: pin.expected,
     expectedRefereeDid: config.expectedRefereeDid,
     requireRefereePin: config.requireRefereePin,
@@ -813,6 +815,21 @@ export async function createRuntime(
       // whatever the reader has stored, and a room that grows faster than one
       // page per scheduler tick must be drained by the reader, not by the tick.
       if (config.technoCore.readerEnabled) reader.startContinuous();
+      // A one-off, read-only probe of the live service contract, after the loops
+      // start. It sends no write and commits no cursor, so it can never change
+      // reader state; the result lands in `/status.reader.serverContract`. A
+      // failure is recorded, never a reason to refuse to start.
+      if (config.technoCore.readerEnabled) {
+        void reader.probeServerContract().catch((error: unknown) => {
+          logger.event({
+            level: 'warn',
+            source: 'main',
+            code: 'server_contract_probe_failed',
+            message: 'the read-only service contract probe did not complete',
+            data: { error: error instanceof Error ? error.message : String(error) },
+          });
+        });
+      }
       scheduler.start();
     },
     async stop(): Promise<void> {

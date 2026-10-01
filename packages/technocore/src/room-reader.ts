@@ -42,7 +42,7 @@ import {
   type CursorRecord,
   type CursorStore,
 } from './cursor-store.js';
-import { advanceCursor, RoomMessageSchema } from './protocol.js';
+import { advanceCursor, MAX_PAGE_SIZE, RoomMessageSchema } from './protocol.js';
 import type { CursorAdvance, RoomMessage, TechnocoreLogger } from './protocol.js';
 import type { RefereeObservation } from './referee-verifier.js';
 import { RefereeVerifier } from './referee-verifier.js';
@@ -116,6 +116,29 @@ export interface RoomReaderOptions {
   exportMaxLines?: number;
   /** Wall-clock ceiling for one export, on top of the client's own timeout. */
   exportTimeoutMs?: number;
+  /**
+   * The minimum interval between export attempts for the same room.
+   *
+   * A gap that repeats on every poll is one fact, not a stream of new ones, and
+   * the export endpoint is the most expensive read the service offers. Without a
+   * cooldown a permanently-gapping room would export on every single gap read.
+   */
+  exportCooldownMs?: number;
+  /**
+   * The trading room's name, for the effective-config block.
+   *
+   * The reader does not act on this — it only needs to say, in `/status`, which
+   * room the `close1*` limits belong to.
+   */
+  tradingRoom?: string;
+  /**
+   * The configured `CLOSE1_GAP_POLICY`, echoed into the effective-config block.
+   *
+   * The reader is not the component that enforces the policy; it is the component
+   * that reports which policy is in force, so an operator can see it without
+   * reading the unit file.
+   */
+  close1GapPolicy?: string;
   /**
    * How long a continuous room loop waits after a failed read before trying
    * again. A successful read does not wait at all: the long poll is the pacing.
@@ -229,6 +252,25 @@ export interface RoomThroughput {
   pageSaturated: boolean;
   /** The ring's newest seq minus our cursor, from the last read. */
   cursorLag: number | null;
+  /**
+   * The long-poll hold the last read asked for, in seconds.
+   *
+   * Reported per room because it is the lever that separates "waiting for the
+   * room to speak" from "draining a queue": a behind room asks for `0` so the
+   * queue in front of it is what paces it, and an operator needs to see which
+   * of the two a given room is doing.
+   */
+  waitSeconds: number;
+  /** The page size the last read asked for, after clamping. */
+  lastLimitUsed: number;
+  /** Messages the last read returned. */
+  lastReturnedCount: number;
+  /** The retained ring's oldest seq as of the last read. */
+  lastRingFirstSeq: number | null;
+  /** The retained ring's newest seq as of the last read; the producer's position. */
+  lastRingLastSeq: number | null;
+  /** Consecutive contiguous reads that came back short of the page size. */
+  consecutiveShortPages: number;
   /** Consecutive completed windows with `netPersistBacklogRate > 0`. */
   positiveBacklogWindows: number;
   /** How long since this room last completed a successful read. */
@@ -272,6 +314,17 @@ export interface RoomThroughput {
  * and can never un-lose a gap.
  */
 export interface ExportRecoveryStats {
+  /** Whether export-assisted recovery is on at all; false means it never runs. */
+  enabled: boolean;
+  /**
+   * Why the most recent gap did *not* trigger an export.
+   *
+   * `null` once an attempt has been made. A gap in a process with this on must
+   * always be explained: an operator looking at an unresolved gap and no
+   * `room_export_*` event needs to know whether the export was off, inside its
+   * cooldown, or never reached.
+   */
+  skippedReason: 'disabled' | 'cooldown' | 'not_attempted' | null;
   /** Attempts made this process. */
   attempts: number;
   /** Attempts that returned a usable snapshot. */
@@ -282,6 +335,8 @@ export interface ExportRecoveryStats {
   generationMismatch: number;
   lastAttemptAt: string | null;
   lastError: string | null;
+  /** When the most recent attempt succeeded, if any. */
+  lastSuccessAt: string | null;
   /** Messages the last successful snapshot produced across every attempt. */
   recoveredMessages: number;
   /** JSONL records the last attempt could not parse. */
@@ -290,6 +345,8 @@ export interface ExportRecoveryStats {
   lastTruncated: boolean;
   lastGeneration: number | null;
   lastLines: number;
+  /** The minimum interval between export attempts, in milliseconds. */
+  cooldownMs: number;
 }
 
 /** The reader-wide view: the per-room figures plus what they add up to. */
@@ -368,6 +425,42 @@ export interface ReaderThroughputStats {
   estimatedBacklogRate: number;
   /** Messages the ring dropped unread, summed over the fixed rooms, per minute. */
   estimatedLostGapRate: number;
+  // ---- the same figures under the names an operator is told to look for ----
+  //
+  // The `estimated*` names above are the ones the report and the tests use; the
+  // names below are the contract in the runbook. They are the same numbers, and
+  // they exist so that a field named in the runbook is *present* in `/status`
+  // rather than the operator having to know its alias. A missing field reads as
+  // zero to a monitoring script, which is the failure this whole section is
+  // about, so the aliases are emitted explicitly.
+  /** Alias of `estimatedProducerRate`: the rooms' own growth, messages/minute. */
+  producerRate: number;
+  /**
+   * The consumer figure: messages/minute that actually reached SQLite.
+   *
+   * Deliberately the *persisted* rate and never the cursor-advance rate. When a
+   * room is gapping, the cursor steps over messages nobody stored; using it as
+   * consumption is what made a losing reader look like a keeping-up one. The
+   * cursor figure is still reported, under `cursorAdvancePerMinute`, as a
+   * diagnostic.
+   */
+  consumerRate: number;
+  /** Alias of `consumerRate`, under the name the two-window rule is written with. */
+  persistedConsumerRate: number;
+  /** Alias of `estimatedBacklogRate`: `producerRate - persistedConsumerRate`. */
+  netBacklogRate: number;
+  /** Messages the ring dropped unread, per minute; alias of `estimatedLostGapRate`. */
+  lostGapRate: number;
+  /** Messages the service returned, per minute; alias of `returnedPerMinute`. */
+  messagesPerMinute: number;
+  /** Messages written to SQLite, per minute; alias of `persistedConsumerRate`. */
+  persistedMessagesPerMinute: number;
+  /** How far the cursor numbers moved, per minute. A protocol metric only. */
+  cursorAdvancePerMinute: number;
+  /** Alias of `cursorAdvancePerMinute`, spelling out that it is the seq delta. */
+  cursorSequenceAdvancePerMinute: number;
+  /** Messages the ring dropped unread, per minute; alias of `lostGapRate`. */
+  gapMessagesPerMinute: number;
   /** Reads that moved a cursor forward, i.e. that actually made progress. */
   cursorAdvances: number;
   readsPerMinute: number;
@@ -403,10 +496,109 @@ export interface ReaderThroughputStats {
   lastReturnedFirstSeqByRoom: Record<string, number | null>;
   lastReturnedLastSeqByRoom: Record<string, number | null>;
   lastCursorByRoom: Record<string, number>;
+  /** The retained ring's oldest seq per room, from the last read. */
+  lastRingFirstSeqByRoom: Record<string, number | null>;
+  /** The retained ring's newest seq per room, from the last read. */
+  lastRingLastSeqByRoom: Record<string, number | null>;
+  /** `lastRingLastSeqByRoom - lastCursorByRoom`, per room; null if unknown. */
+  cursorLagByRoom: Record<string, number | null>;
   lastGapFromByRoom: Record<string, number | null>;
   lastGapToByRoom: Record<string, number | null>;
   modeByRoom: Record<string, RoomMode>;
+  /**
+   * The fewest clean short reads any fixed room has behind it.
+   *
+   * The reader-level view of a per-room fact: the caught-up test needs two clean
+   * cycles *per room*, so the minimum is the honest reader-wide figure. Reporting
+   * a sum, or the best room's count, would let one busy room hide behind five
+   * quiet ones.
+   */
+  consecutiveShortPages: number;
+  /**
+   * The effective reader configuration, non-secret and as resolved.
+   *
+   * The startup log carries the same block; it is repeated in `/status` so a
+   * running process can be asked what it is actually doing without reading its
+   * journal.
+   */
+  effectiveConfig: EffectiveReaderConfig;
+  /**
+   * A read-only probe of the live service contract.
+   *
+   * Never a write, and never anything that advances a cursor: it is a `limit`
+   * probe plus a look at the response's own headers. `null` until it has run.
+   */
+  serverContract: ServerContractProbe | null;
+  /** The reader metric contract this payload conforms to. */
+  readerMetricsVersion: number;
+  /** The `/status` document contract this payload belongs to. */
+  statusSchemaVersion: number;
+  /** Fixed rooms the reader owns, in read order; `modeByRoom` is keyed by these. */
   rooms: RoomThroughput[];
+}
+
+/**
+ * The reader configuration as it was actually resolved, for the startup log and
+ * `/status`.
+ *
+ * Every value here is a decision the code made (a clamp, a default, a fallback),
+ * not an environment variable echoed back: `EXPORT_RECOVERY_MAX_BYTES=2` becomes
+ * `1024` because that is the floor the code enforces. A value is never included
+ * because it is configured — only because it is what the process will use.
+ *
+ * Nothing here is a secret. There is no key, no seed, no token and no URL with
+ * credentials in it, and there must never be.
+ */
+export interface EffectiveReaderConfig {
+  exportRecoveryEnabled: boolean;
+  exportMaxBytes: number;
+  exportTimeoutMs: number;
+  exportCooldownMs: number;
+  close1GapPolicy: string;
+  close1Room: string;
+  serverLimit: number;
+  readLimit: number;
+  close1ReadLimit: number;
+  close1CatchupLimit: number;
+  readConcurrency: number;
+  maxInflight: number;
+  waitSeconds: number;
+  retryDelayMs: number;
+  catchupMaxRequestsPerSecond: number;
+  catchupMaxSeconds: number;
+  fairnessMaxSilenceMs: number;
+}
+
+/**
+ * What a read-only probe of the live service contract found.
+ *
+ * The probe exists because the contract is the one thing the reader cannot infer
+ * from its own success: a `limit` the service clamps rather than refuses, a
+ * `wait_held` it never sets, a generation header it omits — each is invisible in
+ * a cursor that keeps advancing. It sends no write, moves no cursor, and records
+ * only the response's own metadata.
+ */
+export interface ServerContractProbe {
+  room: string;
+  at: string;
+  status: number;
+  /** The `limit` the probe asked for, which is the documented maximum. */
+  requestedLimit: number;
+  /** How many messages the response carried, which is not the limit. */
+  returnedCount: number;
+  /** The service's own `last_seq`, present even on an empty page. */
+  lastSeq: number | null;
+  firstSeq: number | null;
+  /** The `wait_held` verdict, when the probe's read volunteered one. */
+  waitHeld: boolean | null;
+  /** The response content type, which distinguishes JSON from the text fallback. */
+  contentType: string;
+  /** Whether an `x-room-generation` header was present at all. */
+  generationHeader: boolean;
+  /** Whether the probe's own export HEAD-style check saw a generation. */
+  exportGeneration: number | null;
+  /** A bounded, non-secret description of any failure. */
+  error: string | null;
 }
 
 /** One second of read activity, for the rolling per-minute rates. */
@@ -483,6 +675,8 @@ interface RoomStats {
   lastRingFirstSeq: number | null;
   /** The page size the last read asked for. */
   lastLimitUsed: number;
+  /** The long-poll hold the last read asked for, in seconds. */
+  lastWaitSeconds: number;
   lastReadAtMs: number | null;
   lastSuccessAt: string | null;
   lastRequestStartedAtMs: number;
@@ -506,6 +700,26 @@ const RATE_WINDOW_SECONDS = 60;
 const RATE_WINDOW_MS = RATE_WINDOW_SECONDS * 1_000;
 /** How often the continuous loop recomputes cursor health, in milliseconds. */
 const HEALTH_INTERVAL_MS = 1_000;
+
+/**
+ * The version of the reader's metric contract.
+ *
+ * Bump this whenever a field of `ReaderThroughputStats` is added, renamed or
+ * changes meaning. It travels in `/status.reader`, so an operator looking at a
+ * deployed process can tell *which* contract they are reading — and a field that
+ * a build does not emit is then visibly absent rather than silently zero.
+ */
+export const READER_METRICS_VERSION = 2;
+
+/**
+ * The version of the whole `/status` document.
+ *
+ * Bump this when the shape of the status payload changes anywhere, not just in
+ * the reader block. Together with the build commit it is how a stale deployment
+ * is recognised from the outside: a process reporting an older schema version
+ * than the source is a process running an older bundle.
+ */
+export const STATUS_SCHEMA_VERSION = 2;
 /** How many completed windows in a row must show a widening backlog. */
 const UNATTAINABLE_WINDOWS = 2;
 /** The longest a failed read may park a room, in milliseconds. */
@@ -595,6 +809,9 @@ export class RoomReader {
   private readonly exportMaxBytes: number;
   private readonly exportMaxLines: number;
   private readonly exportTimeoutMs: number;
+  private readonly exportCooldownMs: number;
+  private readonly gapPolicy: string;
+  private readonly tradingRoom: string;
   private readonly retryDelayMs: number;
   private readonly semaphore: Semaphore;
   private readonly localDids: () => Set<string>;
@@ -637,18 +854,26 @@ export class RoomReader {
   private readonly roomStats = new Map<string, RoomStats>();
   /** What export-assisted recovery has tried and what it achieved. */
   private readonly exportStats: ExportRecoveryStats = {
+    enabled: false,
+    skippedReason: null,
     attempts: 0,
     succeeded: 0,
     failed: 0,
     generationMismatch: 0,
     lastAttemptAt: null,
     lastError: null,
+    lastSuccessAt: null,
     recoveredMessages: 0,
     malformedRecords: 0,
     lastTruncated: false,
     lastGeneration: null,
     lastLines: 0,
+    cooldownMs: 0,
   };
+  /** The last export attempt per room, for the cooldown. */
+  private readonly lastExportAttemptMs = new Map<string, number>();
+  /** The most recent read-only contract probe, or null before it has run. */
+  private serverContractProbe: ServerContractProbe | null = null;
 
   constructor(options: RoomReaderOptions) {
     this.client = options.client;
@@ -680,6 +905,14 @@ export class RoomReader {
     this.exportMaxBytes = Math.max(1_024, options.exportMaxBytes ?? 12 * 1_024 * 1_024);
     this.exportMaxLines = Math.max(1, options.exportMaxLines ?? 200_000);
     this.exportTimeoutMs = Math.max(1_000, options.exportTimeoutMs ?? 20_000);
+    this.exportCooldownMs = Math.max(0, options.exportCooldownMs ?? 60_000);
+    this.gapPolicy = options.close1GapPolicy ?? 'block';
+    this.tradingRoom = options.tradingRoom ?? 'close1';
+    // The stats literal is created before the constructor runs, so the two
+    // resolved values it carries are stamped here, once, rather than left at
+    // their placeholders.
+    this.exportStats.enabled = this.exportRecoveryEnabled;
+    this.exportStats.cooldownMs = this.exportCooldownMs;
     this.retryDelayMs = Math.max(0, options.retryDelayMs ?? 2_000);
     // The pool is exactly what was asked for; it is not silently widened. The
     // production default is one slot per fixed room (see `READ_CONCURRENCY`),
@@ -736,6 +969,37 @@ export class RoomReader {
     return this.semaphore.limit;
   }
 
+  /**
+   * The reader configuration as it was actually resolved.
+   *
+   * Reported rather than config-derived on purpose: every value here has been
+   * through the same clamp the reader applies, so `EXPORT_RECOVERY_MAX_BYTES=2`
+   * shows as `1024`, and a limit above the service's own maximum shows as the
+   * maximum. It is what the process will use, not what an operator typed.
+   */
+  effectiveConfig(): EffectiveReaderConfig {
+    const close1 = this.limitsByRoom.get(this.tradingRoom);
+    return {
+      exportRecoveryEnabled: this.exportRecoveryEnabled,
+      exportMaxBytes: this.exportMaxBytes,
+      exportTimeoutMs: this.exportTimeoutMs,
+      exportCooldownMs: this.exportCooldownMs,
+      close1GapPolicy: this.gapPolicy,
+      close1Room: this.tradingRoom,
+      serverLimit: this.serverLimit,
+      readLimit: this.limit,
+      close1ReadLimit: close1?.limit ?? this.limit,
+      close1CatchupLimit: close1?.catchingUpLimit ?? this.catchingUpLimit,
+      readConcurrency: this.semaphore.limit,
+      maxInflight: this.client.stats().maxInflight,
+      waitSeconds: this.waitSeconds,
+      retryDelayMs: this.retryDelayMs,
+      catchupMaxRequestsPerSecond: this.catchingUpMaxRequestsPerSecond,
+      catchupMaxSeconds: this.catchingUpMaxSeconds,
+      fairnessMaxSilenceMs: this.fairnessMaxSilenceMs,
+    };
+  }
+
   async start(): Promise<void> {
     this.stopped = false;
   }
@@ -784,6 +1048,23 @@ export class RoomReader {
         limit: this.limit,
         retryDelayMs: this.retryDelayMs,
       },
+    });
+    // The effective configuration, in the log, at the moment it starts mattering.
+    // Every field is a resolved value and none of them is a secret: an operator
+    // reading this can tell whether export recovery is on, which limits are in
+    // force, and which gap policy governs `close1`, without opening the unit
+    // file or the source.
+    this.logger.event({
+      level: 'info',
+      source: 'room-reader',
+      code: 'reader_effective_config',
+      message:
+        `effective reader config: export recovery ` +
+        `${this.exportRecoveryEnabled ? `on (cooldown ${this.exportCooldownMs}ms)` : 'off'}, ` +
+        `limits ${this.limit} (close1 ${this.limitsByRoom.get(this.tradingRoom)?.limit ?? this.limit}` +
+        `/${this.limitsByRoom.get(this.tradingRoom)?.catchingUpLimit ?? this.catchingUpLimit}) of ${this.serverLimit}, ` +
+        `close1 gap policy ${this.gapPolicy}`,
+      data: { ...this.effectiveConfig() },
     });
   }
 
@@ -1076,18 +1357,19 @@ export class RoomReader {
 
     stats.lastRequestStartedAtMs = this.now().getTime();
     const startedAt = Date.now();
+    // Catch-up must never hold. The long poll is what paces a reader that is
+    // keeping up; a reader that is behind is paced by the queue in front of it,
+    // so asking the service to wait would only add latency to a room that has
+    // real work queued. A room we have never read holds no cursor either, so its
+    // first read returns immediately too.
+    const waitUsed = this.isBehind(stats) ? 0 : previous.cursor > 0 ? this.waitSeconds : 0;
     try {
       const result = await this.client.readRoom(room, {
         // Always a cursor. `since=0` means "everything retained"; a bare fetch is
         // the documented shape that "often returns cached bytes".
         since: previous.cursor,
         limit: limitUsed,
-        // Catch-up must never hold. The long poll is what paces a reader that is
-        // keeping up; a reader that is behind is paced by the queue in front of
-        // it, so asking the service to wait would only add latency to a room
-        // that has real work queued. A room we have never read holds no cursor
-        // either, so its first read returns immediately too.
-        waitSeconds: this.isBehind(stats) ? 0 : previous.cursor > 0 ? this.waitSeconds : 0,
+        waitSeconds: waitUsed,
         ...(signal === undefined ? {} : { signal }),
       });
       durationMs = Date.now() - startedAt;
@@ -1135,9 +1417,22 @@ export class RoomReader {
       // lever: it can pull a retained backlog in one round trip, and it can never
       // bring back a range the ring already dropped — which is why it runs after
       // the gap is recorded and never in place of recording it.
-      if (this.exportRecoveryEnabled && advance.reason === 'gap') {
-        const recovered = await this.recoverFromExport(room, advance, signal);
-        if (recovered > 0) commit = { ...commit, inserted: commit.inserted + recovered };
+      //
+      // Every gap leaves an explanation in `exportRecovery.skippedReason`. A gap
+      // that repeats on each poll is one fact, not a stream of them, so the
+      // cooldown is what keeps a permanently-gapping room from exporting on every
+      // read; and an operator seeing an open gap with no `room_export_*` event
+      // must be able to tell "off" from "cooling down".
+      if (advance.reason === 'gap') {
+        if (!this.exportRecoveryEnabled) {
+          this.exportStats.skippedReason = 'disabled';
+        } else if (this.exportCoolingDown(room)) {
+          this.exportStats.skippedReason = 'cooldown';
+        } else {
+          this.exportStats.skippedReason = null;
+          const recovered = await this.recoverFromExport(room, advance, signal);
+          if (recovered > 0) commit = { ...commit, inserted: commit.inserted + recovered };
+        }
       }
     }
     const cursor = this.cursorStore.load(room);
@@ -1151,6 +1446,7 @@ export class RoomReader {
         cursor,
         commit,
         limitUsed,
+        waitSeconds: waitUsed,
         durationMs,
         reason: advance.reason,
       });
@@ -1342,6 +1638,13 @@ export class RoomReader {
     });
   }
 
+  /** Whether this room's export cooldown is still running. */
+  private exportCoolingDown(room: string): boolean {
+    const last = this.lastExportAttemptMs.get(room);
+    if (last === undefined) return false;
+    return this.now().getTime() - last < this.exportCooldownMs;
+  }
+
   /**
    * Pull the retained ring in one request and store whatever extends our cursor.
    *
@@ -1372,6 +1675,7 @@ export class RoomReader {
     const stats = this.exportStats;
     stats.attempts += 1;
     stats.lastAttemptAt = this.now().toISOString();
+    this.lastExportAttemptMs.set(room, this.now().getTime());
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error('export timeout')), this.exportTimeoutMs);
     const onAbort = () => controller.abort();
@@ -1423,6 +1727,7 @@ export class RoomReader {
       }
       if (kept.length === 0) {
         stats.succeeded += 1;
+        stats.lastSuccessAt = this.now().toISOString();
         return 0;
       }
       const exportAdvance: CursorAdvance = {
@@ -1441,6 +1746,7 @@ export class RoomReader {
       const committed = this.cursorStore.commit(room, kept, exportAdvance, this.now().toISOString());
       stats.succeeded += 1;
       stats.recoveredMessages += committed.inserted;
+      stats.lastSuccessAt = this.now().toISOString();
       this.logger.event({
         level: 'info',
         source: 'room-reader',
@@ -1557,6 +1863,7 @@ export class RoomReader {
       lastRingLastSeq: null,
       lastRingFirstSeq: null,
       lastLimitUsed: this.baseLimitFor(room),
+      lastWaitSeconds: 0,
       lastReadAtMs: null,
       lastSuccessAt: null,
       lastRequestStartedAtMs: 0,
@@ -1712,6 +2019,7 @@ export class RoomReader {
       cursor: CursorRecord;
       commit: CommitResult;
       limitUsed: number;
+      waitSeconds: number;
       durationMs: number;
       reason: string;
     },
@@ -1749,6 +2057,7 @@ export class RoomReader {
     stats.lastRingFirstSeq = input.ringFirstSeq;
     stats.lastRingLastSeq = input.ringLastSeq;
     stats.lastLimitUsed = input.limitUsed;
+    stats.lastWaitSeconds = input.waitSeconds;
     stats.lastReadAtMs = nowMs;
     stats.lastSuccessAt = at;
     stats.fairnessWarned = false;
@@ -1867,6 +2176,45 @@ export class RoomReader {
     stats.positiveBacklogWindows =
       stats.netPersistBacklogRate > 0 ? stats.positiveBacklogWindows + 1 : 0;
 
+    // One line per sealed window for a room that is behind. Catch-up is the one
+    // question the reader cannot answer by reading its own status quickly — the
+    // rates only mean something once a whole window supports them — so the
+    // direction is stated here, next to the inputs it was derived from. It is
+    // never emitted for a room that is level: a quiet room has nothing to report
+    // and a log line per room per minute would bury the one that matters.
+    if (this.continuous && (stats.mode === 'catching_up' || stats.mode === 'unattainable')) {
+      const growing = stats.netPersistBacklogRate > 0;
+      this.logger.event({
+        level: growing ? 'warn' : 'info',
+        source: 'room-reader',
+        code: 'reader_catchup_window',
+        message:
+          `${stats.room} ${stats.mode}: producer ${stats.producerRate}/min vs persisted ` +
+          `${stats.persistedRate}/min (cursor-adv ${stats.cursorAdvanceRate}/min, lost-gap ` +
+          `${stats.lostGapRate}/min) -> net ${growing ? 'INCREASING' : 'decreasing'} ` +
+          `${stats.netPersistBacklogRate}/min over ${stats.positiveBacklogWindows} window(s); ` +
+          `wait ${stats.lastWaitSeconds}s, limit ${stats.lastLimitUsed}, ` +
+          `returned ${stats.lastReturnedCount}, saturated ${stats.pageSaturated}, ` +
+          `cursor lag ${stats.cursorLag ?? 'unknown'}, exports ${this.exportRecoveryEnabled ? 'on' : 'off'}`,
+        data: {
+          room: stats.room,
+          mode: stats.mode,
+          producerRate: stats.producerRate,
+          persistedRate: stats.persistedRate,
+          cursorAdvanceRate: stats.cursorAdvanceRate,
+          lostGapRate: stats.lostGapRate,
+          netPersistBacklogRate: stats.netPersistBacklogRate,
+          positiveBacklogWindows: stats.positiveBacklogWindows,
+          waitSeconds: stats.lastWaitSeconds,
+          lastLimitUsed: stats.lastLimitUsed,
+          lastReturnedCount: stats.lastReturnedCount,
+          pageSaturated: stats.pageSaturated,
+          cursorLag: stats.cursorLag,
+          exportRecoveryEnabled: this.exportRecoveryEnabled,
+        },
+      });
+    }
+
     stats.windowStartedAtMs = nowMs;
     stats.windowReads = 0;
     stats.windowReturned = 0;
@@ -1924,6 +2272,12 @@ export class RoomReader {
       p95RequestDurationMs: stats.p95RequestDurationMs,
       pageSaturated: stats.pageSaturated,
       cursorLag: stats.cursorLag,
+      waitSeconds: stats.lastWaitSeconds,
+      lastLimitUsed: stats.lastLimitUsed,
+      lastReturnedCount: stats.lastReturnedCount,
+      lastRingFirstSeq: stats.lastRingFirstSeq,
+      lastRingLastSeq: stats.lastRingLastSeq,
+      consecutiveShortPages: stats.consecutiveShortPages,
       positiveBacklogWindows: stats.positiveBacklogWindows,
       silenceMs,
       catchingUpForMs: stats.catchingUpSinceMs === null ? 0 : Math.max(0, nowMs - stats.catchingUpSinceMs),
@@ -2022,6 +2376,9 @@ export class RoomReader {
     const lastReturnedFirstSeqByRoom: Record<string, number | null> = {};
     const lastReturnedLastSeqByRoom: Record<string, number | null> = {};
     const lastCursorByRoom: Record<string, number> = {};
+    const lastRingFirstSeqByRoom: Record<string, number | null> = {};
+    const lastRingLastSeqByRoom: Record<string, number | null> = {};
+    const cursorLagByRoom: Record<string, number | null> = {};
     const lastGapFromByRoom: Record<string, number | null> = {};
     const lastGapToByRoom: Record<string, number | null> = {};
     const modeByRoom: Record<string, RoomMode> = {};
@@ -2030,13 +2387,27 @@ export class RoomReader {
       lastReturnedCountByRoom[row.room] = stats.lastReturnedCount;
       lastReturnedFirstSeqByRoom[row.room] = stats.lastReturnedFirstSeq;
       lastReturnedLastSeqByRoom[row.room] = stats.lastReturnedLastSeq;
+      lastRingFirstSeqByRoom[row.room] = stats.lastRingFirstSeq;
+      lastRingLastSeqByRoom[row.room] = stats.lastRingLastSeq;
       lastGapFromByRoom[row.room] = stats.lastGapFrom;
       lastGapToByRoom[row.room] = stats.lastGapTo;
       modeByRoom[row.room] = row.mode;
     }
+    // The reader-level clean-read count is the *worst* room's: the caught-up test
+    // is per room, so a single room with fewer clean cycles is the honest bound.
+    const consecutiveShortPages =
+      rooms.length === 0 ? 0 : Math.min(...rooms.map((row) => row.consecutiveShortPages));
     // The durable cursor wins over the read-time copy: it is what is actually
     // stored, and it is still right for a room whose last read failed.
     for (const cursor of cursors) lastCursorByRoom[cursor.room] = cursor.cursor;
+    // The lag is the ring's head minus the cursor, per room. Derived from the
+    // durable cursor and the last observed head rather than copied from the read,
+    // so it stays meaningful for a room whose last read failed.
+    for (const row of rooms) {
+      const head = lastRingLastSeqByRoom[row.room] ?? null;
+      const cursor = lastCursorByRoom[row.room];
+      cursorLagByRoom[row.room] = head === null || cursor === undefined ? null : head - cursor;
+    }
 
     return {
       continuousMode: this.continuous,
@@ -2071,6 +2442,20 @@ export class RoomReader {
       estimatedCursorAdvanceRate,
       estimatedBacklogRate: round2(estimatedProducerRate - estimatedPersistedRate),
       estimatedLostGapRate,
+      // The runbook names, as the same figures. `consumerRate` is the persisted
+      // rate and never the cursor-advance rate: the cursor steps over gaps, and a
+      // consumption figure that counted them would report a losing reader as a
+      // keeping-up one.
+      producerRate: estimatedProducerRate,
+      consumerRate: estimatedPersistedRate,
+      persistedConsumerRate: estimatedPersistedRate,
+      netBacklogRate: round2(estimatedProducerRate - estimatedPersistedRate),
+      lostGapRate: estimatedLostGapRate,
+      messagesPerMinute: rates.returnedPerMinute,
+      persistedMessagesPerMinute: estimatedPersistedRate,
+      cursorAdvancePerMinute: estimatedCursorAdvanceRate,
+      cursorSequenceAdvancePerMinute: estimatedCursorAdvanceRate,
+      gapMessagesPerMinute: estimatedLostGapRate,
       cursorAdvances: this.throughput.cursorAdvances,
       readsPerMinute: rates.readsPerMinute,
       returnedPerMinute: rates.returnedPerMinute,
@@ -2098,9 +2483,17 @@ export class RoomReader {
       lastReturnedFirstSeqByRoom,
       lastReturnedLastSeqByRoom,
       lastCursorByRoom,
+      lastRingFirstSeqByRoom,
+      lastRingLastSeqByRoom,
+      cursorLagByRoom,
       lastGapFromByRoom,
       lastGapToByRoom,
       modeByRoom,
+      consecutiveShortPages,
+      effectiveConfig: this.effectiveConfig(),
+      serverContract: this.serverContractProbe,
+      readerMetricsVersion: READER_METRICS_VERSION,
+      statusSchemaVersion: STATUS_SCHEMA_VERSION,
       rooms,
     };
   }
@@ -2109,6 +2502,84 @@ export class RoomReader {
   readerThroughputFor(room: string): RoomThroughput | null {
     if (!this.rooms.includes(room)) return null;
     return this.roomThroughput(room);
+  }
+
+  /** The most recent contract probe, or null before one has run. */
+  get serverContract(): ServerContractProbe | null {
+    return this.serverContractProbe;
+  }
+
+  /**
+   * Probe the live service contract, read-only.
+   *
+   * The reader's own success is not evidence about the contract: a service that
+   * silently clamps `limit`, never sets `wait_held`, or omits the generation
+   * header looks exactly like one that honours the documented shape, from inside
+   * a cursor that keeps advancing. This sends no write and commits nothing — it
+   * is one bounded read plus a look at the response's own metadata, so it can
+   * never advance a cursor or store a message.
+   *
+   * The room defaults to the trading room, which is the one whose contract
+   * actually matters, and only the response's metadata is recorded: no message
+   * body, no key, no token.
+   */
+  async contractProbe(room?: string): Promise<ServerContractProbe> {
+    const target = room ?? this.tradingRoom;
+    const probe: ServerContractProbe = {
+      room: target,
+      at: this.now().toISOString(),
+      status: 0,
+      requestedLimit: Math.min(MAX_PAGE_SIZE, this.serverLimit),
+      returnedCount: 0,
+      lastSeq: null,
+      firstSeq: null,
+      waitHeld: null,
+      contentType: '',
+      generationHeader: false,
+      exportGeneration: null,
+      error: null,
+    };
+    try {
+      // `since=0` is the documented "everything retained" read; `wait=0` keeps the
+      // probe from holding a long-poll slot. Nothing here is committed.
+      const result = await this.client.readRoom(target, {
+        since: 0,
+        limit: probe.requestedLimit,
+        waitSeconds: 0,
+      });
+      probe.status = result.status;
+      probe.returnedCount = result.read.messages.length;
+      probe.firstSeq = result.read.first_seq ?? null;
+      probe.lastSeq = result.read.last_seq ?? null;
+      probe.waitHeld = result.waitHeld;
+      probe.contentType = result.contentType;
+      probe.generationHeader = result.generationHeader;
+    } catch (caught) {
+      probe.error = caught instanceof Error ? caught.message : String(caught);
+    }
+    if (probe.error === null) {
+      try {
+        // The export's own generation header, from a bounded body we do not parse.
+        // A snapshot's generation is what an export-based recovery would check
+        // our cursor against, so its presence is contract evidence too.
+        const exported = await this.client.exportRoom(target, { maxBytes: 4_096 });
+        probe.exportGeneration = exported.generation;
+      } catch (caught) {
+        probe.error = caught instanceof Error ? caught.message : String(caught);
+      }
+    }
+    this.serverContractProbe = probe;
+    this.logger.event({
+      level: 'info',
+      source: 'room-reader',
+      code: 'server_contract_probe',
+      message:
+        `${target} contract probe: status ${probe.status}, limit ${probe.requestedLimit}, ` +
+        `last_seq ${probe.lastSeq ?? 'absent'}, wait_held ${probe.waitHeld === null ? 'n/a' : probe.waitHeld}, ` +
+        `generation ${probe.exportGeneration ?? 'absent'}`,
+      data: { ...probe },
+    });
+    return probe;
   }
 
   /** True once the reader has completed a pass over every room it owns. */

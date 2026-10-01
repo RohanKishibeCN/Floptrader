@@ -40,6 +40,16 @@ export function createHealthServer(options: HealthServerOptions): HealthServer {
   app.get('/status', async () => scheduler.status());
 
   /**
+   * The reader's field acceptance view.
+   *
+   * A projection of `/status`, shaped so an operator on a VPS can answer "is
+   * close1 catching up, falling behind, or unable to catch up" in one request.
+   * Read-only and secret-free by construction: it can only contain what
+   * `/status` already carries.
+   */
+  app.get('/reader-report', async () => scheduler.readerReport());
+
+  /**
    * The report content, for an operator who wants to see exactly what the next
    * scheduled Lark message will contain without waiting for its window.
    */
