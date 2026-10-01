@@ -34,12 +34,15 @@ const READY_FEED: RefereeFeedReadinessInputs = {
   refereeRoomsReset: [],
   profileLaneOk: true,
   seedSeen: true,
+  refereeFeedBlockers: [],
   refereeDid: 'did:key:z6Mkreferee',
   expectedRefereeDid: 'did:key:z6Mkreferee',
   packageHash: 'a'.repeat(64),
   expectedPackageHash: 'a'.repeat(64),
   hydrated: true,
   requirePin: true,
+  hasReference: true,
+  hasLimits: true,
   currentSweepRecoverable: true,
 };
 
@@ -194,6 +197,34 @@ describe('refereeFeedReadiness', () => {
     const result = feed({ expectedRefereeDid: null, requirePin: true, refereeDid: 'did:key:z6Mkanyone' });
     expect(result.ready).toBe(false);
     expect(result.reasons.join(' ')).toContain('no referee DID pinned');
+  });
+
+  it('names the verifier reason that is holding the feed', () => {
+    for (const reason of [
+      'seed_wrong_room',
+      'referee_signature_invalid',
+      'referee_did_mismatch',
+      'package_hash_drift',
+    ]) {
+      const result = feed({ refereeFeedBlockers: [reason] });
+      expect(result.ready).toBe(false);
+      expect(result.reasons.join(' ')).toContain(reason);
+    }
+    // `seed_required` alone is not a finding once the seed is in hand: it is the
+    // reason the *unseeded* rows were refused, and the gate already says so.
+    expect(feed({ refereeFeedBlockers: ['seed_required'] }).reasons.join(' ')).toContain(
+      'seed_required',
+    );
+  });
+
+  it('is not ready without a reference or without the published limits', () => {
+    const noReference = feed({ hasReference: false });
+    expect(noReference.ready).toBe(false);
+    expect(noReference.reasons.join(' ')).toContain('no reference price');
+
+    const noLimits = feed({ hasLimits: false });
+    expect(noLimits.ready).toBe(false);
+    expect(noLimits.reasons.join(' ')).toContain('no published limits');
   });
 });
 

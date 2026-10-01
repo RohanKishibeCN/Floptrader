@@ -17,7 +17,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { READER_METRICS_VERSION, STATUS_SCHEMA_VERSION } from '@flop/technocore';
 import { createHealthServer } from '../apps/orchestrator/src/health.js';
-import { buildHarness, type Harness } from './support/orchestrator.js';
+import { buildHarness, HARNESS_PACKAGE_HASH, type Harness } from './support/orchestrator.js';
 
 /**
  * Every field `/status.reader` must carry.
@@ -155,6 +155,45 @@ describe('the served /status contract', () => {
     // The commit is whatever the supervisor exported; absent means null, never a
     // fabricated hash.
     expect(status).toHaveProperty('commit');
+  });
+
+  it('serves the readiness, close1 and seed-provenance blocks the runbook names', async () => {
+    harness = await buildHarness({ agentCount: 4 });
+    const h = harness;
+    const status = await servedStatus(h);
+
+    expect(status).toHaveProperty('statusSchemaVersion');
+    expect(status).toHaveProperty('readerMetricsVersion');
+    expect(status).toHaveProperty('operatingMode');
+
+    const readiness = status.readiness as Record<string, unknown>;
+    for (const field of ['refereeFeedReady', 'registrationReady', 'tradingReady']) {
+      expect(readiness).toHaveProperty(field);
+    }
+
+    const close1 = status.close1 as Record<string, unknown>;
+    for (const field of [
+      'coverage',
+      'localMessagesInGap',
+      'localAgentsInGap',
+      'registrationReadback',
+      'tradeBlockedReason',
+    ]) {
+      expect(close1).toHaveProperty(field);
+    }
+
+    // Before a seed: the feed is not provable, and the payload says so rather
+    // than implying it by omission.
+    expect(status.seedVerified).toBe(false);
+    expect(status.seedSource).toBeNull();
+
+    h.referee.seedPost(HARNESS_PACKAGE_HASH);
+    await h.runtime.scheduler.runTick();
+    const seeded = await servedStatus(h);
+    expect(seeded.seedVerified).toBe(true);
+    expect(seeded.seedSource).toBe('referee_room');
+    // Provenance and a hash, never the seed text.
+    expect(JSON.stringify(seeded)).not.toContain('"t":"seed"');
   });
 
   it('reports the effective configuration and the per-room view, with no secrets', async () => {

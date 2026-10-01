@@ -181,7 +181,7 @@ describe('a seed that disagrees with the pin', () => {
     const transport = new FakeTransport();
     const seed = new Uint8Array(32).fill(11);
     const did = didFromSeed(seed);
-    transport.room('d-close1-state').appendFrom(
+    transport.room('d-close1-price').appendFrom(
       JSON.stringify({
         t: 'seed',
         season: 'close-1',
@@ -198,7 +198,10 @@ describe('a seed that disagrees with the pin', () => {
       expectedPackageHash,
       expectedRefereeDid: did,
     });
-    const observation = verifier.observe('d-close1-state', transport.room('d-close1-state').messagesSince(0)[0]!);
+    const observation = verifier.observe(
+      'd-close1-price',
+      transport.room('d-close1-price').messagesSince(0)[0]!,
+    );
     return { verifier, observation };
   }
 

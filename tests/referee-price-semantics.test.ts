@@ -22,7 +22,6 @@ import { generateAgents } from './support/harness.js';
 
 const referee = generateAgents(1)[0]!;
 const PRICE_ROOM = 'd-close1-price';
-const STATE_ROOM = 'd-close1-state';
 
 /** Records every event, so a `stale_reference` warning is observable. */
 class RecordingLogger {
@@ -86,7 +85,7 @@ function makeVerifier(options: VerifierOptions = {}): { engine: RefereeVerifier;
     expectedPackageHash: 'a'.repeat(64),
     ...options,
   });
-  engine.observe(STATE_ROOM, post(STATE_ROOM, seedPayload('a'.repeat(64)), 1));
+  engine.observe(PRICE_ROOM, post(PRICE_ROOM, seedPayload('a'.repeat(64)), 1));
   return { engine, logger };
 }
 
@@ -220,6 +219,7 @@ describe('a replay rebuilds the same price view', () => {
       expectedPackageHash: 'a'.repeat(64),
     });
     engine.replay({
+      room: PRICE_ROOM,
       seq: 1,
       ts: ts(1),
       kind: 'seed',
@@ -227,6 +227,7 @@ describe('a replay rebuilds the same price view', () => {
       payload: seedPayload('a'.repeat(64)),
     });
     engine.replay({
+      room: PRICE_ROOM,
       seq: 2,
       ts: ts(2),
       kind: 'price',

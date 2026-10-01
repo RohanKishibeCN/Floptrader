@@ -26,6 +26,7 @@
 import {
   Decimal,
   MAX_REFERENCE_MOVE,
+  REFEREE_SEED_ROOM,
   isLocked,
   parseRefereeMessage,
   type MarketSnapshot,
@@ -46,6 +47,8 @@ export interface VerifiedRefereeRecord {
   ts: string;
   kind: RefereeKind;
   senderDid: string;
+  /** The signed body exactly as it was read. Never rewritten. */
+  text: string;
   sweep: number | null;
   payload: unknown;
   signatureValid: boolean;
@@ -121,6 +124,14 @@ export interface RefereeVerifierOptions {
    * the flag only ever makes the live path stricter.
    */
   live?: boolean;
+  /**
+   * The single room allowed to carry the seed.
+   *
+   * Defaults to the official `d-close1-price`. A seed read from any other room is
+   * refused with `seed_wrong_room` rather than being adopted, so a fixture has to
+   * move the seed *and* this setting to prove it is testing the right layout.
+   */
+  seedRoom?: string;
 }
 
 interface SweepLedger {
@@ -147,6 +158,8 @@ export class RefereeVerifier {
   private readonly maxReferenceJump: Decimal;
   private readonly unpinnedPolicy: 'adopt_first_sender' | 'reject';
   private readonly requireSeedBeforeState: boolean;
+  /** The one room a seed may arrive in. */
+  private readonly seedRoom: string;
   private readonly maxReferenceAgeSeconds: number;
   private readonly staleReferenceMode: 'off' | 'no_new_active_trade';
   private readonly live: boolean;
@@ -194,6 +207,7 @@ export class RefereeVerifier {
     this.maxReferenceJump = Decimal.from(String(options.maxReferenceJump ?? MAX_REFERENCE_MOVE));
     this.unpinnedPolicy = options.unpinnedPolicy ?? 'adopt_first_sender';
     this.requireSeedBeforeState = options.requireSeedBeforeState ?? false;
+    this.seedRoom = options.seedRoom ?? REFEREE_SEED_ROOM;
     this.maxReferenceAgeSeconds = options.maxReferenceAgeSeconds ?? 60;
     this.staleReferenceMode = options.staleReferenceMode ?? 'no_new_active_trade';
     this.live = options.live === true;
@@ -244,6 +258,23 @@ export class RefereeVerifier {
       historyLength: this.referenceHistory.length,
       seedSeen: this.seedSeen,
     };
+  }
+
+  /**
+   * Whether this verifier refuses price/flow/final posts until a seed is read.
+   *
+   * The reader asks because it decides when a stored history has to be replayed:
+   * with the ordering rule in force, nothing before the seed was ever applied, so
+   * the moment the seed lands is exactly the moment a replay is both necessary
+   * and safe.
+   */
+  get requiresSeedBeforeState(): boolean {
+    return this.requireSeedBeforeState;
+  }
+
+  /** The one room allowed to carry the seed. */
+  get seedRoomName(): string {
+    return this.seedRoom;
   }
 
   /** The snapshot the strategy layer consumes. */
@@ -367,6 +398,7 @@ export class RefereeVerifier {
       ts: message.ts,
       kind,
       senderDid,
+      text: message.text,
       sweep: extractSweep(parsed.value),
       payload: parsed.value,
       signatureValid,
@@ -406,8 +438,35 @@ export class RefereeVerifier {
     // first verified post fix who the referee is.
     if (this.refereeDid === null) this.refereeDid = senderDid;
 
-    // The seed carries the season, the package and the referee's baseline. A
-    // price that arrives before it has no authority behind it.
+    // The seed carries the season, the package and the referee's baseline, and it
+    // lives in exactly one room. A seed-shaped message anywhere else is not a
+    // seed: it is the shape re-used in a room the referee only ever posts flow,
+    // positions, pnl or state to. Refused, conservative, and `seedSeen` stays
+    // false — accepting it would let a wrong-room post fix the package and the
+    // baseline the strategy layer then trades on.
+    if (kind === 'seed' && room !== this.seedRoom) {
+      record.rejectedBecause = 'seed_wrong_room';
+      this.enterConservative(
+        'seed_wrong_room',
+        `a seed arrived in ${room}; only ${this.seedRoom} may carry one (seq ${message.seq})`,
+      );
+      return { record, mints: [], enteredConservativeMode: true, packageDrift: false };
+    }
+
+    // The seed lists the rooms the referee will post in, because a look-alike that
+    // claimed a name before the referee did forces it to use fresh ones. A list
+    // that does not name the room the seed itself travelled in contradicts the
+    // message carrying it, so it is refused rather than merged.
+    if (kind === 'seed' && this.seedRoomsContradict(parsed.value)) {
+      record.rejectedBecause = 'seed_rooms_mismatch';
+      this.enterConservative(
+        'seed_rooms_mismatch',
+        `the seed in ${room} does not list its own room (seq ${message.seq})`,
+      );
+      return { record, mints: [], enteredConservativeMode: true, packageDrift: false };
+    }
+
+    // A price that arrives before the seed has no authority behind it.
     if (this.requireSeedBeforeState && !this.seedSeen && kind !== 'seed') {
       record.rejectedBecause = 'seed_required';
       this.enterConservative(
@@ -456,6 +515,12 @@ export class RefereeVerifier {
         const seed = payload as RefereeSeed;
         applied.seed = seed;
         this.seedSeen = true;
+        // The refusal this clears is the only one a seed may clear: `seed_required`
+        // is a statement about read order, and the seed is what settles it. The
+        // other reasons — a bad signature, a package that disagrees with the pin,
+        // a cursor that is losing messages — are not order problems and must
+        // survive a seed.
+        this.clearConservative('seed_required');
         if (this.packageHash === null) {
           this.packageHash = seed.package;
         }
@@ -523,6 +588,7 @@ export class RefereeVerifier {
    * we accepted, and that the sender is the pinned referee.
    */
   replay(record: {
+    room: string;
     seq: number;
     ts: string;
     kind: string;
@@ -536,12 +602,43 @@ export class RefereeVerifier {
     if (this.refereeDid === null && this.unpinnedPolicy === 'reject') return false;
     if (this.refereeDid !== null && record.senderDid !== this.refereeDid) return false;
     if (this.refereeDid === null) this.refereeDid = record.senderDid;
+    // A stored seed from the wrong room is skipped for the same reason a live one
+    // is refused, and it is named: the row is evidence that a seed-shaped post was
+    // put in a room that may not carry one.
+    if (kind === 'seed' && record.room !== this.seedRoom) {
+      this.enterConservative(
+        'seed_wrong_room',
+        `stored seed from ${record.room}; only ${this.seedRoom} may carry one (seq ${record.seq})`,
+      );
+      return false;
+    }
+    if (kind === 'seed' && this.seedRoomsContradict(record.payload)) {
+      this.enterConservative(
+        'seed_rooms_mismatch',
+        `stored seed from ${record.room} does not list its own room (seq ${record.seq})`,
+      );
+      return false;
+    }
     if (this.requireSeedBeforeState && !this.seedSeen && kind !== 'seed') return false;
 
     this.applyPayload(kind, record.payload);
     this.lastRefereeSeq = Math.max(this.lastRefereeSeq ?? 0, record.seq);
     if (this.lastPostAt === null || record.ts > this.lastPostAt) this.lastPostAt = record.ts;
     return true;
+  }
+
+  /**
+   * Whether a seed's own room list contradicts the room it may arrive in.
+   *
+   * An empty list means the referee did not enumerate its rooms in this seed;
+   * there is nothing to check. A non-empty one is the referee naming where it
+   * will post, and it has to include the room the seed itself sits in.
+   */
+  private seedRoomsContradict(payload: unknown): boolean {
+    if (typeof payload !== 'object' || payload === null) return false;
+    const rooms = (payload as { rooms?: unknown }).rooms;
+    if (!Array.isArray(rooms) || rooms.length === 0) return false;
+    return !rooms.some((room) => room === this.seedRoom);
   }
 
   private applyPrice(price: RefereePrice): { appliedMissing: boolean; limitsForMissing: boolean } {

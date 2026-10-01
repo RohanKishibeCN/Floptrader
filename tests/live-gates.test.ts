@@ -264,6 +264,7 @@ describe('live requires an explicit, matching package hash', () => {
 });
 
 describe('the referee is pinned, not adopted', () => {
+  // The one room that may carry a seed, and one that may not.
   const STATE_ROOM = 'd-close1-state';
   const PRICE_ROOM = 'd-close1-price';
 
@@ -295,7 +296,7 @@ describe('the referee is pinned, not adopted', () => {
 
   it('refuses the first signed post when no referee DID is pinned', () => {
     const transport = new FakeTransport();
-    transport.room(STATE_ROOM).appendFrom(seedText(IMPOSTOR_DID), {
+    transport.room(PRICE_ROOM).appendFrom(seedText(IMPOSTOR_DID), {
       seed: IMPOSTOR_SEED,
       did: IMPOSTOR_DID,
       nonce: 1,
@@ -307,7 +308,7 @@ describe('the referee is pinned, not adopted', () => {
       requireSeedBeforeState: true,
     });
 
-    const observation = verifier.observe(STATE_ROOM, last(transport, STATE_ROOM));
+    const observation = verifier.observe(PRICE_ROOM, last(transport, PRICE_ROOM));
     expect(observation!.record.signatureValid).toBe(true);
     expect(observation!.record.accepted).toBe(false);
     expect(observation!.record.rejectedBecause).toBe('referee_unpinned');
@@ -318,7 +319,7 @@ describe('the referee is pinned, not adopted', () => {
 
   it('refuses a valid signature from anyone but the pinned referee', () => {
     const transport = new FakeTransport();
-    transport.room(STATE_ROOM).appendFrom(seedText(IMPOSTOR_DID), {
+    transport.room(PRICE_ROOM).appendFrom(seedText(IMPOSTOR_DID), {
       seed: IMPOSTOR_SEED,
       did: IMPOSTOR_DID,
       nonce: 1,
@@ -331,11 +332,40 @@ describe('the referee is pinned, not adopted', () => {
       requireSeedBeforeState: true,
     });
 
-    const observation = verifier.observe(STATE_ROOM, last(transport, STATE_ROOM));
+    const observation = verifier.observe(PRICE_ROOM, last(transport, PRICE_ROOM));
     expect(observation!.record.signatureValid).toBe(true);
     expect(observation!.record.rejectedBecause).toBe('unexpected_referee_did');
     expect(verifier.state.packageHash).toBeNull();
     expect(verifier.state.conservativeReasons).toContain('referee_did_mismatch');
+  });
+
+  it('refuses a seed that arrives in a room that may not carry one', () => {
+    const transport = new FakeTransport();
+    // Signed *for* `d-close1-state`, so the signature verifies — and the message
+    // is still not a seed. Accepting it would let a wrong-room post fix the
+    // package and the baseline the strategy layer then trades on.
+    transport.room(STATE_ROOM).appendFrom(seedText(REFEREE_DID), {
+      seed: REFEREE_SEED,
+      did: REFEREE_DID,
+      nonce: 1,
+    });
+    const verifier = new RefereeVerifier({
+      rules: referenceRules(),
+      logger: silent,
+      expectedRefereeDid: REFEREE_DID,
+      expectedPackageHash: HARNESS_PACKAGE_HASH,
+      unpinnedPolicy: 'reject',
+      requireSeedBeforeState: true,
+    });
+
+    const observation = verifier.observe(STATE_ROOM, last(transport, STATE_ROOM));
+    expect(observation!.record.signatureValid).toBe(true);
+    expect(observation!.record.accepted).toBe(false);
+    expect(observation!.record.rejectedBecause).toBe('seed_wrong_room');
+    expect(verifier.state.seedSeen).toBe(false);
+    expect(verifier.state.packageHash).toBeNull();
+    expect(verifier.state.conservative).toBe(true);
+    expect(verifier.state.conservativeReasons).toContain('seed_wrong_room');
   });
 
   it('does not accept a price as state before the seed has arrived', () => {
@@ -360,16 +390,18 @@ describe('the referee is pinned, not adopted', () => {
     expect(verifier.state.currentSweep).toBeNull();
     expect(verifier.state.conservative).toBe(true);
 
-    // The same posts in the referee's own order are accepted.
-    transport.room(STATE_ROOM).appendFrom(seedText(REFEREE_DID), {
+    // The same posts in the referee's own order are accepted — and the seed is
+    // what clears the ordering refusal, not a later sweep.
+    transport.room(PRICE_ROOM).appendFrom(seedText(REFEREE_DID), {
       seed: REFEREE_SEED,
       did: REFEREE_DID,
       nonce: 2,
     });
-    const seeded = verifier.observe(STATE_ROOM, last(transport, STATE_ROOM));
+    const seeded = verifier.observe(PRICE_ROOM, last(transport, PRICE_ROOM));
     expect(seeded!.record.accepted).toBe(true);
     expect(verifier.state.packageHash).toBe(HARNESS_PACKAGE_HASH);
     expect(verifier.state.seedSeen).toBe(true);
+    expect(verifier.state.conservativeReasons).not.toContain('seed_required');
   });
 
   it('pins the referee and the package on the running reader', async () => {
@@ -378,7 +410,7 @@ describe('the referee is pinned, not adopted', () => {
       expect(harness.runtime.reader.verifier.state.refereeDid).toBe(HARNESS_REFEREE_DID);
       expect(harness.runtime.reader.verifier.state.expectedPackageHash).toBe(HARNESS_PACKAGE_HASH);
       // An impostor seed must not be able to take over an unpinned or pinned slot.
-      harness.transport.room('d-close1-state').appendFrom(seedText(IMPOSTOR_DID), {
+      harness.transport.room(PRICE_ROOM).appendFrom(seedText(IMPOSTOR_DID), {
         seed: IMPOSTOR_SEED,
         did: IMPOSTOR_DID,
         nonce: 1,

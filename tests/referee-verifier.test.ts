@@ -64,7 +64,7 @@ describe('signature and identity', () => {
     expect(verifier.state.refereeDid).toBeNull();
 
     referee.seedPost(PIN);
-    const observation = verifier.observe(STATE_ROOM, last(transport, STATE_ROOM));
+    const observation = verifier.observe(PRICE_ROOM, last(transport, PRICE_ROOM));
 
     expect(observation).not.toBeNull();
     expect(observation!.record.accepted).toBe(true);
@@ -107,7 +107,7 @@ describe('signature and identity', () => {
 
   it('refuses a valid signature from an unexpected DID', () => {
     const { transport, verifier } = setup();
-    transport.room(STATE_ROOM).appendFrom(
+    transport.room(PRICE_ROOM).appendFrom(
       JSON.stringify({
         t: 'seed',
         season: 'close-1',
@@ -118,11 +118,49 @@ describe('signature and identity', () => {
       }),
       { seed: impostorSeed, did: impostorDid, nonce: 1 },
     );
-    const observation = verifier.observe(STATE_ROOM, last(transport, STATE_ROOM));
+    const observation = verifier.observe(PRICE_ROOM, last(transport, PRICE_ROOM));
     expect(observation!.record.signatureValid).toBe(true);
     expect(observation!.record.rejectedBecause).toBe('unexpected_referee_did');
     expect(verifier.state.conservativeReasons).toContain('referee_did_mismatch');
     expect(verifier.state.refereeDid).toBe(refereeDid);
+  });
+
+  it('refuses a seed in a room that may not carry one', () => {
+    const { transport, referee, verifier } = setup();
+    // Correctly signed — for `d-close1-state`, which only ever carries the state
+    // root. A seed-shaped message there is not a seed, however well it verifies.
+    referee.post(STATE_ROOM, {
+      t: 'seed',
+      season: 'close-1',
+      price: '200',
+      trade: { time: 'x', tid: 't' },
+      package: PIN,
+      rooms: [],
+    });
+    const observation = verifier.observe(STATE_ROOM, last(transport, STATE_ROOM));
+    expect(observation!.record.signatureValid).toBe(true);
+    expect(observation!.record.accepted).toBe(false);
+    expect(observation!.record.rejectedBecause).toBe('seed_wrong_room');
+    expect(verifier.state.seedSeen).toBe(false);
+    expect(verifier.state.packageHash).toBeNull();
+    expect(verifier.state.conservativeReasons).toContain('seed_wrong_room');
+  });
+
+  it('refuses a seed whose own room list does not name its room', () => {
+    const { transport, referee, verifier } = setup();
+    referee.post(PRICE_ROOM, {
+      t: 'seed',
+      season: 'close-1',
+      price: '200',
+      trade: { time: 'x', tid: 't' },
+      package: PIN,
+      rooms: [FLOW_ROOM, STATE_ROOM],
+    });
+    const observation = verifier.observe(PRICE_ROOM, last(transport, PRICE_ROOM));
+    expect(observation!.record.accepted).toBe(false);
+    expect(observation!.record.rejectedBecause).toBe('seed_rooms_mismatch');
+    expect(verifier.state.seedSeen).toBe(false);
+    expect(verifier.state.conservativeReasons).toContain('seed_rooms_mismatch');
   });
 
   it('ignores anything that is not a referee post', () => {
@@ -157,7 +195,7 @@ describe('prices, limits and the sweep clock', () => {
   it('adopts the published limits rather than recomputing them', () => {
     const { transport, referee, verifier } = setup();
     referee.seedPost(PIN);
-    verifier.observe(STATE_ROOM, last(transport, STATE_ROOM));
+    verifier.observe(PRICE_ROOM, last(transport, PRICE_ROOM));
 
     // Deliberately not exactly ±5%: the referee enforces these numbers.
     referee.price(824, '223.01', ['211.86', '234.16']);
@@ -217,7 +255,7 @@ describe('the package pin', () => {
   it('adopts the seed hash when nothing was pinned', () => {
     const { transport, referee, verifier } = setup({ pin: false });
     referee.seedPost(PIN);
-    verifier.observe(STATE_ROOM, last(transport, STATE_ROOM));
+    verifier.observe(PRICE_ROOM, last(transport, PRICE_ROOM));
     expect(verifier.state.expectedPackageHash).toBe(PIN);
     expect(verifier.state.conservative).toBe(false);
   });
@@ -227,7 +265,7 @@ describe('the package pin', () => {
     const { transport, referee, verifier } = setup({ packageHash: PIN });
     referee.seedPost(drifted);
 
-    const observation = verifier.observe(STATE_ROOM, last(transport, STATE_ROOM));
+    const observation = verifier.observe(PRICE_ROOM, last(transport, PRICE_ROOM));
     expect(observation!.packageDrift).toBe(true);
     expect(observation!.enteredConservativeMode).toBe(true);
     expect(verifier.state.conservativeReasons).toContain('package_hash_drift');
@@ -239,7 +277,7 @@ describe('the package pin', () => {
   it('stays clear when the seed agrees with the pin', () => {
     const { transport, referee, verifier } = setup({ packageHash: PIN });
     referee.seedPost(PIN);
-    const observation = verifier.observe(STATE_ROOM, last(transport, STATE_ROOM));
+    const observation = verifier.observe(PRICE_ROOM, last(transport, PRICE_ROOM));
     expect(observation!.packageDrift).toBe(false);
     expect(verifier.state.conservative).toBe(false);
   });
@@ -247,7 +285,7 @@ describe('the package pin', () => {
   it('notices a pin applied after the fact', () => {
     const { transport, referee, verifier } = setup({ pin: false });
     referee.seedPost('d'.repeat(64));
-    verifier.observe(STATE_ROOM, last(transport, STATE_ROOM));
+    verifier.observe(PRICE_ROOM, last(transport, PRICE_ROOM));
     expect(verifier.state.conservative).toBe(false);
 
     verifier.pin({ packageHash: PIN });

@@ -113,14 +113,22 @@ export const REFEREE_ROOMS = [
 export type RefereeRoom = (typeof REFEREE_ROOMS)[number];
 
 /**
- * The room the referee posts the seed and the final price to.
+ * The one room allowed to carry the seed.
  *
- * It has to be read before the price and flow rooms: the seed establishes the
- * package and the baseline, and a price that arrives before it is refused. The
- * order of `contest.json`'s `rooms.referee` is not the referee's posting order,
- * so the reader hoists this room to the front of every pass.
+ * The official close-1 layout puts the seed, the reference, the published
+ * limits, the global price and the final price in `d-close1-price`; `d-close1`
+ * `-flow`, `-positions`, `-pnl` and `-state` carry flow, positions, pnl and the
+ * state root and nothing else. A seed-shaped message anywhere else is refused
+ * (`seed_wrong_room`) and must never set `seedSeen`.
+ *
+ * The room also has to be read first: the seed establishes the package and the
+ * referee's identity, and a price that arrives before it is refused. The order
+ * of `contest.json`'s `rooms.referee` is not the referee's posting order, so the
+ * reader hoists this room to the front of every pass — and because the
+ * continuous loops run concurrently, the verifier enforces the ordering itself
+ * rather than relying on the reader's list.
  */
-export const REFEREE_STATE_ROOM = 'd-close1-state';
+export const REFEREE_SEED_ROOM = 'd-close1-price';
 
 export interface Rules {
   contestId: string;

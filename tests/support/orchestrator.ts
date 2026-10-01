@@ -101,8 +101,14 @@ export class FakeReferee {
     });
   }
 
+  /**
+   * The seed, in the one room that may carry one.
+   *
+   * The official layout puts the seed in `d-close1-price`; a fixture that posted
+   * it anywhere else would be testing the refusal path, not the feed.
+   */
   seedPost(packageHash: string, price = '225.10'): RoomMessageLike {
-    return this.post('d-close1-state', {
+    return this.post('d-close1-price', {
       t: 'seed',
       season: 'close-1',
       price,

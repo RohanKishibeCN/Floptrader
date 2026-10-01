@@ -603,6 +603,29 @@ export async function createRuntime(
     now,
   });
 
+  // The official seed lives in `d-close1-price` and the room's retained ring does
+  // not reach back to the opening, so a late start has to be given the signed
+  // envelope the launch record published. This runs *before* the hydrate: the
+  // stored history is only readable once the verifier has a seed, and without it
+  // every row below is refused with `seed_required`.
+  if (config.refereeSeedBootstrapPath.length > 0) {
+    const bootstrap = reader.applySeedBootstrap(config.refereeSeedBootstrapPath);
+    logger.event({
+      level: bootstrap.ok ? 'info' : 'warn',
+      source: 'main',
+      code: 'referee_seed_bootstrap',
+      message: bootstrap.ok
+        ? `the official signed seed bootstrap was accepted (${bootstrap.reason})`
+        : `the official signed seed bootstrap was not accepted (${bootstrap.reason}); the referee rooms must supply the seed`,
+      data: {
+        path: config.refereeSeedBootstrapPath,
+        outcome: bootstrap.reason,
+        room: bootstrap.room ?? null,
+        seq: bootstrap.seq ?? null,
+      },
+    });
+  }
+
   // Rebuild the market view from the stored referee history *before* anything
   // reads or trades, so a restart resumes at the sweep it left off at rather than
   // at an empty snapshot.

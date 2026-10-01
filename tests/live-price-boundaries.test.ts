@@ -23,7 +23,6 @@ import { HARNESS_PACKAGE_HASH, buildHarness, type Harness } from './support/orch
 
 const referee = generateAgents(1)[0]!;
 const PRICE_ROOM = 'd-close1-price';
-const STATE_ROOM = 'd-close1-state';
 
 class RecordingLogger {
   readonly events: Array<{ level: string; code: string; data?: Record<string, unknown> }> = [];
@@ -82,7 +81,7 @@ function makeVerifier(live: boolean, options: { maxReferenceAgeSeconds?: number 
     live,
     ...options,
   });
-  engine.observe(STATE_ROOM, post(STATE_ROOM, seedPayload('a'.repeat(64)), 1));
+  engine.observe(PRICE_ROOM, post(PRICE_ROOM, seedPayload('a'.repeat(64)), 1));
   return { engine, logger };
 }
 
@@ -181,6 +180,7 @@ describe('a replay rebuilds the four values without swapping them', () => {
       live: true,
     });
     engine.replay({
+      room: PRICE_ROOM,
       seq: 1,
       ts: ts(1),
       kind: 'seed',
@@ -188,6 +188,7 @@ describe('a replay rebuilds the four values without swapping them', () => {
       payload: seedPayload('a'.repeat(64)),
     });
     engine.replay({
+      room: PRICE_ROOM,
       seq: 2,
       ts: ts(2),
       kind: 'price',

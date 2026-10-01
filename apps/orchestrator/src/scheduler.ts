@@ -34,7 +34,6 @@
  *     flow leaves its mints unknown; that is recorded as `mint_unknown` and the
  *     reader goes conservative. Nothing here may ever downgrade it to `failed`.
  */
-import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import {
@@ -79,11 +78,13 @@ import type { ArchiveMaintenance } from './archive-maintenance.js';
 import type { Config } from './config.js';
 import type { DeepSeekBudget, DeepSeekScheduler, ParameterOptimiser } from './llm.js';
 import { localDateKey } from './llm.js';
+import { messageHash } from './hashing.js';
 import type { LarkStack } from './lark.js';
 import type { LoadGuard, LoadTier } from './load-guard.js';
 import type { Logger } from './logger.js';
 import type { Close1Coverage, OrchestratorReader, ReaderStatus } from './reader.js';
 import {
+  refereeFeedBlockerReasons,
   refereeFeedReadiness,
   registrationReadiness,
   tradingReadiness,
@@ -132,17 +133,6 @@ function advanceStatus(
  */
 function localPostRequestId(room: string, did: string, nonce: string): string {
   return `${room}|${did}|${nonce}`;
-}
-
-/**
- * `sha256:<hex>` over the signed body.
- *
- * The room echoes the body text back, so hashing it (rather than the whole
- * envelope) gives a value that can be re-derived from either side — which is
- * what makes "is this echo ours?" answerable rather than assumed.
- */
-function messageHash(text: string): string {
-  return `sha256:${createHash('sha256').update(text, 'utf8').digest('hex')}`;
 }
 
 /**
@@ -303,6 +293,16 @@ export interface StatusSnapshot {
   refereeDid: string | null;
   /** The DID pinned at launch, so a mismatch is a finding rather than a guess. */
   expectedRefereeDid: string | null;
+  /**
+   * How the seed this process is running on was obtained.
+   *
+   * `referee_room` (read off the wire) or `official_signed_bootstrap` (the same
+   * envelope, replayed from the launch record because the room's retained ring no
+   * longer reaches back to it). Null before a seed is accepted. Never the text.
+   */
+  seedSource: string | null;
+  /** True once a seed has been accepted, whichever way it arrived. */
+  seedVerified: boolean;
   agents: {
     total: number;
     enabled: number;
@@ -2408,12 +2408,19 @@ export class OrchestratorScheduler {
       refereeRoomsReset: gaps.resets.filter((room) => refereeSet.has(room)),
       profileLaneOk,
       seedSeen: verifier.seedSeen,
+      // The verifier names its own feed refusals — a seed in the wrong room, a
+      // signature that did not verify, a DID that is not the pinned one, a
+      // package that drifted. Everything else it holds is a risk posture, not a
+      // feed fact, and does not belong in this gate.
+      refereeFeedBlockers: refereeFeedBlockerReasons(verifier.conservativeReasons),
       refereeDid: verifier.refereeDid,
       expectedRefereeDid: this.config.expectedRefereeDid,
       packageHash: verifier.packageHash,
       expectedPackageHash: verifier.expectedPackageHash,
       hydrated: this.reader.isHydrated,
       requirePin: this.config.requireRefereePin,
+      hasReference: verifier.reference !== null,
+      hasLimits: verifier.limits !== null,
       currentSweepRecoverable: verifier.currentSweep !== null,
     } as const;
 
@@ -2546,6 +2553,8 @@ export class OrchestratorScheduler {
       packageDrift: Number(pin?.drift ?? 0) === 1,
       refereeDid: verifier.refereeDid,
       expectedRefereeDid: this.config.expectedRefereeDid,
+      seedSource: this.reader.seedSource,
+      seedVerified: this.reader.seedVerified,
       agents: {
         total: this.keyStore.size,
         enabled: identities.filter((row) => row.enabled === 1).length,

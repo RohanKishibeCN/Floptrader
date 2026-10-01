@@ -57,6 +57,16 @@ export interface RefereeFeedReadinessInputs {
   profileLaneOk: boolean;
   /** A seed post was read, signature-checked and accepted. */
   seedSeen: boolean;
+  /**
+   * The referee-feed reasons the verifier itself is holding.
+   *
+   * Conservative mode is where a seed that arrived in the wrong room, a
+   * signature that did not verify, a sender that is not the pinned referee or a
+   * package that drifted away from the pin are recorded. They are named here
+   * rather than inferred from `seedSeen`, so the operator is told *which* of them
+   * is holding the feed instead of only "no seed".
+   */
+  refereeFeedBlockers: string[];
   refereeDid: string | null;
   expectedRefereeDid: string | null;
   /** The package hash the accepted seed quoted. */
@@ -67,6 +77,10 @@ export interface RefereeFeedReadinessInputs {
   hydrated: boolean;
   /** Whether a referee DID was required to be pinned at launch. */
   requirePin: boolean;
+  /** A reference price is held: the feed's own number, not one we derived. */
+  hasReference: boolean;
+  /** The limits published for the next sweep are held. */
+  hasLimits: boolean;
   /**
    * The official sweep is recoverable from stored history.
    *
@@ -130,6 +144,30 @@ export interface RegistrationReadinessInputs extends RefereeFeedReadinessInputs 
 }
 
 /**
+ * The conservative-mode reasons that are facts about the *referee feed*.
+ *
+ * The verifier collects one flat set of reasons; only some of them speak to
+ * whether the contest record itself can be trusted. Those are the ones the feed
+ * gate names, so "the feed is not ready" can say *which* refusal it is holding
+ * rather than only "no seed".
+ */
+const REFEREE_FEED_BLOCKERS: ReadonlySet<string> = new Set([
+  'seed_required',
+  'seed_wrong_room',
+  'seed_rooms_mismatch',
+  'referee_signature_invalid',
+  'referee_did_mismatch',
+  'referee_unpinned',
+  'package_hash_drift',
+  'package_hash_unpinned',
+]);
+
+/** Narrow the verifier's reasons to the ones about the feed itself. */
+export function refereeFeedBlockerReasons(reasons: readonly string[]): string[] {
+  return reasons.filter((reason) => REFEREE_FEED_BLOCKERS.has(reason));
+}
+
+/**
  * Is the referee *feed* provable?
  *
  * Every clause is a fact, never an inference: a seed we accepted, a sender that
@@ -173,6 +211,9 @@ export function refereeFeedReadiness(input: RefereeFeedReadinessInputs): Readine
     reasons.push(`referee room recreated: ${input.refereeRoomsReset.join(', ')}`);
   }
   if (!input.seedSeen) reasons.push('referee seed not read');
+  for (const blocker of input.refereeFeedBlockers) {
+    reasons.push(`referee feed blocked: ${blocker}`);
+  }
   if (input.refereeDid === null) {
     reasons.push('referee DID unknown');
   } else if (input.expectedRefereeDid !== null && input.refereeDid !== input.expectedRefereeDid) {
@@ -187,6 +228,10 @@ export function refereeFeedReadiness(input: RefereeFeedReadinessInputs): Readine
   }
   if (!input.profileLaneOk) reasons.push('profile/lane configuration does not match the profile');
   if (!input.hydrated) reasons.push('verifier not hydrated from stored referee history');
+  // A sweep without a reference or without limits cannot price anything, and the
+  // two come from the referee's own room: they are feed facts, not trading ones.
+  if (!input.hasReference) reasons.push('no reference price from the referee feed');
+  if (!input.hasLimits) reasons.push('no published limits from the referee feed');
   if (!input.currentSweepRecoverable) {
     reasons.push('the official sweep is not recoverable from stored referee history');
   }

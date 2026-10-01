@@ -89,6 +89,17 @@ export const EnvSchema = z.object({
    * room, not for a contest.
    */
   REQUIRE_REFEREE_PIN: boolish.default(true),
+  /**
+   * A file holding the official signed seed envelope.
+   *
+   * The seed lives in `d-close1-price`, and that room's retained ring does not
+   * reach back to the opening, so a process that starts late can never read it
+   * off the wire. When this path is set the envelope is verified by the same
+   * verifier a live seed goes through — room-bound signature, sender DID, pinned
+   * referee DID, seed schema, season, package pin and room list — and nothing
+   * weaker is accepted. Empty means "the referee rooms alone must supply it".
+   */
+  REFEREE_SEED_BOOTSTRAP_PATH: z.string().default(''),
   /** The fleet the season is defined as: 150 agents, five groups of thirty. */
   EXPECTED_AGENT_COUNT: intString(150),
   REQUIRE_FULL_FLEET: boolish.default(true),
@@ -432,6 +443,8 @@ export interface Config {
   /** The referee DID fixed before the first message, or null if unset. */
   expectedRefereeDid: string | null;
   requireRefereePin: boolean;
+  /** The official signed seed envelope to verify at startup, or `''`. */
+  refereeSeedBootstrapPath: string;
   expectedAgentCount: number;
   requireFullFleet: boolean;
   adminPublicKey: string | null;
@@ -818,6 +831,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     expectedPackageHash: expectedPackageHash.length > 0 ? expectedPackageHash : null,
     expectedRefereeDid: expectedRefereeDid.length > 0 ? expectedRefereeDid : null,
     requireRefereePin: raw.REQUIRE_REFEREE_PIN,
+    refereeSeedBootstrapPath: raw.REFEREE_SEED_BOOTSTRAP_PATH.trim(),
     expectedAgentCount: raw.EXPECTED_AGENT_COUNT,
     requireFullFleet: raw.REQUIRE_FULL_FLEET,
     adminPublicKey: adminPublicKey.length > 0 ? adminPublicKey : null,

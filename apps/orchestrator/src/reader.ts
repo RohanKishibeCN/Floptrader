@@ -19,10 +19,11 @@
  * ever interpreted as an instruction — only as data to be signature-checked,
  * classified and stored.
  */
+import { existsSync, readFileSync } from 'node:fs';
 import type { Repositories, RoomRegistryRow, SqliteDatabase } from '@flop/storage';
 import {
   REFEREE_ROOMS,
-  REFEREE_STATE_ROOM,
+  REFEREE_SEED_ROOM,
   TRADING_ROOM,
   isLocked,
   parseTradeMessage,
@@ -50,6 +51,7 @@ import {
   type TickSummary,
 } from '@flop/technocore';
 import type { Logger } from './logger.js';
+import { messageHash } from './hashing.js';
 
 export interface ReaderOptions {
   rules: Rules;
@@ -170,17 +172,23 @@ export interface ReaderStatus extends ReaderThroughputStats {
 /**
  * The rooms this process reads: five referee rooms and the trading room.
  *
- * The state room is read first in every pass. The seed lives there, and the
+ * The seed room is read first in every pass. The seed lives there, and the
  * verifier refuses a price or flow that arrives before it, so a pass that reads
  * the price rooms first would reject a perfectly good sweep — the referee posts
  * the seed and the prices between two of our reads, and `contest.json`'s room
  * order is not the referee's posting order.
+ *
+ * The order is a *hint*, not the guarantee: the continuous loops issue their
+ * requests concurrently, so the responses can complete in any order and a
+ * scheduler-driven pass cannot promise that the seed is processed first. The
+ * ordering rule itself lives in the verifier, and the reader replays the stored
+ * history the moment the seed lands.
  */
 export function roomsFor(rules: Rules): string[] {
   const referee = rules.refereeRooms.length > 0 ? [...rules.refereeRooms] : [...REFEREE_ROOMS];
   const ordered = [
-    ...referee.filter((room) => room === REFEREE_STATE_ROOM),
-    ...referee.filter((room) => room !== REFEREE_STATE_ROOM),
+    ...referee.filter((room) => room === REFEREE_SEED_ROOM),
+    ...referee.filter((room) => room !== REFEREE_SEED_ROOM),
   ];
   return [...new Set([...ordered, rules.tradingRoom || TRADING_ROOM])];
 }
@@ -285,6 +293,70 @@ function isReservedRoom(room: string, rules: Rules): boolean {
   return RESERVED_ROOM_NAMES.has(room);
 }
 
+/**
+ * Where the seed this process is running on came from.
+ *
+ * `referee_room` is a seed read from the referee's own room on the wire;
+ * `official_signed_bootstrap` is the same envelope replayed from the official
+ * launch record because the room's retained ring no longer reaches back to it.
+ * Both are verified the same way; the distinction is provenance, not trust.
+ */
+export type SeedSource = 'referee_room' | 'official_signed_bootstrap';
+
+/** The provenance of the accepted seed. The seed text itself is never kept. */
+export interface SeedProvenance {
+  source: SeedSource;
+  verifiedAt: string;
+  refereeDid: string;
+  packageHash: string | null;
+  /** `sha256:<hex>` of the seed envelope's text — never the text. */
+  messageHash: string;
+  seq: number;
+}
+
+/** What `applySeedBootstrap()` concluded, for the log and for `/status`. */
+export interface SeedBootstrapResult {
+  ok: boolean;
+  /** A short machine-readable word: `seed_accepted`, `bootstrap_malformed`, … */
+  reason: string;
+  room?: string;
+  seq?: number;
+}
+
+/**
+ * The room a bootstrap envelope's message is for.
+ *
+ * The envelope may name it, and when it does the named room is the one the
+ * signature is checked against — so an envelope that says `d-close1-state` will
+ * be refused the same way a live post there would be. A simplified envelope with
+ * no `room` field means the official seed room.
+ */
+function seedEnvelope(parsed: unknown): { room: string; message: RoomMessage } | null {
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const outer = parsed as Record<string, unknown>;
+  const inner =
+    typeof outer.message === 'object' && outer.message !== null
+      ? (outer.message as Record<string, unknown>)
+      : outer;
+  const room = typeof outer.room === 'string' && outer.room.length > 0 ? outer.room : REFEREE_SEED_ROOM;
+  if (typeof inner.text !== 'string' || inner.text.length === 0) return null;
+  if (typeof inner.seq !== 'number' || !Number.isInteger(inner.seq)) return null;
+  if (typeof inner.ts !== 'string' || inner.ts.length === 0) return null;
+  if (typeof inner.from !== 'string' || inner.from.length === 0) return null;
+  if (typeof inner.sig !== 'string' || inner.sig.length === 0) return null;
+  return {
+    room,
+    message: {
+      seq: inner.seq,
+      ts: inner.ts,
+      from: inner.from,
+      nonce: inner.nonce === undefined ? '' : String(inner.nonce),
+      text: inner.text,
+      sig: inner.sig,
+    },
+  };
+}
+
 export class OrchestratorReader {
   readonly verifier: RefereeVerifier;
   readonly roomReader: RoomReader;
@@ -318,6 +390,25 @@ export class OrchestratorReader {
   private readonly externalOfferTakerEnabled: boolean;
   /** Set once `hydrateFromSnapshots()` has replayed the stored referee history. */
   private hydrated = false;
+  /**
+   * `room|seq` of every stored row this process has already fed the verifier.
+   *
+   * A replay of the stored history is idempotent only for the rows it has not
+   * applied yet: a price applies its close to the reference history, so feeding
+   * the same row twice would double the history. The key set is what makes
+   * "replay again now the seed has arrived" safe.
+   */
+  private readonly appliedRows = new Set<string>();
+  /**
+   * How the seed this process is running on was obtained.
+   *
+   * Recorded because "the feed is proven" has to be answerable with *how* it was
+   * proven: a seed read from the referee's own room and a seed replayed from the
+   * official signed launch record are both genuine, and an operator needs to see
+   * which one is holding the process up. The text is never kept — only its hash.
+   */
+  private seedProvenance: SeedProvenance | null = null;
+  private readonly expectedRefereeDid: string | null;
 
   constructor(options: ReaderOptions) {
     this.rules = options.rules;
@@ -330,6 +421,7 @@ export class OrchestratorReader {
     this.fixedRooms = roomsFor(options.rules);
 
     const requirePin = options.requireRefereePin === true;
+    this.expectedRefereeDid = options.expectedRefereeDid ?? null;
     this.verifier = new RefereeVerifier({
       rules: options.rules,
       logger: options.logger,
@@ -908,9 +1000,23 @@ export class OrchestratorReader {
    * `ageSeconds`, so that is the conservative direction to be wrong in.
    */
   hydrateFromSnapshots(): { applied: number; skipped: number } {
+    const result = this.replayStoredHistory();
+    this.hydrated = true;
+    return result;
+  }
+
+  /**
+   * Replay the stored referee history into the verifier, seed first.
+   *
+   * Safe to run more than once: `orderedForReplay()` puts the seed ahead of
+   * everything and the final price behind it, and a row this process has already
+   * applied is skipped rather than applied twice.
+   */
+  private replayStoredHistory(): { applied: number; skipped: number } {
     let applied = 0;
     let skipped = 0;
     for (const row of this.repositories.referee.orderedForReplay()) {
+      if (this.appliedRows.has(`${row.room}|${row.seq}`)) continue;
       let payload: unknown;
       try {
         payload = JSON.parse(row.payload);
@@ -919,20 +1025,224 @@ export class OrchestratorReader {
         continue;
       }
       const ok = this.verifier.replay({
+        room: row.room,
         seq: row.seq,
         ts: row.created_at,
         kind: row.kind,
         senderDid: row.referee_did,
         payload,
       });
-      if (ok) applied += 1;
-      else skipped += 1;
+      if (ok) {
+        this.appliedRows.add(`${row.room}|${row.seq}`);
+        applied += 1;
+      } else {
+        skipped += 1;
+      }
     }
     if (applied > 0) {
       this.persistSweepState(this.verifier.snapshot(this.now()));
     }
-    this.hydrated = true;
     return { applied, skipped };
+  }
+
+  /**
+   * Seed the verifier from an official signed seed envelope on disk.
+   *
+   * The seed lives in `d-close1-price`, and the room's retained ring does not
+   * reach back to the opening: by the time a late start reads it, the seed has
+   * been rotated out and re-reading the room can never produce it. The envelope
+   * is the same message, kept by the launch record, and it goes through the same
+   * verifier as a live one — room-bound signature, sender DID, pinned referee
+   * DID, seed schema, season, package pin and room list. Nothing weaker is
+   * accepted: a bare payload, an unsigned JSON blob, a hand-written opening
+   * price or a package hash on its own are all refused here.
+   *
+   * Failure never widens a gate. It is logged as a warning and the process
+   * carries on with whatever the network gave it.
+   */
+  applySeedBootstrap(path: string): SeedBootstrapResult {
+    if (this.verifier.state.seedSeen) return { ok: true, reason: 'seed_already_seen' };
+    if (!existsSync(path)) {
+      this.logger.event({
+        level: 'warn',
+        source: 'reader',
+        code: 'referee_seed_bootstrap',
+        message: 'no seed bootstrap file at the configured path; the referee rooms alone must supply the seed',
+        data: { path, outcome: 'missing' },
+      });
+      return { ok: false, reason: 'bootstrap_missing' };
+    }
+    let raw: string;
+    try {
+      raw = readFileSync(path, 'utf8');
+    } catch (error) {
+      this.logger.event({
+        level: 'warn',
+        source: 'reader',
+        code: 'referee_seed_bootstrap',
+        message: 'the seed bootstrap file could not be read',
+        data: {
+          path,
+          outcome: 'unreadable',
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+      return { ok: false, reason: 'bootstrap_unreadable' };
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return this.bootstrapFailed(path, 'bootstrap_malformed', 'the file is not JSON');
+    }
+    const envelope = seedEnvelope(parsed);
+    if (envelope === null) {
+      return this.bootstrapFailed(
+        path,
+        'bootstrap_malformed',
+        'the envelope is missing room, seq, ts, from, text or sig',
+      );
+    }
+    return this.acceptSeed(envelope.room, envelope.message, 'official_signed_bootstrap', path);
+  }
+
+  private bootstrapFailed(path: string, reason: string, detail: string): SeedBootstrapResult {
+    this.logger.event({
+      level: 'warn',
+      source: 'reader',
+      code: 'referee_seed_bootstrap',
+      message: `the seed bootstrap was refused: ${detail}`,
+      data: { path, outcome: reason },
+    });
+    return { ok: false, reason };
+  }
+
+  /**
+   * Offer one seed envelope to the verifier, whatever its source.
+   *
+   * The verifier is the only thing that decides — this records the evidence,
+   * names the provenance and, on success, retries the stored history.
+   */
+  private acceptSeed(
+    room: string,
+    message: RoomMessage,
+    source: SeedSource,
+    path: string,
+  ): SeedBootstrapResult {
+    const observation = this.verifier.observe(room, message, this.expectedRefereeDid ?? undefined);
+    if (observation === null) {
+      return this.bootstrapFailed(path, 'bootstrap_unparsable', 'the seed body is not a seed message');
+    }
+    // The signed evidence is kept either way: a refused seed is a finding, not
+    // noise, and the row is what lets an operator see it.
+    this.persistObservation(observation, source);
+    const record = observation.record;
+    if (!record.accepted || observation.seed === undefined) {
+      return this.bootstrapFailed(
+        path,
+        record.rejectedBecause ?? 'seed_rejected',
+        `the verifier refused the seed (${record.rejectedBecause ?? 'not a seed'})`,
+      );
+    }
+    // A seed that quotes a different package is not a bootstrap: the process
+    // would come up running rules nobody pinned. The verifier has already gone
+    // conservative over it, and the feed gate names the drift, so the refusal is
+    // recorded rather than papered over.
+    if (observation.packageDrift) {
+      return this.bootstrapFailed(
+        path,
+        'package_hash_drift',
+        'the seed package hash differs from the pinned package',
+      );
+    }
+    this.recordAcceptedSeed(observation, source, { path });
+    return { ok: true, reason: 'seed_accepted', room, seq: record.seq };
+  }
+
+  /**
+   * Record that a seed has been accepted, and retry the stored history.
+   *
+   * Only the first seed fixes the provenance — a second copy changes nothing
+   * about where the process got its identity from.
+   */
+  private recordAcceptedSeed(
+    observation: RefereeObservation,
+    source: SeedSource,
+    detail: Record<string, unknown>,
+  ): void {
+    const seed = observation.seed;
+    if (seed === undefined) return;
+    const record = observation.record;
+    if (this.seedProvenance === null) {
+      this.seedProvenance = {
+        source,
+        verifiedAt: this.now().toISOString(),
+        refereeDid: record.senderDid,
+        packageHash: seed.package,
+        messageHash: messageHash(record.text),
+        seq: record.seq,
+      };
+    }
+    const evidence = this.seedProvenance;
+    this.logger.event({
+      level: 'info',
+      source: 'reader',
+      code: source === 'referee_room' ? 'referee_seed_accepted' : 'referee_seed_bootstrap',
+      message: `the referee seed was accepted from ${source}`,
+      data: {
+        ...detail,
+        outcome: 'seed_accepted',
+        seed_source: evidence.source,
+        seed_verified_at: evidence.verifiedAt,
+        seed_referee_did: evidence.refereeDid,
+        seed_package_hash: evidence.packageHash,
+        seed_message_hash: evidence.messageHash,
+        seed_seq: evidence.seq,
+      },
+    });
+    this.replayFromStoredHistory();
+  }
+
+  /** Note a seed the room itself delivered, and retry the stored history. */
+  private noteLiveSeed(observation: RefereeObservation): void {
+    if (!observation.record.accepted || observation.seed === undefined) return;
+    this.recordAcceptedSeed(observation, 'referee_room', { room: observation.record.room });
+  }
+
+  /**
+   * Re-run the stored history now that a seed has landed.
+   *
+   * Without this a late start would keep every already-stored referee post in the
+   * bin until the next sweep, and a contest that had already locked would never
+   * recover the current market state at all. Before the first hydrate there is
+   * nothing to do: `hydrateFromSnapshots()` replays the same rows, seed first.
+   */
+  private replayFromStoredHistory(): void {
+    if (!this.hydrated) return;
+    const result = this.replayStoredHistory();
+    if (result.applied === 0) return;
+    this.logger.event({
+      level: 'info',
+      source: 'reader',
+      code: 'referee_history_replay',
+      message: `replayed ${result.applied} stored referee post(s) after the seed arrived (${result.skipped} skipped)`,
+      data: { applied: result.applied, skipped: result.skipped },
+    });
+  }
+
+  /** How the accepted seed was obtained, or null before one was. */
+  get seedSource(): SeedSource | null {
+    return this.seedProvenance?.source ?? null;
+  }
+
+  /** True once a seed has been accepted, from the rooms or from the bootstrap. */
+  get seedVerified(): boolean {
+    return this.verifier.state.seedSeen;
+  }
+
+  /** The accepted seed's provenance, for the report. Never the text. */
+  get seedEvidence(): SeedProvenance | null {
+    return this.seedProvenance === null ? null : { ...this.seedProvenance };
   }
 
   /**
@@ -998,7 +1308,7 @@ export class OrchestratorReader {
     if (overflow > 0) this.pendingLocalMessages.splice(0, overflow);
   }
 
-  private persistObservation(observation: RefereeObservation): void {
+  private persistObservation(observation: RefereeObservation, origin: SeedSource = 'referee_room'): void {
     const record = observation.record;
     const now = this.now().toISOString();
     const price = observation.price;
@@ -1016,6 +1326,13 @@ export class OrchestratorReader {
       signature_valid: record.signatureValid ? 1 : 0,
       created_at: now,
     });
+    // Anything the verifier accepted has already been applied to it, so a later
+    // replay of the stored history must not hand it over a second time.
+    if (record.accepted) this.appliedRows.add(`${record.room}|${record.seq}`);
+    // A seed that arrived over the wire is the one case where `persistObservation`
+    // is the first thing to see it, so the provenance and the post-seed replay are
+    // triggered from here. A bootstrap seed records its own provenance.
+    if (origin === 'referee_room') this.noteLiveSeed(observation);
     if (observation.flow !== undefined) this.recordFlowAnomalies(observation.flow, now);
     this.recordPriceAnomalies(observation, now);
   }
