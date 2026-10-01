@@ -30,6 +30,16 @@ export interface RefereeReadinessInputs {
   roomsWithGap: string[];
   /** Of those, the ones still *open*: no contiguous read has resumed past them. */
   roomsWithUnresolvedGap: string[];
+  /**
+   * Two consecutive 60-second windows with the producer outrunning the reader.
+   *
+   * This is the fact that says "we are losing messages faster than we can store
+   * them" without waiting for the loss to appear in `gap`. Recording a gap is
+   * the consequence, not the evidence.
+   */
+  netBacklogIncreasing: boolean;
+  /** The reader's own catch-up verdict, including `unattainable`. */
+  catchupState: 'normal' | 'catching_up' | 'unattainable' | 'fully_caught_up';
   /** Fixed rooms whose generation was reset. */
   roomsReset: string[];
   /** A seed post was read, signature-checked and accepted. */
@@ -83,6 +93,14 @@ export function refereeReadiness(input: RefereeReadinessInputs): Readiness {
     reasons.push(
       `recorded cursor gap in ${input.roomsWithGap.join(', ')} (recovered, still on the record)`,
     );
+  }
+  // A reader that is measured to be losing ground is a refusal in its own right,
+  // and a separate one from the gap: the backlog can widen for whole windows
+  // before the first message is actually dropped from the retained ring.
+  if (input.catchupState === 'unattainable') {
+    reasons.push('the trading room ingest rate exceeds reader capacity (catch-up unattainable)');
+  } else if (input.netBacklogIncreasing) {
+    reasons.push('reader net backlog is increasing over two consecutive windows');
   }
   if (input.roomsReset.length > 0) {
     reasons.push(`room recreated: ${input.roomsReset.join(', ')}`);

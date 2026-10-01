@@ -2112,7 +2112,11 @@ export class OrchestratorScheduler {
       fixedRoomCount: readerStatus.fixedRoomCount,
       expectedFixedRoomCount: this.reader.fixedRoomList.length,
       roomsWithGap: gaps.rooms,
-      roomsWithUnresolvedGap: gaps.unresolved,
+      // The reader's own verdict, not the durable `gap_resolved_at` flag: a room
+      // whose cursor resumed while it is still behind is not resolved.
+      roomsWithUnresolvedGap: readerStatus.unresolvedGapRooms,
+      netBacklogIncreasing: readerStatus.netBacklogIncreasing,
+      catchupState: readerStatus.catchupState,
       roomsReset: gaps.resets,
       seedSeen: verifier.seedSeen,
       refereeDid: verifier.refereeDid,
@@ -2392,9 +2396,23 @@ export class OrchestratorScheduler {
     // is a finding in its own right. It is already carried by the referee gate
     // above — a reader that is not continuous makes `refereeReady` false with
     // that exact reason — so it is not repeated here as a separate warning.
-    if (status.reader.backlogObserved) {
+    // A saturated page means the service had more than one page waiting, so the
+    // reader is behind — nothing more. It is never a health signal, and it must
+    // not read as "catching up".
+    if (status.reader.pageSaturated) {
       warning.push(
-        'reader page came back saturated: the service had more than one page of messages waiting, so the reader is behind but catching up',
+        'reader page came back saturated: the service had more than one page of messages waiting, so the reader is behind',
+      );
+    }
+    // A widening backlog is the stronger and separate finding: the room produces
+    // faster than the reader stores, so messages will be lost whether or not
+    // `gap` has recorded one yet. This is the state that must never be described
+    // as "catching up".
+    if (status.reader.netBacklogIncreasing || status.reader.catchupState === 'unattainable') {
+      critical.push(
+        `close1 ingest rate exceeds reader capacity: producer ${status.reader.estimatedProducerRate}/min vs consumer ` +
+          `${status.reader.estimatedConsumerRate}/min, net backlog ${status.reader.estimatedBacklogRate}/min, ` +
+          `limit ${status.reader.limit} (server ${status.reader.serverLimit}), read concurrency ${status.reader.concurrency}`,
       );
     }
     if (status.tier === 'critical' || status.tier === 'readonly') {
@@ -2497,20 +2515,20 @@ export class OrchestratorScheduler {
           lines: [
             // Deliberately compact: the rendered message has a hard character
             // budget, so the section carries exactly the fields an operator needs
-            // to judge throughput — mode, room count, in-flight reads, the two
-            // rates, per-room liveness and the gap/health view. The rest of the
-            // reader's throughput lives in `status()`.
-            `reader mode: ${status.reader.continuousMode ? 'continuous' : 'scheduler tick'} · fixed rooms: ${status.reader.fixedRoomCount} · active reads: ${status.reader.activeRequests}`,
-            `reads/min: ${status.reader.readsPerMinute} · messages/min: ${status.reader.messagesPerMinute} · cursor advances/min: ${status.reader.cursorAdvancesPerMinute} · per-room last success: ${
-              Object.entries(status.reader.lastSuccessByRoom)
-                .map(([room, at]) => `${room}=${at.slice(11, 19)}Z`)
-                .join(' ') || 'none'
-            }`,
-            `cursor health: ${status.reader.healthy ? 'healthy' : status.reader.healthReasons.join('; ')} · cursor gaps: ${status.reader.gaps.total}${
+            // to judge throughput — mode, catch-up state, the page size and its
+            // ceiling, the producer/consumer/net rates, and the gap/health view
+            // with the unresolved gap named separately from the permanent record.
+            // The rest of the reader's throughput lives in `status()`.
+            `mode: ${status.reader.continuousMode ? 'continuous' : 'scheduler tick'} · rooms: ${status.reader.fixedRoomCount} · active: ${status.reader.activeRequests} · catch-up state: ${status.reader.catchupState}`,
+            `reads/min: ${status.reader.readsPerMinute} · messages/min: ${status.reader.messagesPerMinute} · cursor adv/min: ${status.reader.cursorAdvancesPerMinute} · limit: ${status.reader.limit} (server ${status.reader.serverLimit})`,
+            // The three rates are the honest answer to "are we keeping up". They
+            // are separate figures on purpose: `messages/min` alone cannot tell a
+            // reader that keeps up from one that is being left behind, because a
+            // producer that outruns us produces the same consumption number.
+            `producer/min: ${status.reader.estimatedProducerRate} · consumer/min: ${status.reader.estimatedConsumerRate} · net backlog/min: ${status.reader.estimatedBacklogRate}${status.reader.netBacklogIncreasing ? ' (INCREASING over 2 windows)' : ''} · resumes: ${status.reader.contiguousResumeCount} · recoveries: ${status.reader.gapRecoveryCount}`,
+            `health: ${status.reader.healthy ? 'healthy' : status.reader.healthReasons.join('; ')} · recorded gaps: ${status.reader.gaps.total}${
               status.reader.gaps.rooms.length ? ` (${status.reader.gaps.rooms.join(', ')})` : ''
-            } · unresolved: ${status.reader.gaps.unresolved.join(', ') || 'none'} · recovered: ${
-              status.reader.gaps.recovered.join(', ') || 'none'
-            } · backlog observed: ${status.reader.backlogObserved} · last error: ${status.reader.lastError ?? 'none'}`,
+            } · unresolved gap: ${status.reader.unresolvedGapRooms.join(', ') || 'none'} · page saturated: ${status.reader.pageSaturated} · silent: ${status.reader.silentRooms.join(', ') || 'none'} · error: ${status.reader.lastError ?? 'none'}`,
           ],
         },
         {
@@ -2580,8 +2598,8 @@ export class OrchestratorScheduler {
               .filter(([key]) => key !== 'total')
               .map(([key, value]) => `${key}=${value}`)
               .join(' ') || 'none'}`,
-            `cursor gap: ${status.cors.gaps}${status.cors.gapRooms.length ? ` (${status.cors.gapRooms.join(', ')})` : ''}`,
-            `bootstrap_truncated rooms: ${status.cors.bootstrap.join(', ') || 'none'}`,
+            // The cursor-gap and bootstrap lines live in 运行状态; repeating them
+            // here would spend report budget on the same two facts.
             `room resets: ${status.cors.resets.join(', ') || 'none'}`,
             `referee_ready: ${status.readiness.refereeReady} trading_ready: ${status.readiness.tradingReady}`,
           ],
@@ -2601,7 +2619,6 @@ export class OrchestratorScheduler {
         {
           heading: '房间范围 (room scope)',
           lines: [
-            `room_scope: ${status.rooms.scope}`,
             `fixed rooms: ${status.rooms.fixed.join(', ')}`,
             `dynamic rooms (${status.rooms.dynamic.length}/${status.rooms.cap}): ${
               status.rooms.dynamic.join(', ') || 'none'

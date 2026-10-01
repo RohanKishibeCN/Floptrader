@@ -200,7 +200,13 @@ describe('close1 catch-up', () => {
     // back saturated. The honest signal is backlog — not "caught up", and not a
     // fabricated gap either, because no retained range was skipped.
     for (let seq = 1; seq <= 2_000; seq += 1) transport.enqueue('close1', { seq, text: `m${seq}` });
-    await waitFor(() => reader.throughputStats().backlogObserved, 'the saturated page to be reported');
+    // The fact is about `close1`, so it is read from `close1`'s own row. The
+    // reader-wide flag only ever describes whichever room read last, which with
+    // six loops says nothing about any particular one.
+    const saturated = () =>
+      reader.throughputStats().rooms.find((row) => row.room === 'close1')?.pageSaturated === true;
+    await waitFor(saturated, 'the saturated page to be reported');
+    expect(reader.throughputStats().modeByRoom['close1']).toBe('catching_up');
     expect(reader.gaps().unresolved).not.toContain('close1');
 
     await reader.stopContinuous();

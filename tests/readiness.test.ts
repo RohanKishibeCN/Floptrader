@@ -19,6 +19,8 @@ const READY_REFEREE: RefereeReadinessInputs = {
   expectedFixedRoomCount: 6,
   roomsWithGap: [],
   roomsWithUnresolvedGap: [],
+  netBacklogIncreasing: false,
+  catchupState: 'fully_caught_up',
   roomsReset: [],
   seedSeen: true,
   refereeDid: 'did:key:z6Mkreferee',
@@ -32,6 +34,24 @@ const READY_REFEREE: RefereeReadinessInputs = {
 function referee(patch: Partial<RefereeReadinessInputs> = {}) {
   return refereeReadiness({ ...READY_REFEREE, ...patch });
 }
+
+const READY_TRADING = {
+  referee: { ready: true, reasons: [] },
+  conservative: false,
+  conservativeReasons: [],
+  sweep: 824,
+  hasReference: true,
+  limits: { low: '213.85', high: '236.36' },
+  limitsUsable: true,
+  limitsForSweep: 825,
+  staleReference: false,
+  locked: false,
+  loadAllowsNewOffer: true,
+  packageDrift: false,
+  fleetComplete: true,
+  registrationRequired: true,
+  registrationReadbackComplete: true,
+};
 
 describe('refereeReadiness', () => {
   it('is ready only when every clause holds', () => {
@@ -103,26 +123,33 @@ describe('refereeReadiness', () => {
     expect(result.ready).toBe(false);
     expect(result.reasons.join(' ')).toContain('no referee DID pinned');
   });
+
+  it('refuses live while the reader is measurably losing ground', () => {
+    // A widening backlog is a refusal on its own, and a different one from a gap:
+    // it is the reader saying "messages will be lost", before any has been.
+    const widening = referee({ netBacklogIncreasing: true });
+    expect(widening.ready).toBe(false);
+    expect(widening.reasons.join(' ')).toContain('net backlog is increasing over two consecutive windows');
+
+    // And once catch-up is unattainable it is named as capacity, not as a
+    // temporary state that will clear on its own.
+    const unattainable = referee({ netBacklogIncreasing: true, catchupState: 'unattainable' });
+    expect(unattainable.ready).toBe(false);
+    expect(unattainable.reasons.join(' ')).toContain('catch-up unattainable');
+
+    // Both propagate: trading is strictly downstream of the referee gate, so a
+    // reader that cannot keep up stops registration *and* trading.
+    const trading = tradingReadiness({
+      ...READY_TRADING,
+      referee: unattainable,
+    });
+    expect(trading.ready).toBe(false);
+    expect(trading.reasons.join(' ')).toContain('catch-up unattainable');
+  });
 });
 
 describe('tradingReadiness', () => {
-  const ready = {
-    referee: { ready: true, reasons: [] },
-    conservative: false,
-    conservativeReasons: [],
-    sweep: 824,
-    hasReference: true,
-    limits: { low: '213.85', high: '236.36' },
-    limitsUsable: true,
-    limitsForSweep: 825,
-    staleReference: false,
-    locked: false,
-    loadAllowsNewOffer: true,
-    packageDrift: false,
-    fleetComplete: true,
-    registrationRequired: true,
-    registrationReadbackComplete: true,
-  };
+  const ready = READY_TRADING;
 
   it('is ready only when every clause holds', () => {
     expect(tradingReadiness(ready)).toEqual({ ready: true, reasons: [] });

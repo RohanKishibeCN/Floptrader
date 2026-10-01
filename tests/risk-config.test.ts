@@ -31,6 +31,43 @@ describe('the stale-reference knobs', () => {
   });
 });
 
+describe('the page-size knobs', () => {
+  it('defaults everything to the service ceiling of 200', () => {
+    const config = load();
+    expect(config.technoCore.serverLimit).toBe(200);
+    expect(config.technoCore.readLimit).toBe(200);
+    expect(config.technoCore.tradingRoomLimit).toBe(200);
+    expect(config.technoCore.tradingRoomCatchupLimit).toBe(200);
+  });
+
+  it('clamps every limit to the confirmed service ceiling', () => {
+    // A `limit` the service refuses is a 400 on every read, so a larger ask is
+    // reduced rather than trusted.
+    const config = load({ READ_LIMIT: '1000', CLOSE1_READ_LIMIT: '1000', CLOSE1_CATCHUP_LIMIT: '1000' });
+    expect(config.technoCore.serverLimit).toBe(200);
+    expect(config.technoCore.readLimit).toBe(200);
+    expect(config.technoCore.tradingRoomLimit).toBe(200);
+    expect(config.technoCore.tradingRoomCatchupLimit).toBe(200);
+  });
+
+  it('uses a larger ceiling only once an operator has raised it', () => {
+    const config = load({
+      TECHNOCORE_SERVER_LIMIT: '500',
+      READ_LIMIT: '300',
+      CLOSE1_READ_LIMIT: '400',
+      CLOSE1_CATCHUP_LIMIT: '500',
+    });
+    expect(config.technoCore.readLimit).toBe(300);
+    expect(config.technoCore.tradingRoomLimit).toBe(400);
+    expect(config.technoCore.tradingRoomCatchupLimit).toBe(500);
+  });
+
+  it('never lets the catch-up page be smaller than the normal one', () => {
+    const config = load({ CLOSE1_READ_LIMIT: '150', CLOSE1_CATCHUP_LIMIT: '20' });
+    expect(config.technoCore.tradingRoomCatchupLimit).toBe(150);
+  });
+});
+
 describe('the external-offer ceilings', () => {
   it('parses the three numbers as exact decimals', () => {
     const config = load({

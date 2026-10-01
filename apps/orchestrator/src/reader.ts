@@ -59,13 +59,30 @@ export interface ReaderOptions {
   readConcurrency?: number;
   waitSeconds?: number;
   /**
-   * Messages per room per pass. 200 is the service's own clamp.
+   * Messages per read for a room without its own limit.
    *
    * This has to be large enough to read back a burst of 150 owner registrations
    * in one pass: at the library default of 50 it would take three ticks, and a
    * registration that is not yet echoed back is not yet evidence.
    */
   readLimit?: number;
+  /**
+   * The largest `limit` the read endpoint will accept; 200 unless confirmed.
+   *
+   * Every limit below is clamped to it, and the client refuses to exceed it: a
+   * `limit` the service rejects is a 400 on every read.
+   */
+  serverLimit?: number;
+  /** The trading room's page size. Falls back to `readLimit`. */
+  tradingRoomLimit?: number;
+  /** The trading room's page size while it is behind. Falls back to its limit. */
+  tradingRoomCatchupLimit?: number;
+  /** The most reads/second one room in catch-up may issue; 0 is uncapped. */
+  catchupMaxRequestsPerSecond?: number;
+  /** How long a room may keep being called `catching_up`; 0 is unbounded. */
+  catchupMaxSeconds?: number;
+  /** How long a fixed room may go unread before a fairness warning. */
+  fairnessMaxSilenceMs?: number;
   /**
    * How long a continuous room loop waits after a failed read before retrying.
    * A successful read never waits: the long poll is the pacing.
@@ -262,6 +279,21 @@ export class OrchestratorReader {
       staleReferenceMode: options.staleReferenceMode,
       live: options.live === true,
     });
+    // The page sizes, all clamped to the service's own ceiling. The trading room
+    // gets its own pair because it is the one room that grows faster than a
+    // scheduler tick; the referee rooms share `readLimit`.
+    const serverLimit = Math.max(1, options.serverLimit ?? 200);
+    const readLimit = Math.max(1, Math.min(serverLimit, options.readLimit ?? serverLimit));
+    const tradingRoom = this.rules.tradingRoom || TRADING_ROOM;
+    const tradingRoomLimit = Math.max(
+      1,
+      Math.min(serverLimit, options.tradingRoomLimit ?? readLimit),
+    );
+    const tradingRoomCatchupLimit = Math.max(
+      tradingRoomLimit,
+      Math.min(serverLimit, options.tradingRoomCatchupLimit ?? tradingRoomLimit),
+    );
+
     this.roomReader = new RoomReader({
       client: options.client,
       db: options.db,
@@ -272,7 +304,15 @@ export class OrchestratorReader {
       ...(options.readConcurrency === undefined ? {} : { readConcurrency: options.readConcurrency }),
       ...(options.waitSeconds === undefined ? {} : { waitSeconds: options.waitSeconds }),
       ...(options.retryDelayMs === undefined ? {} : { retryDelayMs: options.retryDelayMs }),
-      limit: Math.min(200, Math.max(1, options.readLimit ?? 200)),
+      serverLimit,
+      limit: readLimit,
+      catchingUpLimit: readLimit,
+      limitsByRoom: {
+        [tradingRoom]: { limit: tradingRoomLimit, catchingUpLimit: tradingRoomCatchupLimit },
+      },
+      catchingUpMaxRequestsPerSecond: Math.max(0, options.catchupMaxRequestsPerSecond ?? 0),
+      catchingUpMaxSeconds: Math.max(0, options.catchupMaxSeconds ?? 0),
+      fairnessMaxSilenceMs: Math.max(0, options.fairnessMaxSilenceMs ?? 120_000),
       localDids: options.localDids,
       // The continuous loops own the fixed rooms, so the durable evidence a read
       // produces — referee snapshots, flow/price anomalies and our own messages —
@@ -305,7 +345,8 @@ export class OrchestratorReader {
             roomsProvider: () => this.dynamicRoomList(),
             readConcurrency: Math.max(1, options.dynamicReadConcurrency ?? 1),
             ...(options.waitSeconds === undefined ? {} : { waitSeconds: options.waitSeconds }),
-            limit: Math.min(200, Math.max(1, options.readLimit ?? 200)),
+            serverLimit,
+            limit: readLimit,
             localDids: options.localDids,
             now: this.now,
           });

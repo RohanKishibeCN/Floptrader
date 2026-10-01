@@ -550,6 +550,9 @@ export async function createRuntime(
     baseUrl: config.technoCore.baseUrl,
     timeoutMs: config.technoCore.requestTimeoutMs,
     maxInflight: config.technoCore.maxInflight,
+    // The page-size ceiling, so no caller can put a `limit` on the wire that the
+    // service would refuse.
+    serverLimit: config.technoCore.serverLimit,
     ...(overrides.fetchImpl ? { fetchImpl: overrides.fetchImpl } : {}),
   });
 
@@ -576,6 +579,13 @@ export async function createRuntime(
     readConcurrency: config.technoCore.readConcurrency,
     waitSeconds: config.technoCore.readWaitSeconds,
     retryDelayMs: config.technoCore.readerRetryDelayMs,
+    serverLimit: config.technoCore.serverLimit,
+    readLimit: config.technoCore.readLimit,
+    tradingRoomLimit: config.technoCore.tradingRoomLimit,
+    tradingRoomCatchupLimit: config.technoCore.tradingRoomCatchupLimit,
+    catchupMaxRequestsPerSecond: config.technoCore.catchupMaxRequestsPerSecond,
+    catchupMaxSeconds: config.technoCore.catchupMaxSeconds,
+    fairnessMaxSilenceMs: config.technoCore.fairnessMaxSilenceMs,
     expectedPackageHash: pin.expected,
     expectedRefereeDid: config.expectedRefereeDid,
     requireRefereePin: config.requireRefereePin,

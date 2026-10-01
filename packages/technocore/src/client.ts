@@ -20,6 +20,7 @@ import {
   parseTextRoomRead,
   readQuery,
   signedEnvelopeBody,
+  ASSUMED_SERVER_LIMIT,
 } from './protocol.js';
 import { Semaphore } from './retry.js';
 
@@ -28,6 +29,15 @@ export interface TechnocoreClientOptions {
   timeoutMs?: number;
   /** Hard cap on concurrent requests across the whole process. */
   maxInflight?: number;
+  /**
+   * The largest `limit` the read endpoint will accept.
+   *
+   * This is the last line of defence for the page size, and it exists so that no
+   * caller can raise `limit` past what the service actually supports: a refused
+   * `limit` is a 400 on every read, which is a worse failure than a small page.
+   * `ASSUMED_SERVER_LIMIT` (200) unless an operator has confirmed otherwise.
+   */
+  serverLimit?: number;
   fetchImpl?: typeof fetch;
   userAgent?: string;
 }
@@ -65,6 +75,7 @@ export class TechnocoreClient {
   private readonly fetchImpl: typeof fetch;
   private readonly semaphore: Semaphore;
   private readonly userAgent: string;
+  private readonly serverLimit: number;
   private readonly counters = {
     reads: 0,
     writes: 0,
@@ -80,7 +91,13 @@ export class TechnocoreClient {
     this.timeoutMs = options.timeoutMs ?? 15_000;
     this.fetchImpl = options.fetchImpl ?? ((...args) => fetch(...args));
     this.semaphore = new Semaphore(options.maxInflight ?? 6);
+    this.serverLimit = Math.max(1, options.serverLimit ?? ASSUMED_SERVER_LIMIT);
     this.userAgent = options.userAgent ?? 'flop-close-call-orchestrator/0.1 (+close-1)';
+  }
+
+  /** The `limit` ceiling this client will ever put on the wire. */
+  get limitCeiling(): number {
+    return this.serverLimit;
   }
 
   stats(): RequestStats {
@@ -132,6 +149,9 @@ export class TechnocoreClient {
       since: options.since,
       limit: options.limit,
       waitSeconds: options.waitSeconds,
+      // The client's own ceiling, so a caller asking for a bigger page than the
+      // service supports gets the service's maximum rather than a 400.
+      maxLimit: this.serverLimit,
     });
     const url = `${this.baseUrl}/r/${encodeURIComponent(room)}?${query}`;
     this.counters.reads += 1;

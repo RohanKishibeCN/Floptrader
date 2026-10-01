@@ -133,6 +133,48 @@ export const EnvSchema = z.object({
   WRITE_MAX_RETRIES: intString(4),
   /** Hard cap on requests in flight; the reader must not spawn a poll per room. */
   MAX_INFLIGHT: intString(6),
+  /**
+   * The largest `limit` the read endpoint accepts.
+   *
+   * 200 is the documented ceiling and the number the live service enforces: a
+   * larger `limit` is refused rather than truncated, so raising this without the
+   * service's own confirmation turns every read into a 400. Everything else here
+   * is clamped to it, and the client refuses to exceed it.
+   */
+  TECHNOCORE_SERVER_LIMIT: intString(200),
+  /** Messages per read for a room without its own limit. */
+  READ_LIMIT: intString(200),
+  /**
+   * Messages per read for the trading room (`TRADING_ROOM`, `close1`).
+   *
+   * Its own knob because it is the one room that grows faster than a scheduler
+   * tick: the size that reads the five referee rooms quickly enough is not
+   * necessarily the size that drains `close1`.
+   */
+  CLOSE1_READ_LIMIT: intString(200),
+  /**
+   * The trading room's page size while it is behind.
+   *
+   * Only useful when `TECHNOCORE_SERVER_LIMIT` is above `CLOSE1_READ_LIMIT`;
+   * otherwise it is clamped back down to it.
+   */
+  CLOSE1_CATCHUP_LIMIT: intString(200),
+  /**
+   * The most reads per second a room in catch-up may issue.
+   *
+   * A room that is behind reads back to back, and without a cap one saturated
+   * room would spend the whole `MAX_INFLIGHT` budget and starve the referee
+   * rooms. 0 leaves it uncapped.
+   */
+  CLOSE1_CATCHUP_MAX_REQUESTS_PER_SECOND: intString(0),
+  /**
+   * How long a room may keep being called `catching_up` before the reader stops
+   * calling it a temporary state. 0 leaves it unbounded (the two-window rule
+   * still applies).
+   */
+  CLOSE1_CATCHUP_MAX_SECONDS: intString(900),
+  /** How long a fixed room may go unread before a fairness warning is recorded. */
+  READER_FAIRNESS_MAX_SILENCE_MS: intString(120_000),
 
   // ---- deepseek -----------------------------------------------------------
   DEEPSEEK_BASE_URL: z.string().default('https://api.deepseek.com'),
@@ -356,6 +398,26 @@ export interface Config {
     readMaxRetries: number;
     writeMaxRetries: number;
     maxInflight: number;
+    /**
+     * The largest `limit` the read endpoint will accept.
+     *
+     * Every other page-size setting is clamped to this, and the client refuses
+     * to put a larger one on the wire. It is 200 unless an operator has confirmed
+     * the service accepts more.
+     */
+    serverLimit: number;
+    /** Messages per read for the referee rooms and any room without an override. */
+    readLimit: number;
+    /** Messages per read for the trading room. */
+    tradingRoomLimit: number;
+    /** The trading room's page size while it is catching up. */
+    tradingRoomCatchupLimit: number;
+    /** The most reads per second one room in catch-up may issue; 0 is uncapped. */
+    catchupMaxRequestsPerSecond: number;
+    /** How long a room may keep being called `catching_up`; 0 is unbounded. */
+    catchupMaxSeconds: number;
+    /** How long a fixed room may go unread before a fairness warning. */
+    fairnessMaxSilenceMs: number;
   };
   deepseek: {
     /** Whether any model call may happen. Off by default. */
@@ -515,6 +577,23 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const askedForReadConcurrency = env.READ_CONCURRENCY !== undefined && env.READ_CONCURRENCY !== '';
   const requestedReadConcurrency = lite && !askedForReadConcurrency ? 6 : raw.READ_CONCURRENCY;
   const readConcurrency = Math.max(1, Math.min(requestedReadConcurrency, maxInflight));
+
+  // The page-size ceiling. Nothing may ask for a page the service would refuse:
+  // a rejected `limit` is a 400 on every read, which is a worse failure than a
+  // page that is merely small. Every limit below is clamped to this, and the same
+  // ceiling is handed to the client so a caller cannot bypass it.
+  const serverLimit = Math.max(1, raw.TECHNOCORE_SERVER_LIMIT);
+  const readLimit = Math.max(1, Math.min(serverLimit, raw.READ_LIMIT));
+  const tradingRoomLimit = Math.max(1, Math.min(serverLimit, raw.CLOSE1_READ_LIMIT));
+  const tradingRoomCatchupLimit = Math.max(
+    tradingRoomLimit,
+    Math.min(serverLimit, raw.CLOSE1_CATCHUP_LIMIT),
+  );
+  if (raw.CLOSE1_CATCHUP_LIMIT > serverLimit) {
+    profileOverrides.push(
+      `TECHNOCORE_SERVER_LIMIT=${serverLimit} (a larger CLOSE1_CATCHUP_LIMIT would be refused by the service)`,
+    );
+  }
 
   const liveArmed = raw.FLOP_MODE === 'live' && raw.FLOP_LIVE_CONFIRM === raw.SEASON;
   if (raw.FLOP_MODE === 'live' && !liveArmed) {
@@ -678,6 +757,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       readMaxRetries: raw.READ_MAX_RETRIES,
       writeMaxRetries: raw.WRITE_MAX_RETRIES,
       maxInflight,
+      serverLimit,
+      readLimit,
+      tradingRoomLimit,
+      tradingRoomCatchupLimit,
+      catchupMaxRequestsPerSecond: Math.max(0, raw.CLOSE1_CATCHUP_MAX_REQUESTS_PER_SECOND),
+      catchupMaxSeconds: Math.max(0, raw.CLOSE1_CATCHUP_MAX_SECONDS),
+      fairnessMaxSilenceMs: Math.max(0, raw.READER_FAIRNESS_MAX_SILENCE_MS),
     },
     deepseek: {
       enabled: deepseekEnabled,

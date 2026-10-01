@@ -201,9 +201,23 @@ describe('a lite runtime', () => {
       .map((section) => `${section.heading}\n${section.lines.join('\n')}`)
       .join('\n')}`;
 
+    // The report goes out as a Lark *text* message and is truncated past 4000
+    // characters, so growth in any section is silent until it costs another
+    // section its middle. This fixture is fully deterministic, which makes the
+    // budget checkable rather than merely hoped for.
+    expect(rendered.length).toBeLessThan(4000);
     expect(rendered).toContain('current_sweep: 1');
     expect(rendered).toContain('profile: lite');
     expect(rendered).toContain('total_agents: 6');
+    // The reader's throughput has to be legible in the report, and the two
+    // figures that answer "are we keeping up" have to be separate ones: the
+    // producer rate is the room's own growth, the consumer rate is what we
+    // stored, and the gap that is still open is named on its own.
+    expect(rendered).toContain('producer/min:');
+    expect(rendered).toContain('consumer/min:');
+    expect(rendered).toContain('net backlog/min:');
+    expect(rendered).toContain('catch-up state:');
+    expect(rendered).toContain('unresolved gap:');
 
     // Nothing secret may survive into the report: not the Lark app secret, not
     // the model key, not a seed, not the private key.

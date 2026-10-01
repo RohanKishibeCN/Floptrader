@@ -112,15 +112,31 @@ export function parseTextRoomRead(text: string, room: string): RoomRead {
   return { room, count: messages.length, first_seq: first, last_seq: last, messages };
 }
 
+/**
+ * The largest `limit` the read endpoint is assumed to accept.
+ *
+ * 200 is the documented ceiling and the value the live service has been seen to
+ * enforce; a larger `limit` is refused rather than silently truncated, so
+ * assuming one would turn every read into a 400. Raising it is a deliberate act
+ * (`TECHNOCORE_SERVER_LIMIT`) taken only by an operator who has confirmed the
+ * service's own reply, and the clamp lives here so no caller can bypass it.
+ */
+export const ASSUMED_SERVER_LIMIT = 200;
+
 /** The query string for a read, including a long poll when `since` is given. */
 export function readQuery(options: {
   since?: number;
   limit?: number;
   waitSeconds?: number;
+  /** The service's own ceiling; `ASSUMED_SERVER_LIMIT` unless configured. */
+  maxLimit?: number;
 }): string {
   const params = new URLSearchParams();
   if (options.since !== undefined) params.set('since', String(options.since));
-  if (options.limit !== undefined) params.set('limit', String(Math.min(200, Math.max(1, options.limit))));
+  if (options.limit !== undefined) {
+    const ceiling = Math.max(1, options.maxLimit ?? ASSUMED_SERVER_LIMIT);
+    params.set('limit', String(Math.min(ceiling, Math.max(1, options.limit))));
+  }
   if (options.waitSeconds !== undefined && options.since !== undefined) {
     params.set('wait', String(Math.min(10, Math.max(0, options.waitSeconds))));
   }

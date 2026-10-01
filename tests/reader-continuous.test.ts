@@ -230,7 +230,7 @@ describe('RoomReader continuous mode', () => {
     await reader.stopContinuous();
   });
 
-  it('records a real loss as a cursor gap, and a later contiguous read as its recovery', async () => {
+  it('records a real loss as a cursor gap, and a later contiguous read as a resume — not a recovery', async () => {
     const transport = new FakeTransport({ readDelayMs: 2 });
     for (let seq = 1; seq <= 3; seq += 1) transport.enqueue('close1', { seq, text: `m${seq}` });
     const reader = makeReader(transport, { readConcurrency: 6, limit: 200 });
@@ -248,13 +248,22 @@ describe('RoomReader continuous mode', () => {
     expect(row.gap_count).toBe(1);
     expect(row.last_gap_from).toBe(4);
     expect(row.last_gap_to).toBe(5);
-    expect(reader.throughputStats().gapRecoveries).toBe(0);
+    expect(reader.throughputStats().contiguousResumeCount).toBe(0);
+    expect(reader.throughputStats().gapRecoveryCount).toBe(0);
+    // The gap is open, and that is its own field: this is the fact that
+    // `backlogObserved`/`pageSaturated` was never able to express.
+    expect(reader.throughputStats().unresolvedGap).toBe(true);
+    expect(reader.throughputStats().unresolvedGapRooms).toContain('close1');
 
     // A contiguous page afterwards is the evidence the reader is back inside the
-    // window. The historical gap is not cleared; only the resume is recorded.
+    // window. The historical gap is not cleared and the room is not declared
+    // level; only the resume is recorded.
     transport.enqueue('close1', { seq: 9, text: 'm9' });
     transport.enqueue('close1', { seq: 10, text: 'm10' });
-    await waitFor(() => reader.throughputStats().gapRecoveries === 1, 'the gap recovery');
+    await waitFor(
+      () => reader.throughputStats().contiguousResumeCount === 1,
+      'the contiguous resume to be recorded',
+    );
     expect(reader.gaps().rooms).toContain('close1');
     expect(reader.gaps().total).toBe(2);
 
