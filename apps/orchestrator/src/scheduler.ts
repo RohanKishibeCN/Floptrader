@@ -2112,6 +2112,7 @@ export class OrchestratorScheduler {
       fixedRoomCount: readerStatus.fixedRoomCount,
       expectedFixedRoomCount: this.reader.fixedRoomList.length,
       roomsWithGap: gaps.rooms,
+      roomsWithUnresolvedGap: gaps.unresolved,
       roomsReset: gaps.resets,
       seedSeen: verifier.seedSeen,
       refereeDid: verifier.refereeDid,
@@ -2500,13 +2501,15 @@ export class OrchestratorScheduler {
             // rates, per-room liveness and the gap/health view. The rest of the
             // reader's throughput lives in `status()`.
             `reader mode: ${status.reader.continuousMode ? 'continuous' : 'scheduler tick'} · fixed rooms: ${status.reader.fixedRoomCount} · active reads: ${status.reader.activeRequests}`,
-            `reads/min: ${status.reader.readsPerMinute} · messages/min: ${status.reader.messagesPerMinute} · per-room last success: ${
+            `reads/min: ${status.reader.readsPerMinute} · messages/min: ${status.reader.messagesPerMinute} · cursor advances/min: ${status.reader.cursorAdvancesPerMinute} · per-room last success: ${
               Object.entries(status.reader.lastSuccessByRoom)
                 .map(([room, at]) => `${room}=${at.slice(11, 19)}Z`)
                 .join(' ') || 'none'
             }`,
             `cursor health: ${status.reader.healthy ? 'healthy' : status.reader.healthReasons.join('; ')} · cursor gaps: ${status.reader.gaps.total}${
               status.reader.gaps.rooms.length ? ` (${status.reader.gaps.rooms.join(', ')})` : ''
+            } · unresolved: ${status.reader.gaps.unresolved.join(', ') || 'none'} · recovered: ${
+              status.reader.gaps.recovered.join(', ') || 'none'
             } · backlog observed: ${status.reader.backlogObserved} · last error: ${status.reader.lastError ?? 'none'}`,
           ],
         },

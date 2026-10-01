@@ -133,6 +133,10 @@ export interface ReaderStatus extends ReaderThroughputStats {
     rooms: string[];
     resets: string[];
     bootstrap: string[];
+    /** Rooms whose latest gap is still open; part of the live gate. */
+    unresolved: string[];
+    /** Rooms whose latest gap was closed by a contiguous read; still recorded. */
+    recovered: string[];
   };
 }
 
@@ -428,6 +432,8 @@ export class OrchestratorReader {
         rooms: gaps.rooms,
         resets: gaps.resets,
         bootstrap: gaps.bootstrap,
+        unresolved: gaps.unresolved,
+        recovered: gaps.recovered,
       },
     };
   }
@@ -693,6 +699,8 @@ export class OrchestratorReader {
     rooms: string[];
     resets: string[];
     bootstrap: string[];
+    unresolved: string[];
+    recovered: string[];
     states: Array<{
       room: string;
       state: string;
@@ -701,6 +709,7 @@ export class OrchestratorReader {
       lastGapTo: number | null;
       firstObservedSeq: number | null;
       lastObservedSeq: number | null;
+      gapResolvedAt: string | null;
     }>;
   } {
     return this.roomReader.gaps();

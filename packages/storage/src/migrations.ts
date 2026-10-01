@@ -540,6 +540,26 @@ export const MIGRATIONS: Migration[] = [
       `ALTER TABLE room_cursors ADD COLUMN bootstrap_at TEXT`,
     ],
   },
+  {
+    version: 7,
+    name: 'room-gap-resolution',
+    statements: [
+      // Whether a recorded gap is still *unresolved*.
+      //
+      // A gap is permanent evidence and is never cleared — but "a loss happened"
+      // and "the reader is still losing" are different facts, and a live launch
+      // needs to be able to tell them apart. A gap becomes resolved only on
+      // positive evidence: a contiguous read (`reason = 'ok'`) that resumed past
+      // the missed range, which is the reader proving it is back inside the
+      // room's retained window. A later gap re-opens it (`gap_resolved_at` goes
+      // back to NULL), so the flag always describes the *latest* gap.
+      //
+      // It is durable on purpose: a restart must not turn a resolved gap back
+      // into an unresolved one, and must not lose the fact that one was resolved.
+      `ALTER TABLE room_cursors ADD COLUMN gap_resolved_at TEXT`,
+      `ALTER TABLE room_cursors ADD COLUMN last_resolved_gap_to INTEGER`,
+    ],
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;

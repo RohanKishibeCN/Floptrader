@@ -33,6 +33,10 @@ export interface CursorRecord {
   lastGapFrom: number | null;
   lastGapTo: number | null;
   bootstrapAt: string | null;
+  /** When a contiguous read proved the latest gap is behind us; null while open. */
+  gapResolvedAt: string | null;
+  /** The `missedTo` of the most recent gap that was resolved. */
+  lastResolvedGapTo: number | null;
 }
 
 export function toCursorRecord(row: RoomCursorRow): CursorRecord {
@@ -53,6 +57,8 @@ export function toCursorRecord(row: RoomCursorRow): CursorRecord {
     lastGapFrom: row.last_gap_from,
     lastGapTo: row.last_gap_to,
     bootstrapAt: row.bootstrap_at,
+    gapResolvedAt: row.gap_resolved_at,
+    lastResolvedGapTo: row.last_resolved_gap_to,
   };
 }
 
@@ -167,6 +173,12 @@ export class SqliteCursorStore implements CursorStore {
       }
       const current = repositories.roomCursors.ensure(room);
       const isGap = advance.reason === 'gap';
+      // The only evidence that a recorded gap is behind us: a contiguous read
+      // (`ok`) that resumed while the room already had a gap. An empty read is
+      // not evidence — nothing arriving is not the same as being caught up — and
+      // an old, already-resolved gap is left alone so a restart cannot re-open it.
+      const resolvedNow =
+        !isGap && advance.reason === 'ok' && current.gap_count > 0 && current.gap_resolved_at === null;
       const firstObserved =
         advance.firstSeq === null
           ? current.first_observed_seq
@@ -195,6 +207,11 @@ export class SqliteCursorStore implements CursorStore {
         last_gap_from: isGap ? (advance.missedFrom ?? null) : current.last_gap_from,
         last_gap_to: isGap ? (advance.missedTo ?? null) : current.last_gap_to,
         bootstrap_at: current.bootstrap_at ?? ingestedAt,
+        // A new gap re-opens the flag; only a contiguous read closes it.
+        gap_resolved_at: isGap ? null : resolvedNow ? ingestedAt : current.gap_resolved_at,
+        last_resolved_gap_to: resolvedNow
+          ? (current.last_gap_to ?? current.last_resolved_gap_to)
+          : current.last_resolved_gap_to,
       });
     });
     transaction();

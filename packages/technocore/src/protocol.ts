@@ -243,7 +243,11 @@ export function advanceCursor(
       generation,
       firstSeq,
       lastSeq,
-      gap: 0,
+      // The accumulated gap is carried through a quiet read. Returning 0 here
+      // would erase a recorded loss the first time nothing new arrived — the
+      // cursor would look clean while the evidence said otherwise, and the
+      // reader would stop reporting a gap it had already lost messages to.
+      gap: previous.gap,
       roomReset: false,
       reason: 'empty',
     };

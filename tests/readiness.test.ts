@@ -18,6 +18,7 @@ const READY_REFEREE: RefereeReadinessInputs = {
   fixedRoomCount: 6,
   expectedFixedRoomCount: 6,
   roomsWithGap: [],
+  roomsWithUnresolvedGap: [],
   roomsReset: [],
   seedSeen: true,
   refereeDid: 'did:key:z6Mkreferee',
@@ -82,11 +83,19 @@ describe('refereeReadiness', () => {
   });
 
   it('stays not-ready while any fixed room carries a cursor gap', () => {
-    const result = referee({ roomsWithGap: ['close1'] });
-    expect(result.ready).toBe(false);
-    expect(result.reasons.join(' ')).toContain('cursor gap in close1');
+    // Still losing: the gate names the room as an *unresolved* gap.
+    const open = referee({ roomsWithGap: ['close1'], roomsWithUnresolvedGap: ['close1'] });
+    expect(open.ready).toBe(false);
+    expect(open.reasons.join(' ')).toContain('unresolved cursor gap in close1');
+
+    // Caught up, but a loss still happened: a refusal either way, reported as
+    // recovered so an operator can tell "still losing" from "lost, then caught up".
+    const recovered = referee({ roomsWithGap: ['close1'], roomsWithUnresolvedGap: [] });
+    expect(recovered.ready).toBe(false);
+    expect(recovered.reasons.join(' ')).toContain('recovered, still on the record');
+
     // An empty list is the only acceptable value: a gap is never silently cleared.
-    expect(referee({ roomsWithGap: [] }).ready).toBe(true);
+    expect(referee({ roomsWithGap: [], roomsWithUnresolvedGap: [] }).ready).toBe(true);
   });
 
   it('refuses to call an unpinned referee established when a pin is required', () => {

@@ -140,17 +140,21 @@ export interface ReaderThroughputStats {
   lastError: string | null;
   lastErrorAt: string | null;
   backlogObserved: boolean;
+  /** Reads that moved a cursor forward, i.e. that actually made progress. */
+  cursorAdvances: number;
   /** Times the reader observed a contiguous read resume after a recorded gap. */
   gapRecoveries: number;
   lastGapRecoveredAt: string | null;
   readsPerMinute: number;
   messagesPerMinute: number;
+  cursorAdvancesPerMinute: number;
 }
 
 /** One second of read activity, for the rolling per-minute rates. */
 interface RateBucket {
   reads: number;
   messages: number;
+  advances: number;
 }
 
 const RATE_WINDOW_SECONDS = 60;
@@ -193,6 +197,7 @@ export class RoomReader {
     lastError: null as string | null,
     lastErrorAt: null as string | null,
     backlogObserved: false,
+    cursorAdvances: 0,
     gapRecoveries: 0,
     lastGapRecoveredAt: null as string | null,
   };
@@ -547,7 +552,7 @@ export class RoomReader {
       : this.cursorStore.commit(room, read, advance, this.now().toISOString());
 
     if (!error) {
-      this.noteRead(room, read.length);
+      this.noteRead(room, read.length, advance.cursor > previous.cursor);
       for (const message of read) {
         // Referee posts are the only messages with a state machine attached.
         if (room.startsWith('d-')) {
@@ -658,18 +663,20 @@ export class RoomReader {
   }
 
   /** Record one read in the rolling per-minute window. */
-  private noteRead(room: string, messages: number): void {
+  private noteRead(room: string, messages: number, advanced: boolean): void {
     const at = this.now().toISOString();
     this.throughput.lastSuccessAt = at;
     this.lastSuccessByRoom.set(room, at);
     this.throughput.messagesRead += messages;
     // Saturated page: the service had at least `limit` to give, so there is more.
     this.throughput.backlogObserved = messages >= this.limit;
+    if (advanced) this.throughput.cursorAdvances += 1;
 
     const second = Math.floor(this.now().getTime() / 1000);
-    const bucket = this.rateBuckets.get(second) ?? { reads: 0, messages: 0 };
+    const bucket = this.rateBuckets.get(second) ?? { reads: 0, messages: 0, advances: 0 };
     bucket.reads += 1;
     bucket.messages += messages;
+    if (advanced) bucket.advances += 1;
     this.rateBuckets.set(second, bucket);
     if (this.rateBuckets.size > RATE_WINDOW_SECONDS + 2) {
       for (const key of this.rateBuckets.keys()) {
@@ -678,16 +685,18 @@ export class RoomReader {
     }
   }
 
-  private rates(): { readsPerMinute: number; messagesPerMinute: number } {
+  private rates(): { readsPerMinute: number; messagesPerMinute: number; cursorAdvancesPerMinute: number } {
     const second = Math.floor(this.now().getTime() / 1000);
     let reads = 0;
     let messages = 0;
+    let advances = 0;
     for (const [key, bucket] of this.rateBuckets) {
       if (key < second - RATE_WINDOW_SECONDS || key > second) continue;
       reads += bucket.reads;
       messages += bucket.messages;
+      advances += bucket.advances;
     }
-    return { readsPerMinute: reads, messagesPerMinute: messages };
+    return { readsPerMinute: reads, messagesPerMinute: messages, cursorAdvancesPerMinute: advances };
   }
 
   /** The reader's own throughput view, for `status()` and the report. */
@@ -707,10 +716,12 @@ export class RoomReader {
       lastError: this.throughput.lastError,
       lastErrorAt: this.throughput.lastErrorAt,
       backlogObserved: this.throughput.backlogObserved,
+      cursorAdvances: this.throughput.cursorAdvances,
       gapRecoveries: this.throughput.gapRecoveries,
       lastGapRecoveredAt: this.throughput.lastGapRecoveredAt,
       readsPerMinute: rates.readsPerMinute,
       messagesPerMinute: rates.messagesPerMinute,
+      cursorAdvancesPerMinute: rates.cursorAdvancesPerMinute,
     };
   }
 
@@ -737,6 +748,14 @@ export class RoomReader {
     rooms: string[];
     resets: string[];
     bootstrap: string[];
+    /**
+     * Rooms whose latest gap is still open — no contiguous read has resumed past
+     * it. This is the "are we still losing messages" set, and it is what the live
+     * gate names; `rooms` is the permanent record and is never cleared.
+     */
+    unresolved: string[];
+    /** Rooms whose latest gap was closed by a contiguous read; still recorded. */
+    recovered: string[];
     states: Array<{
       room: string;
       state: CursorRecord['bootstrapState'];
@@ -745,9 +764,11 @@ export class RoomReader {
       lastGapTo: number | null;
       firstObservedSeq: number | null;
       lastObservedSeq: number | null;
+      gapResolvedAt: string | null;
     }>;
   } {
     const cursors = this.cursorStore.all();
+    const recorded = cursors.filter((cursor) => cursor.gap > 0 || cursor.gapCount > 0);
     return {
       total: cursors.reduce((sum, cursor) => sum + cursor.gap, 0),
       rooms: cursors.filter((cursor) => cursor.gap > 0).map((cursor) => cursor.room),
@@ -757,6 +778,8 @@ export class RoomReader {
       bootstrap: cursors
         .filter((cursor) => cursor.bootstrapState === 'bootstrap_truncated')
         .map((cursor) => cursor.room),
+      unresolved: recorded.filter((cursor) => cursor.gapResolvedAt === null).map((cursor) => cursor.room),
+      recovered: recorded.filter((cursor) => cursor.gapResolvedAt !== null).map((cursor) => cursor.room),
       states: cursors.map((cursor) => ({
         room: cursor.room,
         state: cursor.bootstrapState,
@@ -765,6 +788,7 @@ export class RoomReader {
         lastGapTo: cursor.lastGapTo,
         firstObservedSeq: cursor.firstObservedSeq,
         lastObservedSeq: cursor.lastObservedSeq,
+        gapResolvedAt: cursor.gapResolvedAt,
       })),
     };
   }

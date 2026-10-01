@@ -373,10 +373,18 @@ pass the scheduler still drives — so a discovered room can never delay the
 referee feed. Exceeding the cap records a `room_overflow` alert and a Lark
 critical line; it never opens more polls. The report prints `room_scope`, the
 reader's own throughput (mode, fixed rooms, in-flight reads, reads/min,
-messages/min, per-room last success) and its cursor gap/health view, so "which
-rooms did we observe, and is the reader keeping up" is always answerable from
-the report rather than assumed. A saturated page is reported as **backlog**, never
-as a gap — and a gap is never reported as backlog.
+messages/min, cursor advances/min, per-room last success) and its cursor
+gap/health view, so "which rooms did we observe, and is the reader keeping up" is
+always answerable from the report rather than assumed. A saturated page is
+reported as **backlog**, never as a gap — and a gap is never reported as backlog.
+
+A gap has two states and they are never confused. It is *unresolved* while no
+contiguous read has resumed past the missed range — the reader is still losing —
+and *recovered* once one has, which is durable so a restart cannot re-open it
+(`room_cursors.gap_resolved_at`, schema v7). A recovery never clears anything: the
+gap, its range and its count stay on the record and in the report forever, and
+**both states refuse a live launch** — the gate names which is which so an
+operator can tell "still losing" from "lost, then caught up".
 
 **`missed` means the referee never read the message**, so it does not count. The
 `repost_queue` is the finite, auditable remedy: only a message that is genuinely

@@ -326,6 +326,20 @@ else
   fail "room scope is not close1_only"
 fi
 
+# The reader must own the fixed rooms itself, not wait for the agent tick: this
+# is the throughput fix, and it has to be visible from the running process.
+if printf '%s' "$STATUS_BODY" | grep -q '"continuousMode":true'; then
+  pass "reader is in continuous mode (decoupled from the scheduler tick)"
+else
+  fail "reader is not in continuous mode"
+fi
+
+if printf '%s' "$STATUS_BODY" | grep -q '"fixedRoomCount":6'; then
+  pass "reader owns all six fixed rooms"
+else
+  fail "reader does not own six fixed rooms"
+fi
+
 # WAL is the journal mode the crash-recovery story depends on.
 DB_FILE="$DATA_DIR/app.db"
 if [[ -f "$DB_FILE" ]]; then

@@ -28,6 +28,8 @@ export interface RefereeReadinessInputs {
   expectedFixedRoomCount: number;
   /** Fixed rooms carrying a recorded cursor gap: a real mid-run loss. */
   roomsWithGap: string[];
+  /** Of those, the ones still *open*: no contiguous read has resumed past them. */
+  roomsWithUnresolvedGap: string[];
   /** Fixed rooms whose generation was reset. */
   roomsReset: string[];
   /** A seed post was read, signature-checked and accepted. */
@@ -71,8 +73,16 @@ export function refereeReadiness(input: RefereeReadinessInputs): Readiness {
       `reader owns ${input.fixedRoomCount} fixed rooms, expected ${input.expectedFixedRoomCount}`,
     );
   }
-  if (input.roomsWithGap.length > 0) {
-    reasons.push(`cursor gap in ${input.roomsWithGap.join(', ')}`);
+  if (input.roomsWithUnresolvedGap.length > 0) {
+    reasons.push(`unresolved cursor gap in ${input.roomsWithUnresolvedGap.join(', ')}`);
+  } else if (input.roomsWithGap.length > 0) {
+    // Still a refusal: a recorded loss is permanent evidence and is never cleared
+    // by a recovery. The distinction is only in *what the operator is told* — an
+    // open gap means the reader is still losing, a recovered one means it caught
+    // up but the loss happened and a human has to decide about it.
+    reasons.push(
+      `recorded cursor gap in ${input.roomsWithGap.join(', ')} (recovered, still on the record)`,
+    );
   }
   if (input.roomsReset.length > 0) {
     reasons.push(`room recreated: ${input.roomsReset.join(', ')}`);

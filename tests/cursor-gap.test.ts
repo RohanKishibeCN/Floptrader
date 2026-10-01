@@ -91,6 +91,16 @@ describe('advanceCursor', () => {
     expect(advance.gap).toBe(0);
   });
 
+  it('does not clear an accumulated gap just because a read came back empty', () => {
+    // A quiet moment is not evidence that a recorded loss went away. Returning
+    // `gap: 0` here would make the room look clean while the cursor table still
+    // said messages were never read.
+    const advance = advanceCursor(view({ cursor: 5, gap: 2 }), read([]), 1);
+    expect(advance.reason).toBe('empty');
+    expect(advance.gap).toBe(2);
+    expect(advance.cursor).toBe(5);
+  });
+
   it('stops at the last message returned, never at the ring newest', () => {
     // `last_seq` is the retained ring's newest, not the page's: a reply capped at
     // `limit` reports seq 500 while carrying only up to 200. Trusting `last_seq`

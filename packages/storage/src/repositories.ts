@@ -608,6 +608,10 @@ export interface RoomCursorRow {
   last_gap_from: number | null;
   last_gap_to: number | null;
   bootstrap_at: string | null;
+  /** Set once a contiguous read proved the latest gap is behind us; NULL while open. */
+  gap_resolved_at: string | null;
+  /** The `missedTo` of the most recent gap that was resolved. */
+  last_resolved_gap_to: number | null;
   updated_at: string;
 }
 
@@ -644,16 +648,20 @@ export class RoomCursorRepository {
       last_gap_from: null,
       last_gap_to: null,
       bootstrap_at: null,
+      gap_resolved_at: null,
+      last_resolved_gap_to: null,
       updated_at: nowIso(),
     };
     this.db
       .prepare(
         `INSERT INTO room_cursors (room, cursor, generation, first_seq, last_seq, gap,
            room_reset, consecutive_errors, last_ok_at, bootstrap_state, first_observed_seq,
-           last_observed_seq, gap_count, last_gap_from, last_gap_to, bootstrap_at, updated_at)
+           last_observed_seq, gap_count, last_gap_from, last_gap_to, bootstrap_at,
+           gap_resolved_at, last_resolved_gap_to, updated_at)
          VALUES (@room, @cursor, @generation, @first_seq, @last_seq, @gap, @room_reset,
            @consecutive_errors, @last_ok_at, @bootstrap_state, @first_observed_seq,
-           @last_observed_seq, @gap_count, @last_gap_from, @last_gap_to, @bootstrap_at, @updated_at)`,
+           @last_observed_seq, @gap_count, @last_gap_from, @last_gap_to, @bootstrap_at,
+           @gap_resolved_at, @last_resolved_gap_to, @updated_at)`,
       )
       .run(row);
     return row;
@@ -670,7 +678,8 @@ export class RoomCursorRepository {
            bootstrap_state = @bootstrap_state, first_observed_seq = @first_observed_seq,
            last_observed_seq = @last_observed_seq, gap_count = @gap_count,
            last_gap_from = @last_gap_from, last_gap_to = @last_gap_to,
-           bootstrap_at = @bootstrap_at, updated_at = @updated_at
+           bootstrap_at = @bootstrap_at, gap_resolved_at = @gap_resolved_at,
+           last_resolved_gap_to = @last_resolved_gap_to, updated_at = @updated_at
          WHERE room = @room`,
       )
       .run({ ...next, room, updated_at: nowIso() });
