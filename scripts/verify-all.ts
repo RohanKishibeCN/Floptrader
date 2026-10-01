@@ -245,11 +245,24 @@ await check('a control proof verifies against the signed inventory', () => {
   assert(verifyInventorySignature(inventory, manifest), 'the inventory signature did not verify');
 
   // A tampered proof must not verify any more.
-  const tampered = { ...proofs[0]!, signature: `${proofs[0]!.signature.slice(0, 84)}AA` };
+  //
+  // The tamper flips one significant character in place. Truncating the string
+  // and re-appending a fixed suffix would, whenever the original happened to
+  // carry that suffix at the cut, reproduce it byte for byte and make this check
+  // flap — so the mutation is guaranteed to differ and to keep the length, which
+  // is what forces the real signature verification to run.
+  const original = proofs[0]!.signature;
+  const pivot = 10;
+  const flipped = original[pivot] === 'A' ? 'B' : 'A';
+  const tampered = {
+    ...proofs[0]!,
+    signature: `${original.slice(0, pivot)}${flipped}${original.slice(pivot + 1)}`,
+  };
   assert(
     verifyControlProofSet([tampered], hash, inventory, manifest).verified === 0,
     'a tampered proof still verified',
   );
+  assert(tampered.signature !== original, 'the tamper did not change the signature');
 
   // The public inventory must never carry key material.
   const serialized = serializeInventory(parseInventory(serializeInventory(inventory)));

@@ -1442,6 +1442,30 @@ export class TradeRepository {
   }
 
   /**
+   * How much of the fleet the participation fallback has actually covered.
+   *
+   * The fallback's ids all begin with `pl`, so the set is exactly the trades it
+   * wrote — never a strategy trade that happened to share a pair. `posted`
+   * counts the copies that reached the book or were ruled on; `agentsCovered` is
+   * the distinct owners across their maker and taker sides, which is the figure
+   * the 150-agent participation promise is actually measured by.
+   */
+  participationCoverage(): { posted: number; agentsCovered: number } {
+    const rows = this.db
+      .prepare(
+        `SELECT maker_did, taker_did FROM trades
+          WHERE id LIKE 'pl%' AND status IN ('pending','settled','void','missed')`,
+      )
+      .all() as Array<{ maker_did: string; taker_did: string }>;
+    const agents = new Set<string>();
+    for (const row of rows) {
+      agents.add(row.maker_did);
+      agents.add(row.taker_did);
+    }
+    return { posted: rows.length, agentsCovered: agents.size };
+  }
+
+  /**
    * How many trade ids this pair has already spent.
    *
    * Counts only the copies that reached the book or were reported `missed`:
@@ -2573,6 +2597,25 @@ export class RepostRepository {
            updated_at = ? WHERE id = ?`,
       )
       .run(error, nowIso(), id);
+  }
+
+  /**
+   * Queue rows still owing work, for one kind of message.
+   *
+   * `pending` and `failed` both count: a row that exhausted its retries is still
+   * an unresolved message, and treating it as resolved would let a missed owner
+   * registration be forgotten rather than reported. The trading gate reads this
+   * for `owner` specifically.
+   */
+  unresolved(kind: string): number {
+    return (
+      this.db
+        .prepare(
+          `SELECT COUNT(*) AS n FROM repost_queue
+            WHERE message_kind = ? AND status IN ('pending','failed')`,
+        )
+        .get(kind) as { n: number }
+    ).n;
   }
 
   /** Terminal, and deliberately not retried: e.g. the lock has passed. */

@@ -28,9 +28,79 @@
  * and never a substitute for it.
  */
 
+import type { Rules } from '@flop/close-call';
+
 export interface Readiness {
   ready: boolean;
   reasons: string[];
+}
+
+/**
+ * The contest's own wall-clock lock, as a fact about *now*.
+ *
+ * Every other lock in this process is derived from the referee feed: the sweep
+ * number, `price.for`, the verifier's `locked` flag. All of those depend on the
+ * feed still talking. A feed that goes quiet — the referee stops posting, or
+ * the reader loses its cursor — leaves the sweep frozen where it was, and a
+ * frozen sweep before `lock_sweep` reads as "still open". The wall clock does
+ * not depend on any of that: `rules.lockAt` is published, fixed, and true
+ * whether or not we can hear the referee. It is the one gate that cannot be
+ * talked out of being closed.
+ */
+export interface LockState {
+  /** True when `lockAt` parsed. False is a refusal, never "unknown, so open". */
+  valid: boolean;
+  /** True only while the wall clock is strictly before the lock. */
+  beforeLock: boolean;
+  /** True when the contest is closed to new writes. */
+  locked: boolean;
+  reason: string | null;
+}
+
+/** The wall-clock reason, phrased once so the gate, the record and the report agree. */
+export const WALL_CLOCK_LOCKED_REASON = 'contest lockAt has passed by wall clock';
+/** The wall clock could not be read; fail closed rather than treat it as open. */
+export const WALL_CLOCK_INVALID_REASON = 'invalid contest lockAt';
+
+/**
+ * Parse `lockAt` as UTC.
+ *
+ * A bare `YYYY-MM-DDTHH:MM:SS` carries no zone designator, and ECMAScript parses
+ * that form as *local* time — which would silently move the lock by the host's
+ * offset. The rules publish UTC, so the missing-zone form is read as UTC
+ * explicitly rather than trusting the server's locale.
+ */
+function parseLockAt(value: string): number {
+  const trimmed = value.trim();
+  const zoned = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(trimmed) ? trimmed : `${trimmed}Z`;
+  return Date.parse(zoned);
+}
+
+/**
+ * The wall-clock lock. Uses the injected clock, never `new Date()`, so a test
+ * can move time deliberately and the two never disagree.
+ *
+ * Invalid `lockAt` fails closed: an unparsable deadline is a closed contest,
+ * because the alternative is a process that cannot read its own rules and
+ * writes anyway.
+ */
+export function lockState(now: Date, rules: Rules): LockState {
+  const lockMs = parseLockAt(rules.lockAt);
+
+  if (!Number.isFinite(lockMs)) {
+    return { valid: false, beforeLock: false, locked: true, reason: WALL_CLOCK_INVALID_REASON };
+  }
+
+  if (now.getTime() >= lockMs) {
+    return {
+      valid: true,
+      beforeLock: false,
+      locked: true,
+      reason: WALL_CLOCK_LOCKED_REASON,
+    };
+  }
+
+  return { valid: true, beforeLock: true, locked: false, reason: null };
 }
 
 /**
@@ -280,20 +350,34 @@ export interface LateStartRegistrationReadinessInputs extends LateStartFeedReadi
   writerHealthy: boolean;
   /** The nonce store is usable, so no registration can reuse a counter. */
   nonceStoreUsable: boolean;
+  /** The real wall-clock lock: false once `rules.lockAt` has passed. */
+  lockBefore: boolean;
+  /** True when `lockAt` parsed. False is a refusal, never a reason to post. */
+  lockValid: boolean;
 }
 
 /**
  * May this process post its owner registrations from a seedless start?
  *
- * The feed gate plus the write lane. `historicalReplayComplete` is deliberately
- * *not* a clause: an owner registration is a fresh message with a fresh nonce,
- * and the referee mints it at the next sweep. Nothing about it needs the
- * opening price.
+ * The feed gate plus the write lane, plus the contest's own wall-clock lock.
+ * `historicalReplayComplete` is deliberately *not* a clause: an owner
+ * registration is a fresh message with a fresh nonce, and the referee mints it
+ * at the next sweep. Nothing about it needs the opening price.
+ *
+ * The wall clock *is* a clause, and it is independent of the referee's sweep.
+ * A registration that arrives after the published lock cannot mint, so the one
+ * gate that holds it back must not be a feed that could still be reporting the
+ * last sweep before the lock.
  */
 export function lateStartRegistrationReadiness(
   input: LateStartRegistrationReadinessInputs,
 ): Readiness {
   const reasons = [...lateStartFeedReadiness(input).reasons];
+  // Ahead of the write-lane clauses: "the contest is over" outranks "a switch
+  // is off", and the reason has to say which it was.
+  if (!input.lockBefore) {
+    reasons.push(input.lockValid ? WALL_CLOCK_LOCKED_REASON : WALL_CLOCK_INVALID_REASON);
+  }
   if (!input.allowRegistration) {
     reasons.push('FLOP_ALLOW_REGISTRATION is off; owner registrations are not posted');
   }
@@ -368,6 +452,36 @@ export function marketSnapshotReadiness(input: MarketSnapshotReadinessInputs): R
   return { ready: reasons.length === 0, reasons };
 }
 
+/** The shape the registration gate reports, shared by the gate and `/status`. */
+export interface RegistrationGateFacts {
+  registrationPostAcked: number;
+  registrationExpected: number;
+  registrationPending: number;
+  registrationFailed: number;
+  registrationUnresolvedMissed: boolean;
+}
+
+/**
+ * Why a trade may not precede owner registration, phrased once.
+ *
+ * Every clause is a fact about the register, never about a mint: the referee
+ * naming our DID in a flow is a separate, later fact, and a sweep whose flow was
+ * omitted leaves it unknown. Requiring it here would turn "the referee did not
+ * publish this sweep's flow" into "this owner is not registered", which is
+ * exactly the conflation the layered counts exist to prevent.
+ */
+export function registrationGateReason(input: RegistrationGateFacts): string {
+  if (input.registrationUnresolvedMissed) {
+    return 'owner registration has unresolved missed messages';
+  }
+  if (input.registrationFailed > 0) {
+    return `owner registration has ${input.registrationFailed} failed message(s); a trade cannot precede registration`;
+  }
+  const pending =
+    input.registrationPending > 0 ? `, ${input.registrationPending} pending` : '';
+  return `owner registration is not ready: ${input.registrationPostAcked}/${input.registrationExpected} owner messages acknowledged${pending}`;
+}
+
 export interface LateStartTradingReadinessInputs {
   /** The late-start feed gate, nested: the trust boundary cannot be skipped. */
   lateStartFeed: Readiness;
@@ -375,6 +489,25 @@ export interface LateStartTradingReadinessInputs {
   tradingArmed: boolean;
   /** The current price post: sweep, reference, band, `for`, freshness. */
   marketSnapshot: Readiness;
+  /**
+   * Every expected owner has a persisted registration with a `technocore_seq`.
+   *
+   * Registration is a *precondition* of trading, never a substitute for it. A
+   * trade written before its owner is on the register would settle against an
+   * account the referee has not minted, and the close-1 participation rule is
+   * that a trade is preceded by its owner's registration.
+   */
+  registrationReady: boolean;
+  registrationPostAcked: number;
+  registrationExpected: number;
+  registrationPending: number;
+  registrationFailed: number;
+  /** A local owner registration was reported missed and not yet re-issued. */
+  registrationUnresolvedMissed: boolean;
+  /** The real wall-clock lock, independent of the referee's own sweep. */
+  wallClockBeforeLock: boolean;
+  /** True when `lockAt` parsed; false fails closed. */
+  wallClockLockValid: boolean;
   loadAllowsNewOffer: boolean;
   writerHealthy: boolean;
   nonceStoreUsable: boolean;
@@ -403,6 +536,14 @@ export interface LateStartTradingReadinessInputs {
  */
 export function lateStartTradingReadiness(input: LateStartTradingReadinessInputs): Readiness {
   const reasons: string[] = [];
+  // The wall clock first: it is the one clause no feed can reopen.
+  if (!input.wallClockBeforeLock) {
+    reasons.push(input.wallClockLockValid ? WALL_CLOCK_LOCKED_REASON : WALL_CLOCK_INVALID_REASON);
+  }
+  // Registration before trade, and never the other way round.
+  if (!input.registrationReady) {
+    reasons.push(registrationGateReason(input));
+  }
   if (!input.lateStartFeed.ready) {
     reasons.push(...input.lateStartFeed.reasons.map((reason) => `late-start feed: ${reason}`));
   }

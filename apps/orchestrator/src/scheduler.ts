@@ -96,11 +96,14 @@ import {
   lateStartFeedReadiness,
   lateStartRegistrationReadiness,
   lateStartTradingReadiness,
+  lockState,
   marketSnapshotReadiness,
   refereeFeedBlockerReasons,
   refereeFeedReadiness,
+  registrationGateReason,
   registrationReadiness,
   tradingReadiness,
+  type LockState,
   type Readiness,
 } from './readiness.js';
 import { runtimeEventSummary, type RuntimeEventNotifier } from './runtime-events.js';
@@ -376,6 +379,41 @@ export interface StatusSnapshot {
   lateStartTradingReady: boolean;
   /** The first reason a late-start trade is refused, or null when none is. */
   tradeBlockedReason: string | null;
+  /**
+   * The contest's own wall-clock lock, reported beside the referee's own.
+   *
+   * `lockedByReferee` is the sweep-derived lock; `lockedByWallClock` is the
+   * published deadline. They are separate because a silent feed can leave the
+   * first false while the second is true, and an operator has to be able to see
+   * which one closed the contest.
+   */
+  wallClockBeforeLock: boolean;
+  lockedByReferee: boolean;
+  lockedByWallClock: boolean;
+  /**
+   * The owner-registration gate the trading path reads before any trade.
+   *
+   * `registrationReady` requires every expected owner to have a seq-bearing
+   * registration — never a mint. The layers below it are the same facts
+   * `/status.registration` splits, repeated here because the trading gate is the
+   * consumer that decides whether a trade may be written.
+   */
+  registrationReady: boolean;
+  registrationExpected: number;
+  registrationPostAcked: number;
+  registrationRoomEchoed: number;
+  registrationMintConfirmed: number;
+  registrationMintUncertain: number;
+  /**
+   * The participation fallback, measured rather than assumed.
+   *
+   * `expected` is the number of pairs the fleet forms; `posted` counts the
+   * participation trades actually written; `agentsCovered` is how many distinct
+   * owners appear in at least one of them.
+   */
+  participationTradesExpected: number;
+  participationTradesPosted: number;
+  participationAgentsCovered: number;
   /**
    * The three registration layers, kept apart on purpose.
    *
@@ -682,6 +720,21 @@ export interface ReaderReport {
     trading: StatusSnapshot['trading'];
     tradingReady: boolean;
     tradeBlockedReason: string | null;
+    /** The contest's own wall clock, and which lock closed the contest. */
+    wallClockBeforeLock: boolean;
+    lockedByReferee: boolean;
+    lockedByWallClock: boolean;
+    /** The owner-registration gate the trading path reads before any trade. */
+    registrationReady: boolean;
+    registrationExpected: number;
+    registrationPostAcked: number;
+    registrationRoomEchoed: number;
+    registrationMintConfirmed: number;
+    registrationMintUncertain: number;
+    /** The participation fallback's own coverage. */
+    participationTradesExpected: number;
+    participationTradesPosted: number;
+    participationAgentsCovered: number;
     audit: StatusSnapshot['lateStartAudit'];
   };
   serverContract: ServerContractProbe | null;
@@ -709,6 +762,29 @@ export type OperatingMode =
  * have `late-start mode is not armed` as their first reason, which is what makes
  * `/status` able to say "asked for, and here is exactly what is missing".
  */
+/**
+ * Owner-registration progress, as the trading path reads it.
+ *
+ * The counts are kept apart exactly as `status().registration` keeps them: a
+ * POST the service acknowledged, a row the room echoed and a mint the referee
+ * named are three different facts, and only the first is a precondition of a
+ * trade. `mintConfirmed` is deliberately *not* part of `ready`.
+ */
+export interface RegistrationProgress {
+  ready: boolean;
+  expected: number;
+  postAcked: number;
+  pending: number;
+  failed: number;
+  roomEchoed: number;
+  mintConfirmed: number;
+  mintUncertain: number;
+  /** A queued owner re-post is still owing work, so registration is not settled. */
+  unresolvedMissed: boolean;
+  /** Why it is not ready, phrased for the gate, `/status` and the report alike. */
+  reason: string | null;
+}
+
 export interface LateStartGates {
   feed: Readiness;
   registration: Readiness;
@@ -718,6 +794,10 @@ export interface LateStartGates {
   launchPinVerified: boolean;
   /** Something signed by the pinned referee has been accepted. */
   refereeSeen: boolean;
+  /** The contest's own wall-clock lock, independent of the referee's sweep. */
+  lock: LockState;
+  /** Owner-registration progress, shared by the trading gate and `/status`. */
+  registrationProgress: RegistrationProgress;
 }
 
 export interface SchedulerOptions {
@@ -1314,6 +1394,86 @@ export class OrchestratorScheduler {
   // -------------------------------------------------------------------------
 
   /**
+   * The contest's own wall-clock lock, read from the injected clock.
+   *
+   * Computed afresh on every write path rather than cached, so the three of
+   * them cannot disagree and a lock that took effect mid-tick is seen by the
+   * next write rather than the one before it.
+   */
+  private contestLock(): LockState {
+    return lockState(this.now(), this.rules);
+  }
+
+  /**
+   * Whether one agent's owner registration is on the register.
+   *
+   * The fact that matters is the room's own acknowledgement — a `technocore_seq`
+   * from the POST — on a row that reached at least `posted`. A row that only
+   * reached `created` or `failed` has no seq and has not registered, while a
+   * `before_lock_confirmed` or `mint_observed` row is strictly past that point;
+   * both the seq and the status rank are required so neither a shed write nor a
+   * walk-back can pass.
+   */
+  private hasPostedRegistration(agentId: string): boolean {
+    const row = this.repositories.participation.get(agentId);
+    if (row === undefined) return false;
+    if (row.technocore_seq === null) return false;
+    return PARTICIPATION_RANK[row.status] >= PARTICIPATION_RANK.posted;
+  }
+
+  /**
+   * Owner registration, counted the way the trading gate reads it.
+   *
+   * `ready` asks one question: does every expected owner have a persisted row
+   * whose POST the room acknowledged with a seq, with no owner re-post still
+   * owing work. It does *not* ask whether the referee minted — a mint is a
+   * later, separate fact, and a sweep whose flow was omitted leaves mints
+   * unknown rather than failed. Requiring a mint here would hold every trade on
+   * evidence the referee may simply not have published, which is exactly the
+   * conflation the layered counts exist to prevent.
+   */
+  private registrationProgress(): RegistrationProgress {
+    const agents = [...this.keyStore.agentIds];
+    const expected = agents.length;
+    let postAcked = 0;
+    let pending = 0;
+    let failed = 0;
+    for (const agentId of agents) {
+      const row = this.repositories.participation.get(agentId);
+      if (row !== undefined && row.technocore_seq !== null) {
+        postAcked += 1;
+      } else if (row?.status === 'failed') {
+        failed += 1;
+      } else {
+        pending += 1;
+      }
+    }
+    const counts = this.repositories.participation.outcomeCounts();
+    const unresolvedMissed = this.repositories.reposts.unresolved('owner') > 0;
+    const ready = postAcked === expected && !unresolvedMissed;
+    return {
+      ready,
+      expected,
+      postAcked,
+      pending,
+      failed,
+      roomEchoed: counts.roomEchoConfirmed,
+      mintConfirmed: counts.mintConfirmed,
+      mintUncertain: counts.mintUncertain,
+      unresolvedMissed,
+      reason: ready
+        ? null
+        : registrationGateReason({
+            registrationPostAcked: postAcked,
+            registrationExpected: expected,
+            registrationPending: pending,
+            registrationFailed: failed,
+            registrationUnresolvedMissed: unresolvedMissed,
+          }),
+    };
+  }
+
+  /**
    * Drive every agent to `readback_confirmed` (and beyond, as the referee
    * confirms mints). Idempotent: the ledger is `participation_records`.
    */
@@ -1828,8 +1988,17 @@ export class OrchestratorScheduler {
     const result = { queued, posted: 0, failed: 0, skipped: 0 };
     if (this.loadGuard.state.paused.readsOnly) return result;
     const sweep = this.reader.verifier.state.currentSweep;
+    // The contest's own wall clock, checked before any re-post. Unlike the
+    // referee's sweep it is true even when the feed has gone silent — and a
+    // re-post past the deadline cannot count, so it is recorded and skipped.
+    const wallClock = this.contestLock();
 
     for (const row of this.repositories.reposts.retryable()) {
+      if (!wallClock.beforeLock) {
+        this.repositories.reposts.markSkipped(row.id!, 'locked_by_wall_clock');
+        result.skipped += 1;
+        continue;
+      }
       // The lock closes re-posting exactly as it closes registration: past it a
       // re-post cannot count, so it is noise on a contest room.
       if (sweep !== null && sweep > this.rules.lockSweep) {
@@ -2164,6 +2333,15 @@ export class OrchestratorScheduler {
     // names the reason, and the fallback simply runs again on the next tick.
     const gates = this.readiness();
     if (!gates.lateStart.feed.ready || !gates.lateStart.marketSnapshot.ready) return result;
+    // Registration precedes trade for the whole fleet, not merely for a pair:
+    // the fallback owes one trade per agent, so it waits until every owner is on
+    // the register with a seq. A pair-local check would let the first pairs
+    // trade while the last owners were still unregistered.
+    if (!gates.lateStart.registrationProgress.ready) return result;
+    // The contest's own wall clock, re-checked here rather than trusted from the
+    // referee feed: a feed that stopped talking must not let the fallback write
+    // past the published deadline.
+    if (!gates.lateStart.lock.beforeLock) return result;
 
     const px = this.participationPrice(limits);
     if (px === null) return result;
@@ -2364,6 +2542,36 @@ export class OrchestratorScheduler {
           continue;
         }
         const { terms, signed } = built;
+        // Specific facts before the aggregate gate, so the refusal names which
+        // one it was rather than a generic `not_trading_ready`. Registration
+        // precedes the trade: a trade written before its owner is on the
+        // register would settle against an account the referee has not minted.
+        if (this.config.lateStartTradingArmed && !this.hasPostedRegistration(agentId)) {
+          this.recordTrade(
+            agentId,
+            terms,
+            'refused',
+            'owner_registration_not_posted',
+            signed.maker_sig,
+            signed.taker_sig,
+          );
+          result.refused += 1;
+          continue;
+        }
+        // The wall clock, independently of the referee's sweep: a feed that went
+        // quiet must not let the strategy write past the contest's own deadline.
+        if (!this.contestLock().beforeLock) {
+          this.recordTrade(
+            agentId,
+            terms,
+            'refused',
+            'locked_by_wall_clock',
+            signed.maker_sig,
+            signed.taker_sig,
+          );
+          result.refused += 1;
+          continue;
+        }
         const refusal = !tradingAllowed
           ? snapshot.locked
             ? 'locked'
@@ -2979,6 +3187,10 @@ export class OrchestratorScheduler {
       refereeFeedBlockers: lateStartFeedBlockerReasons(verifier.conservativeReasons),
       refereeSeen,
     } as const;
+    // The wall clock and the register are read once per assembly, so the gate,
+    // the three write paths and `/status` all quote the same two facts.
+    const lock = this.contestLock();
+    const registrationProgress = this.registrationProgress();
     const lateStartFeed = lateStartFeedReadiness(lateStartFeedInputs);
     const lateStartRegistration = lateStartRegistrationReadiness({
       ...lateStartFeedInputs,
@@ -2986,6 +3198,8 @@ export class OrchestratorScheduler {
       fleetComplete,
       writerHealthy: writesAllowed,
       nonceStoreUsable: writesAllowed,
+      lockBefore: lock.beforeLock,
+      lockValid: lock.valid,
     });
     const marketSnapshot = marketSnapshotReadiness({
       refereeSeen,
@@ -3004,8 +3218,18 @@ export class OrchestratorScheduler {
     });
     const lateStartTrading = lateStartTradingReadiness({
       lateStartFeed,
+      // A trade may not precede its owner's registration, globally, by the same
+      // count `/status` reports — and never by a mint it cannot see.
+      registrationReady: registrationProgress.ready,
+      registrationPostAcked: registrationProgress.postAcked,
+      registrationExpected: registrationProgress.expected,
+      registrationPending: registrationProgress.pending,
+      registrationFailed: registrationProgress.failed,
+      registrationUnresolvedMissed: registrationProgress.unresolvedMissed,
       tradingArmed: this.config.lateStartTradingArmed,
       marketSnapshot,
+      wallClockBeforeLock: lock.beforeLock,
+      wallClockLockValid: lock.valid,
       loadAllowsNewOffer: this.loadGuard.allow('new_offer'),
       writerHealthy: writesAllowed,
       nonceStoreUsable: writesAllowed,
@@ -3038,6 +3262,8 @@ export class OrchestratorScheduler {
           marketSnapshot,
           launchPinVerified,
           refereeSeen,
+          lock,
+          registrationProgress,
         },
       };
     }
@@ -3052,6 +3278,8 @@ export class OrchestratorScheduler {
         marketSnapshot,
         launchPinVerified,
         refereeSeen,
+        lock,
+        registrationProgress,
       },
     };
   }
@@ -3151,6 +3379,12 @@ export class OrchestratorScheduler {
 
     const sweeps = this.repositories.trades.sweepCounts(verifier.currentSweep, this.rules.lockSweep);
     const tradeOutcomes = this.repositories.trades.outcomeCounts();
+    // The wall clock and the register come from the same assembly the gates
+    // used, so `/status` cannot report a different answer than the write path.
+    const lock = readiness.lateStart.lock;
+    const registrationProgress = readiness.lateStart.registrationProgress;
+    const participationCoverage = this.repositories.trades.participationCoverage();
+    const participationExpected = Math.floor(this.keyStore.size / 2);
 
     return {
       at: at.toISOString(),
@@ -3190,10 +3424,27 @@ export class OrchestratorScheduler {
       lateStartTradingReady: readiness.lateStart.trading.ready,
       tradeBlockedReason:
         this.config.lateStartArmed && !readiness.lateStart.trading.ready
-          ? (readiness.lateStart.trading.reasons[0] ?? null)
+          ? // The wall clock outranks the feed-derived reasons: an operator
+            // reading "locked_by_wall_clock" knows the contest is over, while a
+            // stale-feed reason would suggest waiting for a newer post.
+            lock.beforeLock
+            ? (readiness.lateStart.trading.reasons[0] ?? null)
+            : 'locked_by_wall_clock'
           : readiness.trading.ready
             ? null
             : (readiness.trading.reasons[0] ?? null),
+      wallClockBeforeLock: lock.beforeLock,
+      lockedByReferee: verifier.locked,
+      lockedByWallClock: lock.locked,
+      registrationReady: registrationProgress.ready,
+      registrationExpected: registrationProgress.expected,
+      registrationPostAcked: registrationProgress.postAcked,
+      registrationRoomEchoed: registrationProgress.roomEchoed,
+      registrationMintConfirmed: registrationProgress.mintConfirmed,
+      registrationMintUncertain: registrationProgress.mintUncertain,
+      participationTradesExpected: participationExpected,
+      participationTradesPosted: participationCoverage.posted,
+      participationAgentsCovered: participationCoverage.agentsCovered,
       registration: this.repositories.participation.outcomeCounts(),
       trading: {
         eligibleAgents: this.keyStore.size,
@@ -3444,6 +3695,18 @@ export class OrchestratorScheduler {
         trading: status.trading,
         tradingReady: status.lateStartTradingReady,
         tradeBlockedReason: status.tradeBlockedReason,
+        wallClockBeforeLock: status.wallClockBeforeLock,
+        lockedByReferee: status.lockedByReferee,
+        lockedByWallClock: status.lockedByWallClock,
+        registrationReady: status.registrationReady,
+        registrationExpected: status.registrationExpected,
+        registrationPostAcked: status.registrationPostAcked,
+        registrationRoomEchoed: status.registrationRoomEchoed,
+        registrationMintConfirmed: status.registrationMintConfirmed,
+        registrationMintUncertain: status.registrationMintUncertain,
+        participationTradesExpected: status.participationTradesExpected,
+        participationTradesPosted: status.participationTradesPosted,
+        participationAgentsCovered: status.participationAgentsCovered,
         audit: status.lateStartAudit,
       },
       serverContract: reader.serverContract,
@@ -3781,6 +4044,12 @@ export class OrchestratorScheduler {
             `ls: ${status.operatingMode} pin=${status.launchPinVerified} feed=${status.lateStartFeedReady}` +
               ` snap=${status.marketSnapshotReady} seed=${status.seedVerified} replay=${status.historicalReplayComplete}` +
               ` reg=${status.registration.postAcked}/${status.registration.roomEchoConfirmed}/${status.registration.mintConfirmed}/${status.registration.mintUncertain}` +
+              // Registration-before-trade and the wall clock, in the same breath
+              // as the layers they gate: `regready` is what the trading path
+              // requires, and `pt` is the fallback's own coverage.
+              ` regready=${status.registrationReady}/${status.registrationExpected}` +
+              ` lock=${status.wallClockBeforeLock}${status.lockedByWallClock ? '(wall)' : ''}` +
+              ` pt=${status.participationTradesPosted}/${status.participationTradesExpected}/${status.participationAgentsCovered}` +
               (status.lateStartBlockedReason === null ? '' : ` blocked=${status.lateStartBlockedReason}`),
           ],
         },
