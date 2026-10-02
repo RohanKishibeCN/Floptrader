@@ -62,7 +62,11 @@ import {
   snapshotPermanentCounts,
 } from '@flop/storage';
 import { PINNED_PATHS, comparePackageHash, decideOnDrift, pinnedFromManifest, sha256Hex } from '@flop/technocore';
-import { LATE_START_CONFIRM_VALUE, loadConfig } from '../apps/orchestrator/src/config.js';
+import {
+  LATE_START_CONFIRM_VALUE,
+  LATE_START_STRATEGY_CONFIRM_VALUE,
+  loadConfig,
+} from '../apps/orchestrator/src/config.js';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const referenceDir = join(root, 'reference');
@@ -408,7 +412,47 @@ await check('late start needs its own confirmation and a second trading switch',
   );
   assert(!oneSwitch.lateStartTradingArmed, 'FLOP_ALLOW_TRADING alone armed late-start trading');
 
-  return `default off; live alone does not arm it; LATE_START_CONFIRM=${LATE_START_CONFIRM_VALUE} arms registration, both trading switches arm trading`;
+  // The bootstrap strategy is a third switch, and the properties an accidental
+  // arming would violate are the same: off by default, never armed by the two
+  // trading switches alone, and armed only by its own confirmation literal.
+  assert(
+    !byDefault.lateStartStrategyTradingArmed &&
+      !trading.lateStartStrategyTradingArmed &&
+      !oneSwitch.lateStartStrategyTradingArmed,
+    'the bootstrap strategy armed without its own switch',
+  );
+
+  const strategyArmed = loadConfig(
+    live({
+      LATE_START_MODE: 'true',
+      LATE_START_CONFIRM: LATE_START_CONFIRM_VALUE,
+      FLOP_ALLOW_TRADING: 'true',
+      LATE_START_ALLOW_TRADING: 'true',
+      LATE_START_ALLOW_STRATEGY_TRADING: 'true',
+      LATE_START_STRATEGY_CONFIRM: LATE_START_STRATEGY_CONFIRM_VALUE,
+    }),
+  );
+  assert(
+    strategyArmed.lateStartStrategyTradingArmed,
+    'all three switches did not arm the bootstrap strategy',
+  );
+
+  const wrongStrategyLiteral = loadConfig(
+    live({
+      LATE_START_MODE: 'true',
+      LATE_START_CONFIRM: LATE_START_CONFIRM_VALUE,
+      FLOP_ALLOW_TRADING: 'true',
+      LATE_START_ALLOW_TRADING: 'true',
+      LATE_START_ALLOW_STRATEGY_TRADING: 'true',
+      LATE_START_STRATEGY_CONFIRM: 'yes',
+    }),
+  );
+  assert(
+    !wrongStrategyLiteral.lateStartStrategyTradingArmed,
+    'a wrong LATE_START_STRATEGY_CONFIRM armed the bootstrap strategy',
+  );
+
+  return `default off; live alone does not arm it; LATE_START_CONFIRM=${LATE_START_CONFIRM_VALUE} arms registration, both trading switches arm trading, LATE_START_STRATEGY_CONFIRM=${LATE_START_STRATEGY_CONFIRM_VALUE} arms the bootstrap strategy`;
 });
 
 /**

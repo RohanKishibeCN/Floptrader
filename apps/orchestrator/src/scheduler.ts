@@ -63,13 +63,17 @@ import type {
   Repositories,
   SqliteDatabase,
   TradeRow,
+  TradeSource,
 } from '@flop/storage';
 import { fileBytes } from '@flop/storage';
 import {
   GroupRunner,
+  LATE_START_OBSERVATIONS_REQUIRED,
   asDecimals,
   fallbackParams,
+  lateStartSignal,
   type GatedAction,
+  type LateStartSignal,
   type RunOutcome,
   type StrategyGroupName,
 } from '@flop/strategy';
@@ -415,6 +419,21 @@ export interface StatusSnapshot {
   participationTradesPosted: number;
   participationAgentsCovered: number;
   /**
+   * The late-start strategy path.
+   *
+   * `strategyGateMode` names which decision is running — the five group profiles
+   * or the late-start bootstrap — and `lateStartSignal` is the direction the
+   * bootstrap read from the referee's own closes. Both are reported whether or
+   * not the strategy switch is armed, so "off" is visible instead of absent.
+   */
+  strategyGateMode: 'group' | 'late_start_bootstrap';
+  lateStartStrategyTradingReady: boolean;
+  strategyBlockedReason: string | null;
+  lateStartObservationCount: number;
+  lateStartSignal: LateStartSignal | 'insufficient';
+  strategyTradesPosted: number;
+  bootstrapStrategyTradesPosted: number;
+  /**
    * The three registration layers, kept apart on purpose.
    *
    * A POST the service acknowledged is not a room echo, and a room echo is not a
@@ -735,6 +754,14 @@ export interface ReaderReport {
     participationTradesExpected: number;
     participationTradesPosted: number;
     participationAgentsCovered: number;
+    /** The late-start strategy path: which decision, and what it reads. */
+    strategyGateMode: 'group' | 'late_start_bootstrap';
+    lateStartStrategyTradingReady: boolean;
+    strategyBlockedReason: string | null;
+    lateStartObservationCount: number;
+    lateStartSignal: LateStartSignal | 'insufficient';
+    strategyTradesPosted: number;
+    bootstrapStrategyTradesPosted: number;
     audit: StatusSnapshot['lateStartAudit'];
   };
   serverContract: ServerContractProbe | null;
@@ -2250,6 +2277,13 @@ export class OrchestratorScheduler {
       sameDirectionStreak: this.sameDirectionStreak(agentId),
       externalOffers: group === 'external_offer_taker' ? offers : [],
       sweep: snapshot.sweep,
+      // A late start takes the bootstrap decision in place of the group profile,
+      // because the profile needs a history the missing seed would have provided.
+      // `external_offer_taker` is excluded: its input is a stranger's offer from
+      // a book we cannot audit, which is not a price signal at all.
+      ...(this.config.lateStartArmed && group !== 'external_offer_taker'
+        ? { lateStartBootstrap: { enabled: this.config.lateStartStrategyTradingArmed } }
+        : {}),
     };
   }
 
@@ -2347,7 +2381,15 @@ export class OrchestratorScheduler {
     if (px === null) return result;
     const qty = this.rules.minQty;
 
-    const agents = [...this.keyStore.agentIds].sort();
+    // Only the owners who do not already have an effective trade. A bootstrap
+    // trade written earlier in this tick is a trade the referee will rule on, so
+    // that owner is covered already; pairing the full fleet blindly would either
+    // hand them a second position or leave their partner with none.
+    const agents = [...this.keyStore.agentIds]
+      .sort()
+      .filter(
+        (agentId) => !this.repositories.trades.hasEffectiveTradeForDid(this.keyStore.did(agentId)),
+      );
     for (let i = 0; i + 1 < agents.length; i += 2) {
       const makerAgentId = agents[i]!;
       const takerAgentId = agents[i + 1]!;
@@ -2367,15 +2409,6 @@ export class OrchestratorScheduler {
         return row !== undefined && row.technocore_seq !== null;
       });
       if (!registered) {
-        result.skipped += 1;
-        continue;
-      }
-      // One participation trade per agent, ever. The ledger answers this, so a
-      // restart cannot double it and a later sweep cannot repeat it.
-      if (
-        this.repositories.trades.hasEffectiveTradeForDid(makerDid) ||
-        this.repositories.trades.hasEffectiveTradeForDid(takerDid)
-      ) {
         result.skipped += 1;
         continue;
       }
@@ -2450,6 +2483,7 @@ export class OrchestratorScheduler {
         posted_sweep: snapshot.sweep,
         local_funds_side: this.localFundsSide(terms, makerDid),
         funds_side_confidence: 'local_inference',
+        trade_source: 'participation',
       };
       if (!this.repositories.trades.insert(row)) {
         // The row exists but never took effect — a previous `refused`. Rewriting
@@ -2532,12 +2566,17 @@ export class OrchestratorScheduler {
       const agentId = outcome.agentId;
       const action = outcome.action;
       const did = this.keyStore.did(agentId);
+      // Which decision asked for this trade, recorded rather than inferred from
+      // an id prefix: the sources are trusted for different reasons and have to
+      // be countable apart.
+      const tradeSource: TradeSource =
+        outcome.decision === 'late_start_bootstrap' ? 'bootstrap' : 'strategy';
       try {
         const built = this.buildSignedTrade(agentId, did, action, snapshot);
         if (!built.ok) {
           result.refused += 1;
           if (built.terms) {
-            this.recordTrade(agentId, built.terms, 'refused', built.reason, null, null);
+            this.recordTrade(agentId, built.terms, 'refused', built.reason, null, null, null, tradeSource);
           }
           continue;
         }
@@ -2554,6 +2593,8 @@ export class OrchestratorScheduler {
             'owner_registration_not_posted',
             signed.maker_sig,
             signed.taker_sig,
+            null,
+            tradeSource,
           );
           result.refused += 1;
           continue;
@@ -2568,6 +2609,26 @@ export class OrchestratorScheduler {
             'locked_by_wall_clock',
             signed.maker_sig,
             signed.taker_sig,
+            null,
+            tradeSource,
+          );
+          result.refused += 1;
+          continue;
+        }
+        // One bootstrap trade per agent, ever, and never a second position on
+        // top of one that already exists. The ledger answers this rather than a
+        // counter, so a restart cannot double it and the participation fallback
+        // cannot add to it.
+        if (tradeSource === 'bootstrap' && this.repositories.trades.hasEffectiveTradeForDid(did)) {
+          this.recordTrade(
+            agentId,
+            terms,
+            'refused',
+            'bootstrap_trade_already_recorded',
+            signed.maker_sig,
+            signed.taker_sig,
+            null,
+            tradeSource,
           );
           result.refused += 1;
           continue;
@@ -2582,7 +2643,16 @@ export class OrchestratorScheduler {
             ? 'not_trading_ready'
             : null;
         if (refusal !== null) {
-          this.recordTrade(agentId, terms, 'refused', refusal, signed.maker_sig, signed.taker_sig);
+          this.recordTrade(
+            agentId,
+            terms,
+            'refused',
+            refusal,
+            signed.maker_sig,
+            signed.taker_sig,
+            null,
+            tradeSource,
+          );
           result.refused += 1;
           continue;
         }
@@ -2598,6 +2668,8 @@ export class OrchestratorScheduler {
             snapshot.limitsForSweep === null ? 'limits_for_missing' : 'limits_for_mismatch',
             signed.maker_sig,
             signed.taker_sig,
+            null,
+            tradeSource,
           );
           result.refused += 1;
           continue;
@@ -2613,6 +2685,8 @@ export class OrchestratorScheduler {
             this.lateStartMisconfigured ? 'late_start_not_armed' : 'dry_run',
             signed.maker_sig,
             signed.taker_sig,
+            null,
+            tradeSource,
           );
           result.dryRun += 1;
           continue;
@@ -2628,6 +2702,8 @@ export class OrchestratorScheduler {
             'trading_not_armed',
             signed.maker_sig,
             signed.taker_sig,
+            null,
+            tradeSource,
           );
           result.refused += 1;
           continue;
@@ -2642,6 +2718,7 @@ export class OrchestratorScheduler {
             signed.maker_sig,
             signed.taker_sig,
             write.seq ?? null,
+            tradeSource,
           );
           result.posted += 1;
         } else {
@@ -2652,6 +2729,8 @@ export class OrchestratorScheduler {
             write.reason ?? 'write_failed',
             signed.maker_sig,
             signed.taker_sig,
+            null,
+            tradeSource,
           );
           result.refused += 1;
         }
@@ -2804,6 +2883,8 @@ export class OrchestratorScheduler {
     makerSig: string | null,
     takerSig: string | null,
     seq: number | null = null,
+    /** Which decision asked for this trade. Recorded, never inferred. */
+    source: TradeSource = 'strategy',
   ): void {
     const did = this.keyStore.did(agentId);
     const accepted = this.repositories.trades.insert({
@@ -2828,6 +2909,7 @@ export class OrchestratorScheduler {
       // null until the referee itself names a reason.
       local_funds_side: this.localFundsSide(terms, did),
       funds_side_confidence: 'local_inference',
+      trade_source: source,
     });
     if (!accepted) {
       this.logger.event({
@@ -3385,6 +3467,38 @@ export class OrchestratorScheduler {
     const registrationProgress = readiness.lateStart.registrationProgress;
     const participationCoverage = this.repositories.trades.participationCoverage();
     const participationExpected = Math.floor(this.keyStore.size / 2);
+    // The strategy path's own view. The mode is named from the config alone, so
+    // an operator can tell "the profiles are running" from "the bootstrap is
+    // running" without reading the unit file.
+    const tradeSourceCounts = this.repositories.trades.tradeSourceCounts();
+    const strategyGateMode: 'group' | 'late_start_bootstrap' = this.config.lateStartArmed
+      ? 'late_start_bootstrap'
+      : 'group';
+    const observations = this.reader.snapshot().history;
+    const latestObservation = observations[observations.length - 1];
+    const previousObservation = observations[observations.length - 2];
+    const lateStartSignalValue: LateStartSignal | 'insufficient' =
+      observations.length < LATE_START_OBSERVATIONS_REQUIRED ||
+      latestObservation === undefined ||
+      previousObservation === undefined
+        ? 'insufficient'
+        : lateStartSignal(latestObservation, previousObservation, this.rules.priceStep);
+    const lateStartStrategyTradingReady =
+      this.config.lateStartStrategyTradingArmed &&
+      readiness.lateStart.trading.ready &&
+      lateStartSignalValue !== 'insufficient';
+    const strategyBlockedReason: string | null =
+      strategyGateMode !== 'late_start_bootstrap'
+        ? readiness.trading.ready
+          ? null
+          : (readiness.trading.reasons[0] ?? null)
+        : !this.config.lateStartStrategyTradingArmed
+          ? 'late_start_strategy_disabled'
+          : !readiness.lateStart.trading.ready
+            ? (readiness.lateStart.trading.reasons[0] ?? null)
+            : lateStartSignalValue === 'insufficient'
+              ? 'late_start_insufficient_observations'
+              : null;
 
     return {
       at: at.toISOString(),
@@ -3445,6 +3559,13 @@ export class OrchestratorScheduler {
       participationTradesExpected: participationExpected,
       participationTradesPosted: participationCoverage.posted,
       participationAgentsCovered: participationCoverage.agentsCovered,
+      strategyGateMode,
+      lateStartStrategyTradingReady,
+      strategyBlockedReason,
+      lateStartObservationCount: observations.length,
+      lateStartSignal: lateStartSignalValue,
+      strategyTradesPosted: tradeSourceCounts.strategy,
+      bootstrapStrategyTradesPosted: tradeSourceCounts.bootstrap,
       registration: this.repositories.participation.outcomeCounts(),
       trading: {
         eligibleAgents: this.keyStore.size,
@@ -3707,6 +3828,13 @@ export class OrchestratorScheduler {
         participationTradesExpected: status.participationTradesExpected,
         participationTradesPosted: status.participationTradesPosted,
         participationAgentsCovered: status.participationAgentsCovered,
+        strategyGateMode: status.strategyGateMode,
+        lateStartStrategyTradingReady: status.lateStartStrategyTradingReady,
+        strategyBlockedReason: status.strategyBlockedReason,
+        lateStartObservationCount: status.lateStartObservationCount,
+        lateStartSignal: status.lateStartSignal,
+        strategyTradesPosted: status.strategyTradesPosted,
+        bootstrapStrategyTradesPosted: status.bootstrapStrategyTradesPosted,
         audit: status.lateStartAudit,
       },
       serverContract: reader.serverContract,
@@ -4050,6 +4178,13 @@ export class OrchestratorScheduler {
               ` regready=${status.registrationReady}/${status.registrationExpected}` +
               ` lock=${status.wallClockBeforeLock}${status.lockedByWallClock ? '(wall)' : ''}` +
               ` pt=${status.participationTradesPosted}/${status.participationTradesExpected}/${status.participationAgentsCovered}` +
+              // The strategy path, only where it is the bootstrap: in the strict
+              // mode the group profiles' numbers are already in `statuses`.
+              (status.strategyGateMode === 'late_start_bootstrap'
+                ? ` strat=${status.lateStartSignal} obs=${status.lateStartObservationCount}` +
+                  ` ready=${status.lateStartStrategyTradingReady}` +
+                  ` st=${status.strategyTradesPosted}/bs${status.bootstrapStrategyTradesPosted}`
+                : '') +
               (status.lateStartBlockedReason === null ? '' : ` blocked=${status.lateStartBlockedReason}`),
           ],
         },

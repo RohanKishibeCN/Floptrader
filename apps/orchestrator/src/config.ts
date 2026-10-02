@@ -98,6 +98,19 @@ export const EnvSchema = z.object({
    * `FLOP_ALLOW_TRADING`. Off by default.
    */
   LATE_START_ALLOW_TRADING: boolish.default(false),
+  /**
+   * A third, late-start-specific switch, for the *strategy* path.
+   *
+   * The five deterministic profiles need a reference history the seed would have
+   * given them; without it they decline on `insufficient_history`. This switch
+   * opens a small, explicitly-named bootstrap decision that reads the pinned
+   * referee's own recent, signature-verified price closes instead — nothing is
+   * replayed and no seed is invented. Off by default, and it needs its own
+   * confirmation literal as well.
+   */
+  LATE_START_ALLOW_STRATEGY_TRADING: boolish.default(false),
+  /** Must equal `close-1-strategy` for the strategy switch to take effect. */
+  LATE_START_STRATEGY_CONFIRM: z.string().default(''),
 
   // ---- close call ---------------------------------------------------------
   SEASON: z.literal('close-1').default('close-1'),
@@ -479,6 +492,16 @@ export interface Config {
    * `LATE_START_ALLOW_TRADING`. Arming the mode is never enough on its own.
    */
   lateStartTradingArmed: boolean;
+  /**
+   * May the *strategy* path write in late-start mode.
+   *
+   * Needs `lateStartTradingArmed` **and** `LATE_START_ALLOW_STRATEGY_TRADING`
+   * **and** `LATE_START_STRATEGY_CONFIRM=close-1-strategy`. When false the
+   * late-start strategy decision is still taken, and records
+   * `late_start_strategy_disabled` rather than silently falling back to the
+   * profiles that need a seed.
+   */
+  lateStartStrategyTradingArmed: boolean;
   season: 'close-1';
   tradingRoom: string;
   contestJsonPath: string;
@@ -667,6 +690,8 @@ export const DID_KEY_PATTERN = /^did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 /** The exact string `LATE_START_CONFIRM` must equal for the mode to arm. */
 export const LATE_START_CONFIRM_VALUE = 'close-1-late-start';
+/** The exact string `LATE_START_STRATEGY_CONFIRM` must equal for it to arm. */
+export const LATE_START_STRATEGY_CONFIRM_VALUE = 'close-1-strategy';
 /** Only one sweep of freshness is promised; two is the widest tolerated gap. */
 export const LATE_START_MAX_STALE_SWEEPS = 2;
 
@@ -778,6 +803,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   // trade. See LATE_START_ALLOW_TRADING.
   const lateStartTradingArmed =
     lateStartArmed && raw.FLOP_ALLOW_TRADING && raw.LATE_START_ALLOW_TRADING;
+  // Three switches and a literal: the strategy path is a separate, deliberate
+  // commitment, and it can never be reached by arming less than all of them.
+  const lateStartStrategyTradingArmed =
+    lateStartTradingArmed &&
+    raw.LATE_START_ALLOW_STRATEGY_TRADING &&
+    raw.LATE_START_STRATEGY_CONFIRM === LATE_START_STRATEGY_CONFIRM_VALUE;
 
   const expectedRefereeDid = raw.EXPECTED_REFEREE_DID.trim();
   if (expectedRefereeDid.length > 0 && !DID_KEY_PATTERN.test(expectedRefereeDid)) {
@@ -897,6 +928,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     lateStartArmed,
     lateStartBlockedReason,
     lateStartTradingArmed,
+    lateStartStrategyTradingArmed,
     season: raw.SEASON,
     tradingRoom: raw.TRADING_ROOM,
     contestJsonPath: raw.CONTEST_JSON_PATH,

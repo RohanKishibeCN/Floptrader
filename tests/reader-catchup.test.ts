@@ -22,6 +22,7 @@ import { referenceRules } from '@flop/close-call';
 import {
   closeDatabase,
   createRepositories,
+  expectedSchemaVersion,
   openDatabase,
   type Repositories,
   type SqliteDatabase,
@@ -320,7 +321,7 @@ describe('close1 catch-up, in a whole runtime', () => {
     // Second process over the same files: the resolution is durable, so a restart
     // cannot turn a caught-up room back into an unresolved one.
     const reopened = openDatabase({ path: cursorPath() });
-    expect(reopened.pragma('user_version', { simple: true })).toBe(8);
+    expect(reopened.pragma('user_version', { simple: true })).toBe(expectedSchemaVersion());
     const store = new SqliteCursorStore({ db: reopened, repositories: createRepositories(reopened) });
     const row = store.load('close1');
     expect(row.gapCount).toBe(1);

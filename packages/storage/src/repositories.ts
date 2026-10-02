@@ -1143,6 +1143,17 @@ export interface SweepStateRow {
   updated_at: string;
 }
 
+/**
+ * Which decision wrote a trade.
+ *
+ * `strategy` is the five group profiles; `bootstrap` is the late-start
+ * bootstrap decision; `participation` is the fallback that gives every owner at
+ * least one ruled trade. They are separate because they are trusted for
+ * different reasons, and because "how many trades did the strategy write" is a
+ * question the id prefix could only ever answer by convention.
+ */
+export type TradeSource = 'strategy' | 'participation' | 'bootstrap';
+
 export interface TradeRow {
   id: string;
   season: string;
@@ -1177,6 +1188,8 @@ export interface TradeRow {
   local_funds_side?: string | null;
   /** `official` when the values came from the referee; `local_inference` otherwise. */
   funds_side_confidence?: string | null;
+  /** The path that wrote this row. Null only for rows older than the column. */
+  trade_source?: TradeSource | null;
   created_at?: string;
   updated_at?: string;
 }
@@ -1193,11 +1206,11 @@ export class TradeRepository {
            id, season, maker_did, taker_did, side, qty, px, until_sweep, maker_sig, taker_sig,
            status, reason, room, seq, agent_id, counter_agent_id, settle_sweep, posted_sweep,
            referee_reason, referee_funds_side, local_funds_side, funds_side_confidence,
-           created_at, updated_at)
+           trade_source, created_at, updated_at)
          VALUES (@id, @season, @maker_did, @taker_did, @side, @qty, @px, @until_sweep,
            @maker_sig, @taker_sig, @status, @reason, @room, @seq, @agent_id, @counter_agent_id,
            @settle_sweep, @posted_sweep, @referee_reason, @referee_funds_side, @local_funds_side,
-           @funds_side_confidence, @created_at, @updated_at)`,
+           @funds_side_confidence, @trade_source, @created_at, @updated_at)`,
       )
       .run({
         ...row,
@@ -1214,6 +1227,10 @@ export class TradeRepository {
         referee_funds_side: row.referee_funds_side ?? null,
         local_funds_side: row.local_funds_side ?? null,
         funds_side_confidence: row.funds_side_confidence ?? null,
+        // Rows written before the column existed are backfilled by the migration;
+        // a caller that omits it here is a strategy trade, which is the default
+        // the old schema implied for everything that was not the fallback.
+        trade_source: row.trade_source ?? 'strategy',
         created_at: row.created_at ?? at,
         updated_at: at,
       });
@@ -1454,15 +1471,40 @@ export class TradeRepository {
     const rows = this.db
       .prepare(
         `SELECT maker_did, taker_did FROM trades
-          WHERE id LIKE 'pl%' AND status IN ('pending','settled','void','missed')`,
+          WHERE trade_source = 'participation' AND status IN ('pending','settled','void','missed')`,
       )
       .all() as Array<{ maker_did: string; taker_did: string }>;
     const agents = new Set<string>();
     for (const row of rows) {
       agents.add(row.maker_did);
-      agents.add(row.taker_did);
+      if (row.taker_did !== null) agents.add(row.taker_did);
     }
     return { posted: rows.length, agentsCovered: agents.size };
+  }
+
+  /**
+   * Effective trades per writing path.
+   *
+   * Only rows that reached the book or were ruled on count — a `refused` or
+   * `dry_run` row was never a trade. The three are reported beside each other and
+   * never summed: "75 trades" means one thing when they are the presence
+   * fallback and another when they came from a decision.
+   */
+  tradeSourceCounts(): Record<TradeSource, number> {
+    const rows = this.db
+      .prepare(
+        `SELECT trade_source AS source, COUNT(*) AS n FROM trades
+          WHERE status IN ('pending','settled','void')
+          GROUP BY trade_source`,
+      )
+      .all() as Array<{ source: string | null; n: number }>;
+    const counts: Record<TradeSource, number> = { strategy: 0, participation: 0, bootstrap: 0 };
+    for (const row of rows) {
+      if (row.source === 'strategy' || row.source === 'participation' || row.source === 'bootstrap') {
+        counts[row.source] = row.n;
+      }
+    }
+    return counts;
   }
 
   /**

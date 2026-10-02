@@ -444,11 +444,28 @@ the seed.
 | `LATE_START_MODE` | `false` | Ask for the seedless participation mode |
 | `LATE_START_CONFIRM` | *(empty)* | Must be exactly `close-1-late-start` |
 | `LATE_START_ALLOW_TRADING` | `false` | Second switch, on top of `FLOP_ALLOW_TRADING` |
+| `LATE_START_ALLOW_STRATEGY_TRADING` | `false` | Third switch: the bootstrap strategy decision |
+| `LATE_START_STRATEGY_CONFIRM` | *(empty)* | Must be exactly `close-1-strategy` |
 
 A half-configured late start is **not** a startup error: it keeps running as a
 dry run, writes nothing at all, and `/status.lateStartBlockedReason` names the
 missing switch. `FLOP_MODE=live` alone never arms it, and trading needs *both*
 trading switches — arming the mode must never be enough to write a trade.
+
+The five deterministic profiles all need a reference *history*, and in a late
+start the seed that would have supplied it is unreadable, so they decline on
+`insufficient_history` forever. The **bootstrap strategy** is the smallest
+honest alternative, and a third, separate switch: when armed it reads the
+closes the pinned referee has actually published and takes the direction of the
+last one (`rising` → a bounded BUY, `falling` → a bounded SELL, anything within
+one `price_step` → no trade). It requires at least two accepted closes, prices
+and sizes from the referee's own band (`until` is the band's `for`, size is
+`rules.min_qty`), and every owner takes at most one. It invents no seed and
+never claims a replay; `external_offer_taker` is excluded because its input is
+a stranger's offer, not a price. `/status` reports
+`lateStartStrategyTradingReady`, `lateStartObservationCount`, `lateStartSignal`,
+`strategyTradesPosted` and `bootstrapStrategyTradesPosted`, and each trade is
+labelled in `trades.trade_source` rather than inferred from its id.
 
 ### Staged rollout
 
@@ -464,6 +481,10 @@ FLOP_ALLOW_REGISTRATION=true FLOP_ALLOW_TRADING=false
 
 # 3. trade
 LATE_START_ALLOW_TRADING=true FLOP_ALLOW_TRADING=true
+
+# 4. strategy — only after 3, and only while watching the counters
+LATE_START_ALLOW_STRATEGY_TRADING=true \
+LATE_START_STRATEGY_CONFIRM=close-1-strategy
 ```
 
 Each step is a separate restart. The process never moves between them on its

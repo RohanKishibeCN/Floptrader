@@ -26,6 +26,7 @@ import type { MarketSnapshot, RiskCaps, Rules } from '@flop/close-call';
 import { Decimal } from '@flop/close-call';
 import type { Repositories } from '@flop/storage';
 import { gateDecision } from './deterministic-gate.js';
+import { LATE_START_BOOTSTRAP_VERSION, lateStartBootstrapProposal } from './late-start-bootstrap.js';
 import { profileFor } from './profiles.js';
 import {
   ExternalOffer,
@@ -53,6 +54,15 @@ export interface AgentRunInput {
   sameDirectionStreak: number;
   externalOffers: ExternalOffer[];
   sweep: number;
+  /**
+   * Take the late-start bootstrap decision instead of the group profile.
+   *
+   * Present only while the process is in late-start mode, and never for
+   * `external_offer_taker`: that group's whole purpose is taking a stranger's
+   * offer from a book this process has no history for, and a bootstrap price
+   * signal is not an offer. Absent means the ordinary five profiles.
+   */
+  lateStartBootstrap?: { enabled: boolean };
 }
 
 export interface RunOutcome {
@@ -61,6 +71,8 @@ export interface RunOutcome {
   runAt: string;
   rollingWindowStart: string;
   source: RunSource;
+  /** Which decision produced the proposal, so the trade can be labelled. */
+  decision: 'group' | 'late_start_bootstrap';
   proposal: StrategyProposal;
   action: GatedAction;
   runId: number;
@@ -148,7 +160,19 @@ export class GroupRunner {
       externalOffers: input.externalOffers,
     };
 
-    const proposal = profileFor(input.group).evaluate(context);
+    // A late start takes the bootstrap decision in place of the profile, and
+    // says so: the profile would decline on `insufficient_history` forever, and
+    // recording that as the reason would hide the fact that the operator's
+    // strategy switch is what is holding the trade.
+    const bootstrap = input.lateStartBootstrap;
+    const decision: RunOutcome['decision'] =
+      bootstrap !== undefined ? 'late_start_bootstrap' : 'group';
+    const proposal =
+      bootstrap === undefined
+        ? profileFor(input.group).evaluate(context)
+        : lateStartBootstrapProposal(context, { enabled: bootstrap.enabled, rules: this.rules });
+    const strategyVersion =
+      bootstrap === undefined ? profileFor(input.group).version : LATE_START_BOOTSTRAP_VERSION;
     const action = gateDecision({ proposal, context, rules: this.rules });
 
     // A run is one logical event across three tables. If the process dies
@@ -161,7 +185,7 @@ export class GroupRunner {
         run_at: runAt,
         rolling_window_start: windowStart,
         strategy_group: input.group,
-        strategy_version: profileFor(input.group).version,
+        strategy_version: strategyVersion,
         action: action.intent,
         confidence: action.confidence.toString(),
         reason: action.gate === 'ok' ? action.reason : `${action.reason}:${action.gate}`,
@@ -174,7 +198,7 @@ export class GroupRunner {
         confidence: action.confidence.toString(),
         reason: action.reason,
         strategy_group: input.group,
-        strategy_version: profileFor(input.group).version,
+        strategy_version: strategyVersion,
         sweep: input.sweep,
         reference_px: input.market.reference?.toString() ?? null,
         detail: JSON.stringify({
@@ -196,6 +220,7 @@ export class GroupRunner {
       runAt,
       rollingWindowStart: windowStart,
       source,
+      decision,
       proposal,
       action,
       runId,

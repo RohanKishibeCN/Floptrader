@@ -26,14 +26,33 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  DEFAULT_RISK_CAPS,
   Decimal,
+  emptySnapshot,
   parseTradeMessage,
+  referenceRules,
   verifyMakerSignature,
   verifyTakerSignature,
   withinPublishedLimits,
+  type MarketSnapshot,
 } from '@flop/close-call';
-import { verifyRoomSignatureForRoom } from '@flop/identity';
-import { LATE_START_CONFIRM_VALUE, loadConfig, type Config } from '../apps/orchestrator/src/config.js';
+import { didFromSeed, verifyRoomSignatureForRoom } from '@flop/identity';
+import {
+  LATE_START_BOOTSTRAP_VERSION,
+  LATE_START_OBSERVATIONS_REQUIRED,
+  asDecimals,
+  fallbackParams,
+  gateDecision,
+  lateStartBootstrapProposal,
+  lateStartSignal,
+  type StrategyContext,
+} from '@flop/strategy';
+import {
+  LATE_START_CONFIRM_VALUE,
+  LATE_START_STRATEGY_CONFIRM_VALUE,
+  loadConfig,
+  type Config,
+} from '../apps/orchestrator/src/config.js';
 import { loadRules } from '../apps/orchestrator/src/main.js';
 import {
   WALL_CLOCK_INVALID_REASON,
@@ -285,6 +304,7 @@ describe('the current market snapshot', () => {
 async function buildLateStart(options: {
   agentCount?: number;
   trading?: boolean;
+  strategy?: boolean;
   live?: boolean;
   startReader?: boolean;
   env?: Record<string, string>;
@@ -302,6 +322,11 @@ async function buildLateStart(options: {
       LATE_START_CONFIRM: LATE_START_CONFIRM_VALUE,
       FLOP_ALLOW_TRADING: options.trading === true ? 'true' : 'false',
       LATE_START_ALLOW_TRADING: options.trading === true ? 'true' : 'false',
+      // The bootstrap strategy is a third, separate switch. Left off it changes
+      // nothing: the profiles and the fallback behave exactly as before.
+      LATE_START_ALLOW_STRATEGY_TRADING: options.strategy === true ? 'true' : 'false',
+      LATE_START_STRATEGY_CONFIRM:
+        options.strategy === true ? LATE_START_STRATEGY_CONFIRM_VALUE : '',
       // The per-minute write gate is production pacing. A test that posts 150
       // registrations plus 75 trades must not spend the whole window waiting.
       WRITE_RATE_PER_MINUTE: '100000',
@@ -919,7 +944,11 @@ describe('a trade may not precede its owner registration', () => {
   }
 
   it('refuses a strategy trade while the owner has no posted registration', async () => {
-    harness = await buildLateStart({ trading: true, env: { AGENTS_PER_TICK: '30' } });
+    harness = await buildLateStart({
+      trading: true,
+      strategy: true,
+      env: { AGENTS_PER_TICK: '30' },
+    });
     const h = harness;
     await waitForFirstPass(h);
     refuseEveryPost(h);
@@ -1341,4 +1370,490 @@ describe('an omitted mint list is uncertainty, never confirmation', () => {
     expect(omitted.length).toBeGreaterThan(0);
     expect(omitted.some((row) => (row.raw_payload ?? '').includes('150'))).toBe(true);
   }, 240_000);
+});
+
+// ---------------------------------------------------------------------------
+// The bootstrap decision, read on its own
+// ---------------------------------------------------------------------------
+
+const BOOTSTRAP_RULES = referenceRules();
+
+/** A market the current price post *can* price a trade from. */
+function bootstrapMarket(
+  overrides: Partial<MarketSnapshot> = {},
+): MarketSnapshot {
+  return {
+    ...emptySnapshot(),
+    sweep: 1758,
+    close: Decimal.from('229.80'),
+    reference: Decimal.from('229.80'),
+    limits: { low: Decimal.from('218.31'), high: Decimal.from('241.29') },
+    nextLimits: { low: Decimal.from('218.31'), high: Decimal.from('241.29') },
+    limitsForSweep: 1759,
+    limitsUsable: true,
+    // Two accepted closes, the fewest a direction exists from.
+    history: [Decimal.from('229.40'), Decimal.from('229.80')],
+    degraded: false,
+    degradedReason: null,
+    refereeDid: HARNESS_REFEREE_DID,
+    ...overrides,
+  };
+}
+
+function bootstrapContext(overrides: Partial<StrategyContext> = {}): StrategyContext {
+  return {
+    agentId: 'agent-0001',
+    group: 'trend_following',
+    sweep: 1758,
+    market: bootstrapMarket(),
+    caps: DEFAULT_RISK_CAPS.trend_following!,
+    params: asDecimals(fallbackParams('trend_following').values),
+    position: Decimal.zero(),
+    cash: BOOTSTRAP_RULES.mint,
+    openNotional: Decimal.zero(),
+    lastTradeSweep: null,
+    randomSeed: 1,
+    sameDirectionStreak: 0,
+    externalOffers: [],
+    ...overrides,
+  };
+}
+
+const BOOTSTRAP_ARMED = { enabled: true, rules: BOOTSTRAP_RULES } as const;
+const BOOTSTRAP_OFF = { enabled: false, rules: BOOTSTRAP_RULES } as const;
+
+describe('the late-start bootstrap decision', () => {
+  it('declines while its own switch is off, and says so rather than staying silent', () => {
+    const context = bootstrapContext();
+    const proposal = lateStartBootstrapProposal(context, BOOTSTRAP_OFF);
+    expect(proposal.intent).toBe('NO_TRADE');
+    expect(proposal.reason).toBe('late_start_strategy_disabled');
+  });
+
+  it('needs two accepted closes before it will read a direction', () => {
+    const context = bootstrapContext({
+      market: bootstrapMarket({ history: [Decimal.from('229.80')] }),
+    });
+    const proposal = lateStartBootstrapProposal(context, BOOTSTRAP_ARMED);
+    expect(proposal.intent).toBe('NO_TRADE');
+    expect(proposal.reason).toBe('late_start_insufficient_observations');
+    expect(LATE_START_OBSERVATIONS_REQUIRED).toBe(2);
+  });
+
+  it('reads a move no larger than one price step as flat, not as a trend', () => {
+    const step = BOOTSTRAP_RULES.priceStep;
+    expect(lateStartSignal(Decimal.from('229.81'), Decimal.from('229.80'), step)).toBe('flat');
+    expect(lateStartSignal(Decimal.from('229.80'), Decimal.from('229.80'), step)).toBe('flat');
+    // One cent more and it is a real move; the threshold is the market's own.
+    expect(lateStartSignal(Decimal.from('229.82'), Decimal.from('229.80'), step)).toBe('rising');
+    expect(lateStartSignal(Decimal.from('229.78'), Decimal.from('229.80'), step)).toBe('falling');
+  });
+
+  it('declines on a flat market with its own reason', () => {
+    const context = bootstrapContext({
+      market: bootstrapMarket({
+        history: [Decimal.from('229.80'), Decimal.from('229.80')],
+      }),
+    });
+    const proposal = lateStartBootstrapProposal(context, BOOTSTRAP_ARMED);
+    expect(proposal.intent).toBe('NO_TRADE');
+    expect(proposal.reason).toBe('late_start_flat');
+  });
+
+  it('buys the smallest allowed size when the latest close is above the last', () => {
+    const context = bootstrapContext();
+    const action = gateDecision({
+      proposal: lateStartBootstrapProposal(context, BOOTSTRAP_ARMED),
+      context,
+      rules: BOOTSTRAP_RULES,
+    });
+    expect(action.gate).toBe('ok');
+    expect(action.intent).toBe('MAKE_OFFER');
+    expect(action.side).toBe('buy');
+    expect(action.reason).toBe('late_start_price_rising');
+    // The rules' own minimum, never a position.
+    expect(action.qty!.eq(BOOTSTRAP_RULES.minQty)).toBe(true);
+    expect(action.qty!.gte(BOOTSTRAP_RULES.minQty)).toBe(true);
+    // Priced inside the band the referee published for this very sweep.
+    expect(withinPublishedLimits(action.px!, context.market.limits!)).toBe(true);
+  });
+
+  it('sells the smallest allowed size when the latest close is below the last', () => {
+    const context = bootstrapContext({
+      market: bootstrapMarket({
+        history: [Decimal.from('229.80'), Decimal.from('229.40')],
+      }),
+    });
+    const action = gateDecision({
+      proposal: lateStartBootstrapProposal(context, BOOTSTRAP_ARMED),
+      context,
+      rules: BOOTSTRAP_RULES,
+    });
+    expect(action.gate).toBe('ok');
+    expect(action.side).toBe('sell');
+    expect(action.reason).toBe('late_start_price_falling');
+    expect(action.qty!.gte(BOOTSTRAP_RULES.minQty)).toBe(true);
+  });
+
+  it('declines whenever the current post cannot price a trade, naming that', () => {
+    const unusable: Array<Partial<MarketSnapshot>> = [
+      { locked: true },
+      { degraded: true, degradedReason: 'reference_jump' },
+      { staleReference: true },
+      { reference: null },
+      { limits: null },
+      { limitsUsable: false },
+      { limitsForSweep: null },
+      { limitsForSweep: 1760 },
+    ];
+    for (const override of unusable) {
+      const context = bootstrapContext({ market: bootstrapMarket(override) });
+      const proposal = lateStartBootstrapProposal(context, BOOTSTRAP_ARMED);
+      expect(proposal.intent).toBe('NO_TRADE');
+      expect(proposal.reason).toBe('late_start_market_unusable');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The bootstrap strategy at the write path
+// ---------------------------------------------------------------------------
+
+/** A price series whose final step rises, i.e. a bootstrap BUY. */
+async function primeRising(h: Harness): Promise<void> {
+  const series: Array<[number, string]> = [
+    [1753, '228.20'],
+    [1754, '228.60'],
+    [1755, '229.00'],
+    [1756, '229.40'],
+    [1757, '229.60'],
+    [1758, '232.00'],
+  ];
+  for (const [sweep, px] of series) {
+    const centre = Number.parseFloat(px);
+    h.referee.price(sweep, px, [(centre * 0.95).toFixed(2), (centre * 1.05).toFixed(2)], sweep + 1);
+  }
+  await waitFor(
+    () => h.runtime.reader.verifier.state.currentSweep === 1758,
+    'the rising price series to be verified',
+  );
+}
+
+/** The same shape, ending lower: a bootstrap SELL. */
+async function primeFalling(h: Harness): Promise<void> {
+  const series: Array<[number, string]> = [
+    [1753, '227.60'],
+    [1754, '228.00'],
+    [1755, '228.40'],
+    [1756, '228.80'],
+    [1757, '229.20'],
+    [1758, '226.40'],
+  ];
+  for (const [sweep, px] of series) {
+    const centre = Number.parseFloat(px);
+    h.referee.price(sweep, px, [(centre * 0.95).toFixed(2), (centre * 1.05).toFixed(2)], sweep + 1);
+  }
+  await waitFor(
+    () => h.runtime.reader.verifier.state.currentSweep === 1758,
+    'the falling price series to be verified',
+  );
+}
+
+/** Wait until the room has echoed all 150 owner registrations. */
+async function waitForRegistrations(h: Harness): Promise<void> {
+  await waitFor(
+    () => h.runtime.repositories.messages.byKind('close1', 'owner').length >= 150,
+    'the room to echo all 150 registrations',
+  );
+}
+
+/** Every trade row written by one source, whatever its status. */
+function rowsFrom(h: Harness, source: string) {
+  return h.runtime.repositories.trades.all().filter((row) => row.trade_source === source);
+}
+
+/** The rows from one source that actually count as a trade. */
+function effectiveFrom(h: Harness, source: string) {
+  return rowsFrom(h, source).filter(
+    (row) => row.status === 'pending' || row.status === 'settled' || row.status === 'void',
+  );
+}
+
+/** Every reason recorded in `agent_runs`, so "why no trade" is answerable. */
+function runReasons(h: Harness): string[] {
+  return (
+    h.runtime.db.prepare('SELECT reason FROM agent_runs').all() as Array<{ reason: string }>
+  ).map((row) => row.reason);
+}
+
+/**
+ * The distinct owners named by any effective trade, whichever path wrote it.
+ *
+ * The late-start promise is 150/150 coverage; with the strategy switch on, some
+ * of those owners are covered by a bootstrap trade and the rest by the fallback,
+ * so the two sources have to be counted together.
+ */
+function coveredAgents(h: Harness): Set<string> {
+  const covered = new Set<string>();
+  for (const row of h.runtime.repositories.trades.all()) {
+    if (row.status !== 'pending' && row.status !== 'settled' && row.status !== 'void') continue;
+    covered.add(row.maker_did);
+    if (row.taker_did !== null) covered.add(row.taker_did);
+  }
+  return covered;
+}
+
+describe('the bootstrap strategy at the write path', () => {
+  let harness: Harness | null = null;
+
+  afterEach(async () => {
+    if (harness) await harness.dispose();
+    harness = null;
+  });
+
+  it('writes nothing while its switch is off, and leaves the fallback whole', async () => {
+    harness = await buildLateStart({ trading: true });
+    const h = harness;
+    await waitForFirstPass(h);
+    await primeRising(h);
+    await h.runtime.scheduler.runTick();
+    await waitForRegistrations(h);
+    await h.runtime.scheduler.runTick();
+
+    // The market was priceable and the signal rising: only the switch held it.
+    expect(rowsFrom(h, 'bootstrap')).toHaveLength(0);
+    const status = h.runtime.scheduler.status();
+    expect(status.strategyGateMode).toBe('late_start_bootstrap');
+    expect(status.lateStartStrategyTradingReady).toBe(false);
+    expect(status.strategyBlockedReason).toBe('late_start_strategy_disabled');
+    expect(status.lateStartSignal).toBe('rising');
+    expect(status.bootstrapStrategyTradesPosted).toBe(0);
+    expect(status.strategyTradesPosted).toBe(0);
+    expect(status.participationTradesPosted).toBe(75);
+    expect(status.participationAgentsCovered).toBe(150);
+  }, 240_000);
+
+  it('posts a rising close as one bounded BUY per agent, never a position', async () => {
+    harness = await buildLateStart({ trading: true, strategy: true });
+    const h = harness;
+    await waitForFirstPass(h);
+    await primeRising(h);
+    await h.runtime.scheduler.runTick();
+    await waitForRegistrations(h);
+    await h.runtime.scheduler.runTick();
+
+    const bootstrap = effectiveFrom(h, 'bootstrap');
+    expect(bootstrap.length).toBeGreaterThan(0);
+    // One per maker, ever: no second position for the same agent.
+    expect(new Set(bootstrap.map((row) => row.maker_did)).size).toBe(bootstrap.length);
+
+    const groupByDid = new Map(
+      h.runtime.repositories.identities.all().map((row) => [row.did, row.strategy_group]),
+    );
+    for (const row of bootstrap) {
+      expect(row.status).toBe('pending');
+      expect(row.side).toBe('buy');
+      // The rules' own minimum, not a sized position.
+      expect(row.qty).toBe('0.1');
+      // `until` is the band's own `for`, never a local horizon.
+      expect(row.until_sweep).toBe(1759);
+      // The external-offer group never takes the bootstrap decision.
+      expect(groupByDid.get(row.maker_did)).not.toBe('external_offer_taker');
+    }
+
+    const status = h.runtime.scheduler.status();
+    expect(status.bootstrapStrategyTradesPosted).toBe(bootstrap.length);
+    expect(status.strategyTradesPosted).toBe(0);
+    // The fallback still owes every remaining owner one trade: the two sources
+    // together cover the whole fleet, once each.
+    expect(coveredAgents(h).size).toBe(150);
+    // No owner carries two effective trades: no bootstrap position on top of a
+    // participation trade, and none the other way round.
+    const appearances = new Map<string, number>();
+    for (const row of h.runtime.repositories.trades.all()) {
+      if (row.status !== 'pending' && row.status !== 'settled' && row.status !== 'void') continue;
+      // An open bootstrap offer names its own maker on both sides.
+      const dids = new Set<string>([row.maker_did]);
+      if (row.taker_did !== null) dids.add(row.taker_did);
+      for (const did of dids) appearances.set(did, (appearances.get(did) ?? 0) + 1);
+    }
+    expect([...appearances.values()].every((count) => count === 1)).toBe(true);
+    // The run is labelled as the bootstrap decision, not as a group profile:
+    // "which decision asked for this trade" is answerable from the record.
+    const versions = (
+      h.runtime.db.prepare('SELECT DISTINCT strategy_version AS v FROM agent_runs').all() as Array<{
+        v: string;
+      }>
+    ).map((row) => row.v);
+    expect(versions).toContain(LATE_START_BOOTSTRAP_VERSION);
+  }, 240_000);
+
+  it('posts a falling close as a bounded SELL', async () => {
+    harness = await buildLateStart({ trading: true, strategy: true });
+    const h = harness;
+    await waitForFirstPass(h);
+    await primeFalling(h);
+    await h.runtime.scheduler.runTick();
+    await waitForRegistrations(h);
+    await h.runtime.scheduler.runTick();
+
+    const bootstrap = effectiveFrom(h, 'bootstrap');
+    expect(bootstrap.length).toBeGreaterThan(0);
+    for (const row of bootstrap) {
+      expect(row.side).toBe('sell');
+      expect(row.qty).toBe('0.1');
+      expect(row.until_sweep).toBe(1759);
+    }
+  }, 240_000);
+
+  it('declines with late_start_insufficient_observations until a second close exists', async () => {
+    harness = await buildLateStart({ trading: true, strategy: true });
+    const h = harness;
+    await waitForFirstPass(h);
+    // Exactly one accepted close: no direction exists yet.
+    await primeAt(h, 1758, '229.80');
+    await h.runtime.scheduler.runTick();
+    await waitForRegistrations(h);
+    await h.runtime.scheduler.runTick();
+
+    expect(rowsFrom(h, 'bootstrap')).toHaveLength(0);
+    expect(runReasons(h)).toContain('late_start_insufficient_observations:no_trade');
+    const status = h.runtime.scheduler.status();
+    expect(status.lateStartObservationCount).toBe(1);
+    expect(status.lateStartSignal).toBe('insufficient');
+    // The strategy's own shortfall does not touch the participation fallback.
+    expect(status.participationTradesPosted).toBe(75);
+    expect(status.participationAgentsCovered).toBe(150);
+  }, 240_000);
+
+  it('declines a flat market with late_start_flat', async () => {
+    harness = await buildLateStart({ trading: true, strategy: true });
+    const h = harness;
+    await waitForFirstPass(h);
+    await primeAt(h, 1757, '229.80');
+    await primeAt(h, 1758, '229.80');
+    await h.runtime.scheduler.runTick();
+    await waitForRegistrations(h);
+    await h.runtime.scheduler.runTick();
+
+    expect(rowsFrom(h, 'bootstrap')).toHaveLength(0);
+    expect(runReasons(h)).toContain('late_start_flat:no_trade');
+    expect(h.runtime.scheduler.status().lateStartSignal).toBe('flat');
+  }, 240_000);
+
+  it('declines when the band does not label the next sweep', async () => {
+    harness = await buildLateStart({ trading: true, strategy: true });
+    const h = harness;
+    await waitForFirstPass(h);
+    h.referee.price(1757, '229.40', ['217.93', '240.87'], 1758);
+    // Rising closes, but the band names 1760 rather than 1759: unusable.
+    h.referee.price(1758, '229.80', ['218.31', '241.29'], 1760);
+    await waitFor(
+      () => h.runtime.reader.verifier.state.currentSweep === 1758,
+      'the mislabelled price post',
+    );
+    await h.runtime.scheduler.runTick();
+    await waitForRegistrations(h);
+    await h.runtime.scheduler.runTick();
+
+    expect(rowsFrom(h, 'bootstrap')).toHaveLength(0);
+    expect(runReasons(h)).toContain('late_start_market_unusable:no_trade');
+    expect(h.runtime.scheduler.status().strategyBlockedReason).not.toBeNull();
+  }, 240_000);
+
+  it('never turns a post from another DID into an observation or a trade', async () => {
+    harness = await buildLateStart({ trading: true, strategy: true, startReader: false });
+    const h = harness;
+    const foreignSeed = new Uint8Array(32).fill(99);
+    const foreignDid = didFromSeed(foreignSeed);
+    for (const sweep of [1757, 1758]) {
+      h.transport.room('d-close1-price').appendFrom(
+        JSON.stringify({
+          t: 'price',
+          season: 'close-1',
+          n: sweep,
+          ref: { px: '229.80', time: '2026-09-28T12:00:00Z', tid: `t${sweep}` },
+          limits: ['218.31', '241.29'],
+          for: sweep + 1,
+        }),
+        { seed: foreignSeed, did: foreignDid, nonce: sweep },
+      );
+    }
+    await h.runtime.reader.tick();
+    await h.runtime.reader.tick();
+
+    // The pinned referee never posted, so nothing was accepted.
+    expect(h.runtime.reader.verifier.state.currentSweep).toBeNull();
+    expect(h.runtime.reader.snapshot().history).toHaveLength(0);
+    const status = h.runtime.scheduler.status();
+    expect(status.lateStartObservationCount).toBe(0);
+    expect(status.lateStartSignal).toBe('insufficient');
+
+    await h.runtime.scheduler.runTick();
+    expect(rowsFrom(h, 'bootstrap')).toHaveLength(0);
+  }, 180_000);
+});
+
+describe('a bootstrap trade survives a restart without doubling', () => {
+  let first: Harness | undefined;
+  let second: Harness | undefined;
+
+  afterEach(async () => {
+    if (second) await second.dispose();
+    second = undefined;
+    try {
+      await first?.runtime.db.close();
+    } catch {
+      /* already closed */
+    }
+    first = undefined;
+  });
+
+  it('keeps one bootstrap trade per agent and re-issues none', async () => {
+    const dir = tempDir('flop-late-bootstrap-kill-');
+    const transport = new FakeTransport({ readDelayMs: 5 });
+    const env = {
+      ...LIVE_PINS,
+      FLOP_ALLOW_REGISTRATION: 'true',
+      LATE_START_MODE: 'true',
+      LATE_START_CONFIRM: LATE_START_CONFIRM_VALUE,
+      FLOP_ALLOW_TRADING: 'true',
+      LATE_START_ALLOW_TRADING: 'true',
+      LATE_START_ALLOW_STRATEGY_TRADING: 'true',
+      LATE_START_STRATEGY_CONFIRM: LATE_START_STRATEGY_CONFIRM_VALUE,
+      WRITE_RATE_PER_MINUTE: '100000',
+    };
+    for (const room of HARNESS_ROOMS) transport.room(room);
+
+    first = await buildHarness({ agentCount: 150, dir, transport, now: () => new Date(CLOCK), env });
+    first.runtime.reader.startContinuous();
+    await waitForFirstPass(first);
+    await primeRising(first);
+    await first.runtime.scheduler.runTick();
+    await waitForRegistrations(first);
+    await first.runtime.scheduler.runTick();
+
+    const before = effectiveFrom(first, 'bootstrap');
+    expect(before.length).toBeGreaterThan(0);
+    const idsBefore = new Set(before.map((row) => row.id));
+    const participationBefore = first.runtime.repositories.trades.participationCoverage().posted;
+
+    // SIGKILL: the reader loops stop and the process is gone.
+    await first.runtime.reader.stopContinuous();
+
+    second = await buildHarness({ agentCount: 150, dir, transport, now: () => new Date(CLOCK), env });
+    second.runtime.reader.startContinuous();
+    await waitForFirstPass(second);
+    await second.runtime.scheduler.runTick();
+    await second.runtime.scheduler.runTick();
+
+    // The same effective trades, and not one more, however ready the market is.
+    const after = effectiveFrom(second, 'bootstrap');
+    expect(new Set(after.map((row) => row.id))).toEqual(idsBefore);
+    // The participation fallback is neither re-issued nor overwritten.
+    expect(second.runtime.repositories.trades.participationCoverage().posted).toBe(
+      participationBefore,
+    );
+    expect(second.runtime.scheduler.status().bootstrapStrategyTradesPosted).toBe(before.length);
+  }, 300_000);
 });

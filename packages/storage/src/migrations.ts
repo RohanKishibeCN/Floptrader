@@ -579,6 +579,28 @@ export const MIGRATIONS: Migration[] = [
       `ALTER TABLE participation_records ADD COLUMN state_evidence_at TEXT`,
     ],
   },
+  {
+    version: 9,
+    name: 'trade-source',
+    statements: [
+      // Which decision wrote a trade: the five group profiles, the late-start
+      // bootstrap decision, or the participation fallback.
+      //
+      // The old schema had no such column, and the only signal was the `pl`
+      // prefix the fallback happened to use. A prefix is a convention, not a
+      // fact, and it cannot name a third source — so the source is now a column,
+      // written by whichever path inserted the row.
+      `ALTER TABLE trades ADD COLUMN trade_source TEXT`,
+      // One-time backfill for rows written before the column existed. `pl%` is
+      // the *only* thing the old schema recorded, so it is what the legacy rows
+      // are reconstructed from; every row written from here on carries the
+      // column and never needs the prefix again.
+      `UPDATE trades
+          SET trade_source = CASE WHEN id LIKE 'pl%' THEN 'participation' ELSE 'strategy' END
+        WHERE trade_source IS NULL`,
+      `CREATE INDEX IF NOT EXISTS idx_trades_source ON trades(trade_source, status)`,
+    ],
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1]!.version;
