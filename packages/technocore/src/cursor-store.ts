@@ -308,38 +308,75 @@ export class SqliteCursorStore implements CursorStore {
 export interface CursorHealth {
   healthy: boolean;
   reasons: string[];
+  /**
+   * The total size of the gaps still *open*.
+   *
+   * A gap that has been closed by a contiguous read contributes nothing here any
+   * more — but it is still recorded, per room, in `roomsWithHistoricalGaps` and
+   * in the room's own `gapCount`, so the audit never loses it.
+   */
   totalGap: number;
+  /**
+   * Rooms whose latest gap is still open: no contiguous read has resumed past
+   * it. This is the "are we still losing messages *now*" set, and it is the only
+   * gap set that holds risk back.
+   */
+  roomsWithActiveUnresolvedGaps: string[];
+  /**
+   * Rooms a gap happened in and was later closed. Permanent and never cleared:
+   * the loss is a fact about how the process started, not a licence to forget.
+   */
+  roomsWithHistoricalGaps: string[];
+  /** Every room that ever carried a gap, open or closed. The permanent record. */
   roomsWithGaps: string[];
   roomsReset: string[];
   maxConsecutiveErrors: number;
 }
 
 /**
- * The reader's go/no-go. Any gap, any reset, or any room that has failed too many
- * times in a row puts the process into conservative mode: it keeps reading, keeps
- * its state, and stops taking new risk.
+ * The reader's go/no-go.
+ *
+ * A *closed* gap and an *open* one are not the same fact, and conflating them is
+ * how a process parks itself in conservative mode forever: a gap that happened
+ * once and was provably resumed past is part of the audit, not a reason to stop
+ * taking new risk. Only an active unresolved gap, a room reset, or a room
+ * failing its reads in a row does that.
+ *
+ * The historical record stays in `roomsWithHistoricalGaps`, `roomsWithGaps` and
+ * each room's own persisted `gapCount`; nothing here deletes or zeroes it.
  */
 export function cursorHealth(cursors: CursorRecord[], maxConsecutiveErrors = 5): CursorHealth {
   const reasons: string[] = [];
   const roomsWithGaps: string[] = [];
+  const roomsWithActiveUnresolvedGaps: string[] = [];
+  const roomsWithHistoricalGaps: string[] = [];
   const roomsReset: string[] = [];
   let totalGap = 0;
   let worstErrors = 0;
   for (const cursor of cursors) {
-    if (cursor.gap > 0) {
-      roomsWithGaps.push(cursor.room);
-      totalGap += cursor.gap;
-    }
+    const recorded = cursor.gap > 0 || cursor.gapCount > 0;
+    // `gap` is the size of the latest advance's loss, so only an open one has
+    // magnitude; a closed gap keeps its place in the lists below, not here.
+    if (cursor.gap > 0) totalGap += cursor.gap;
+    if (recorded) roomsWithGaps.push(cursor.room);
+    // A gap is active until a contiguous read has been proven past it. `gap === 0`
+    // alone is not the test: a cursor can resume without the flag ever closing.
+    if (recorded && cursor.gapResolvedAt === null) roomsWithActiveUnresolvedGaps.push(cursor.room);
+    else if (recorded) roomsWithHistoricalGaps.push(cursor.room);
     if (cursor.roomReset) roomsReset.push(cursor.room);
     worstErrors = Math.max(worstErrors, cursor.consecutiveErrors);
   }
-  if (roomsWithGaps.length > 0) reasons.push(`cursor gap in ${roomsWithGaps.join(',')}`);
+  if (roomsWithActiveUnresolvedGaps.length > 0) {
+    reasons.push(`cursor gap in ${roomsWithActiveUnresolvedGaps.join(',')}`);
+  }
   if (roomsReset.length > 0) reasons.push(`room reset in ${roomsReset.join(',')}`);
   if (worstErrors >= maxConsecutiveErrors) reasons.push(`read errors: ${worstErrors} consecutive`);
   return {
     healthy: reasons.length === 0,
     reasons,
     totalGap,
+    roomsWithActiveUnresolvedGaps,
+    roomsWithHistoricalGaps,
     roomsWithGaps,
     roomsReset,
     maxConsecutiveErrors: worstErrors,

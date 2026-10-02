@@ -64,16 +64,30 @@ export function gateDecision(input: GateInput): GatedAction {
   if (context.market.staleReference) {
     return { ...base, intent: 'NO_TRADE', side: null, qty: null, px: null, gate: 'stale_reference' };
   }
-  if (context.market.degraded) {
+  // The *current* market, not the historical audit. `degraded` stays true forever
+  // after a resolved cursor gap or an old sweep whose flow was omitted, and
+  // refusing on it forever is how a process ends up unable to price a post that is
+  // perfectly tradeable. The reader answers the current question for the mode it
+  // is running in; in strict mode that answer is exactly `!degraded`, so this is
+  // the same refusal, with the same reason string, that it always was.
+  const currentMarketUsable = context.market.currentMarketUsable ?? !context.market.degraded;
+  if (!currentMarketUsable) {
     return {
       ...base,
       intent: 'NO_TRADE',
       side: null,
       qty: null,
       px: null,
-      gate: `conservative:${context.market.degradedReason ?? 'reader_degraded'}`,
+      gate: `conservative:${
+        context.market.currentMarketBlockedReason ?? context.market.degradedReason ?? 'reader_degraded'
+      }`,
     };
   }
+  // The caps' conservative flag is the same mode-aware answer the check above
+  // used, not the raw `degraded`: a late start with a resolved historical gap
+  // must be able to price an offer. In strict mode `!currentMarketUsable` *is*
+  // `degraded`, so the caps see exactly what they always did.
+  const conservativeCaps = !currentMarketUsable;
 
   // --- accepting an external offer: price and size come from the offer -------
   if (proposal.intent === 'ACCEPT_EXTERNAL') {
@@ -93,7 +107,7 @@ export function gateDecision(input: GateInput): GatedAction {
       locked: false,
       lastTradeSweep: context.lastTradeSweep,
       openNotional: context.openNotional,
-      conservative: context.market.degraded,
+      conservative: conservativeCaps,
     });
     if (!caps.allowed) {
       return { ...base, intent: 'NO_TRADE', side: null, qty: null, px: null, gate: caps.reason, offer };
@@ -137,7 +151,7 @@ export function gateDecision(input: GateInput): GatedAction {
     locked: false,
     lastTradeSweep: context.lastTradeSweep,
     openNotional: context.openNotional,
-    conservative: context.market.degraded,
+    conservative: conservativeCaps,
   });
   if (!caps.allowed) {
     return { ...base, intent: 'NO_TRADE', side: null, qty: null, px: null, gate: caps.reason };

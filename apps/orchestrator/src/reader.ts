@@ -290,6 +290,35 @@ const RESERVED_ROOM_NAMES = new Set(['main', 'lobby', 'system', 'referee', 'anno
 const LOCAL_MESSAGE_BUFFER = 512;
 
 /**
+ * The conservative-mode reasons that block the *current* market in a late start.
+ *
+ * Deliberately a short, named list rather than "anything in conservative mode":
+ * a late start exists precisely because the historical audit can never be made
+ * clean, and the reasons that record that — a seed-shaped post in a room that may
+ * not carry one, a sweep whose flow the referee omitted — are statements about
+ * the past, not about the price post in front of us. Everything here is a
+ * statement about *now*: a bad signature, an unpinned or wrong referee, a package
+ * that drifted from the pin, a reference the referee itself called anomalous, or
+ * a band that cannot price the next sweep.
+ *
+ * `cursor_health` is deliberately absent: it is global (it covers `close1`, which
+ * is a high-traffic public room that will keep gapping) and it is narrowed to the
+ * referee rooms explicitly by the caller instead.
+ */
+const LATE_START_CURRENT_MARKET_BLOCKERS: readonly string[] = [
+  'referee_signature_invalid',
+  'referee_unpinned',
+  'referee_did_mismatch',
+  'referee_did_changed',
+  'package_hash_drift',
+  'package_hash_unpinned',
+  'reference_anomaly',
+  'reference_jump',
+  'limits_for_missing',
+  'limits_for_mismatch',
+];
+
+/**
  * True for a room we already read unconditionally.
  *
  * The five referee rooms and `close1` are excluded from discovery by name, not
@@ -815,10 +844,50 @@ export class OrchestratorReader {
   /** The current market view without touching the network. */
   snapshot(): MarketSnapshot {
     try {
-      return this.verifier.snapshot(this.now());
+      const base = this.verifier.snapshot(this.now());
+      if (!this.lateStart) {
+        // Strict mode's own answer, unchanged: `degraded` is the whole historical
+        // audit, and here "is the current post usable" is the same question.
+        return {
+          ...base,
+          currentMarketUsable: !base.degraded,
+          currentMarketBlockedReason: base.degradedReason,
+        };
+      }
+      const blocker = this.lateStartCurrentMarketBlocker();
+      return {
+        ...base,
+        currentMarketUsable: blocker === null,
+        currentMarketBlockedReason: blocker,
+      };
     } catch {
       return emptySnapshot();
     }
+  }
+
+  /**
+   * Why the current post may not price a late-start trade, or null when it may.
+   *
+   * Answers the current question only. The historical audit — a resolved gap, an
+   * old omitted flow, a seed-shaped post in the wrong room — is reported by the
+   * other fields and is never a reason to stop pricing the post in front of us.
+   * What still stops it: a *referee* room that is still losing messages or was
+   * recreated, and the current-risk reasons the verifier itself is holding.
+   */
+  private lateStartCurrentMarketBlocker(): string | null {
+    const health = this.roomReader.health();
+    const refereeRooms = new Set(this.refereeRoomList);
+    const activeGaps = health.roomsWithActiveUnresolvedGaps.filter((room) => refereeRooms.has(room));
+    if (activeGaps.length > 0) {
+      return `unresolved cursor gap in referee room(s) ${activeGaps.join(', ')}`;
+    }
+    const resets = health.roomsReset.filter((room) => refereeRooms.has(room));
+    if (resets.length > 0) return `referee room recreated: ${resets.join(', ')}`;
+    const reasons = this.verifier.state.conservativeReasons;
+    for (const reason of LATE_START_CURRENT_MARKET_BLOCKERS) {
+      if (reasons.includes(reason)) return reason;
+    }
+    return null;
   }
 
   /**

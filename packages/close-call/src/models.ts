@@ -278,6 +278,23 @@ export interface MarketSnapshot {
   /** True when the reader is in conservative mode (gap, reset, omitted flow). */
   degraded: boolean;
   degradedReason: string | null;
+  /**
+   * May the *current* post price a trade?
+   *
+   * Not the same question as `degraded`. `degraded` answers "is the historical
+   * audit clean", and a resolved cursor gap, an old sweep whose flow was omitted
+   * or a seed-shaped post in the wrong room all leave it true forever — while the
+   * price post in front of us is perfectly tradeable. This field answers the
+   * current question, computed by the reader for the mode it is running in: in
+   * strict mode it is exactly `!degraded`, and in a late start it is the current
+   * risks only (an unresolved referee-room gap, a bad signature, the wrong
+   * referee, package drift, a band that cannot price the next sweep).
+   *
+   * Undefined on a hand-built snapshot, where callers fall back to `!degraded`.
+   */
+  currentMarketUsable?: boolean;
+  /** Why the current post may not price a trade; null when it may. */
+  currentMarketBlockedReason?: string | null;
   packageHash: string | null;
   refereeDid: string | null;
 }

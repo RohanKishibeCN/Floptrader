@@ -490,6 +490,17 @@ export interface LateStartTradingReadinessInputs {
   /** The current price post: sweep, reference, band, `for`, freshness. */
   marketSnapshot: Readiness;
   /**
+   * The reader's mode-aware "may the current post price a trade".
+   *
+   * Distinct from the historical audit: a resolved cursor gap or an old omitted
+   * flow leaves the audit dirty forever without making the *current* post any
+   * less tradeable. This is the current-only answer, and it is the same one the
+   * strategy decision reads, so the gate and the decision cannot disagree.
+   */
+  currentMarketUsable: boolean;
+  /** Why the current post may not price a trade; null when it may. */
+  currentMarketBlockedReason: string | null;
+  /**
    * Every expected owner has a persisted registration with a `technocore_seq`.
    *
    * Registration is a *precondition* of trading, never a substitute for it. A
@@ -554,6 +565,11 @@ export function lateStartTradingReadiness(input: LateStartTradingReadinessInputs
   }
   if (!input.marketSnapshot.ready) {
     reasons.push(...input.marketSnapshot.reasons.map((reason) => `market snapshot: ${reason}`));
+  }
+  // The current market, named separately from the snapshot clauses so a refusal
+  // says *which* current fact held it rather than only "not ready".
+  if (!input.currentMarketUsable) {
+    reasons.push(`current market: ${input.currentMarketBlockedReason ?? 'not usable'}`);
   }
   if (input.localMessageInGap) {
     reasons.push('a local trade, offer or re-post message provably falls inside the close1 gap');

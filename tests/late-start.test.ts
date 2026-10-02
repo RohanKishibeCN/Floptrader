@@ -756,6 +756,8 @@ const TRADING_GATE_BASE = {
   lateStartFeed: { ready: true, reasons: [] },
   tradingArmed: true,
   marketSnapshot: { ready: true, reasons: [] },
+  currentMarketUsable: true,
+  currentMarketBlockedReason: null,
   registrationReady: true,
   registrationPostAcked: 150,
   registrationExpected: 150,
@@ -1856,4 +1858,210 @@ describe('a bootstrap trade survives a restart without doubling', () => {
     );
     expect(second.runtime.scheduler.status().bootstrapStrategyTradesPosted).toBe(before.length);
   }, 300_000);
+});
+
+// ---------------------------------------------------------------------------
+// The production shape: a persistent cursor gap in `close1`
+// ---------------------------------------------------------------------------
+
+/**
+ * The exact failure the VPS reported.
+ *
+ * `close1` had gapped at some earlier point and the gap was provably resumed
+ * past, so it lives on only as an audit line — `gap_resolved_at` set,
+ * `gapCount > 0`. The global verifier had nevertheless entered conservative mode
+ * on `cursor_health`, and there was no path out: `refreshHealth()` entered and
+ * never cleared. Because `late-start-bootstrap` and the gate both read
+ * `market.degraded`, every proposal was refused by a historical fact, and the
+ * fleet posted zero strategy trades while `/status` kept saying
+ * `lateStartTradingReady=true`.
+ *
+ * The fix is two-sided and this test pins both sides: the reader can now leave
+ * conservative mode once the cursor is clean again, and the strategy reads a
+ * *current* market answer that a resolved historical gap cannot hold back.
+ */
+describe('a resolved historical gap does not hold the bootstrap back', () => {
+  let harness: Harness | null = null;
+
+  afterEach(async () => {
+    if (harness) await harness.dispose();
+    harness = null;
+  });
+
+  it('trades through a resolved close1 gap while the audit still records the loss', async () => {
+    harness = await buildLateStart({ trading: true, strategy: true, startReader: false });
+    const h = harness;
+
+    // A real gap in close1: the ring dropped 4 and 5 before the reader returned.
+    for (let seq = 1; seq <= 3; seq += 1) h.transport.enqueue('close1', { seq, text: `gap${seq}` });
+    h.runtime.reader.startContinuous();
+    await waitFor(
+      () => h.runtime.repositories.roomCursors.get('close1')?.cursor === 3,
+      'the first three close1 messages',
+    );
+    for (let seq = 4; seq <= 8; seq += 1) h.transport.enqueue('close1', { seq, text: `gap${seq}` });
+    h.transport.room('close1').firstSeqRetained = 6;
+    await waitFor(
+      () => h.runtime.reader.gaps().unresolved.includes('close1'),
+      'the close1 gap to be recorded',
+    );
+
+    // An *open* gap is a current risk, so the verifier holds conservative mode
+    // under `cursor_health` — the reason that used to be a one-way latch. The
+    // harness clock is fixed, so advance it past the reader's health interval.
+    h.advance(2_000);
+    await waitFor(
+      () => h.runtime.reader.verifier.state.conservativeReasons.includes('cursor_health'),
+      'cursor_health to be entered',
+    );
+    expect(h.runtime.reader.snapshot().degraded).toBe(true);
+
+    // A contiguous read past the missed range closes it. This is the normal
+    // recovery path the production reader did not have.
+    h.transport.enqueue('close1', { seq: 9, text: 'gap9' });
+    h.transport.enqueue('close1', { seq: 10, text: 'gap10' });
+    await waitFor(
+      () => h.runtime.repositories.roomCursors.get('close1')?.gap_resolved_at !== null,
+      'the close1 gap to be resolved',
+    );
+    h.advance(2_000);
+    await waitFor(
+      () => !h.runtime.reader.verifier.state.conservativeReasons.includes('cursor_health'),
+      'cursor_health to be cleared once the gap is closed',
+    );
+    expect(h.runtime.reader.snapshot().degraded).toBe(false);
+
+    // Resolved is not erased: the loss is still on the audit, with its count.
+    const gaps = h.runtime.reader.gaps();
+    expect(gaps.unresolved).not.toContain('close1');
+    expect(gaps.recovered).toContain('close1');
+    expect(gaps.states.find((state) => state.room === 'close1')?.gapCount).toBe(1);
+
+    // The current referee feed is sound: two accepted closes that rise, a band
+    // labelled `for` the next sweep, and the lock still ahead.
+    await primeRising(h);
+    await h.runtime.scheduler.runTick();
+    await waitForRegistrations(h);
+    await h.runtime.scheduler.runTick();
+
+    const status = h.runtime.scheduler.status();
+    // The historical replay really is unavailable — and that is not the gate.
+    expect(status.historicalReplayComplete).toBe(false);
+    expect(status.historicalReplayUnavailable).toBe(true);
+    // The current market is usable independently of the historical audit.
+    expect(status.currentMarketUsable).toBe(true);
+    expect(status.currentMarketBlockedReason).toBeNull();
+    // The two facts the status must never conflate are both reported.
+    expect(status.activeUnresolvedGapRooms).toEqual([]);
+    expect(status.historicalGapTotal).toBeGreaterThan(0);
+    // The switch is armed and the strategy is ready — no contradictory
+    // `conservative:cursor_health` beside a `true`.
+    expect(status.lateStartStrategyTradingArmed).toBe(true);
+    expect(status.lateStartStrategyTradingReady).toBe(true);
+    expect(status.strategyBlockedReason).toBeNull();
+    expect(status.lateStartObservationCount).toBeGreaterThanOrEqual(2);
+    expect(status.lateStartSignal).toBe('rising');
+
+    const bootstrap = effectiveFrom(h, 'bootstrap');
+    expect(bootstrap.length).toBeGreaterThan(0);
+    expect(status.bootstrapStrategyTradesPosted).toBe(bootstrap.length);
+    expect(status.strategyTradesPosted).toBe(0);
+    // The bootstrap and the fallback together still cover the whole fleet, once
+    // each: the historical gap did not cost a single owner their trade.
+    expect(coveredAgents(h).size).toBe(150);
+    const appearances = new Map<string, number>();
+    for (const row of h.runtime.repositories.trades.all()) {
+      if (row.status !== 'pending' && row.status !== 'settled' && row.status !== 'void') continue;
+      const dids = new Set<string>([row.maker_did]);
+      if (row.taker_did !== null) dids.add(row.taker_did);
+      for (const did of dids) appearances.set(did, (appearances.get(did) ?? 0) + 1);
+    }
+    expect([...appearances.values()].every((count) => count === 1)).toBe(true);
+    // The trade was refused by neither the historical audit nor the gate.
+    expect(runReasons(h)).not.toContain('late_start_market_unusable:no_trade');
+  }, 300_000);
+
+  it('still refuses the bootstrap while a referee room is losing messages', async () => {
+    harness = await buildLateStart({ trading: true, strategy: true });
+    const h = harness;
+    await waitForFirstPass(h);
+    // A flat close is not a direction, so two closes and a sound feed still post
+    // nothing: the only thing that can block the trade below is the gap itself.
+    await primeAt(h, 1757, '229.80');
+    await primeAt(h, 1758, '229.80');
+    await h.runtime.scheduler.runTick();
+    await waitForRegistrations(h);
+    expect(rowsFrom(h, 'bootstrap')).toHaveLength(0);
+
+    // Now the referee's own room gaps: the ring drops two posts the cursor never
+    // saw. Unlike the closed `close1` gap, this is a *current* loss.
+    const room = h.transport.room('d-close1-price');
+    const last = room.lastSeq()!;
+    room.firstSeqRetained = last + 3;
+    h.transport.enqueue('d-close1-price', { seq: last + 1, text: 'dropped-1' });
+    h.transport.enqueue('d-close1-price', { seq: last + 2, text: 'dropped-2' });
+    h.transport.enqueue('d-close1-price', { seq: last + 3, text: 'kept' });
+    await waitFor(
+      () => h.runtime.reader.gaps().unresolved.includes('d-close1-price'),
+      'the referee-room gap to be recorded',
+    );
+    h.advance(2_000);
+    await waitFor(
+      () => h.runtime.reader.verifier.state.conservativeReasons.includes('cursor_health'),
+      'the reader to re-grade its health',
+    );
+
+    await h.runtime.scheduler.runTick();
+
+    const status = h.runtime.scheduler.status();
+    expect(status.currentMarketUsable).toBe(false);
+    expect(status.currentMarketBlockedReason).toContain('unresolved cursor gap');
+    expect(status.currentMarketBlockedReason).toContain('d-close1-price');
+    expect(status.activeUnresolvedGapRooms).toContain('d-close1-price');
+    // The strategy is held back, and the status names the *current* reason.
+    expect(status.lateStartStrategyTradingReady).toBe(false);
+    expect(status.strategyBlockedReason).not.toBeNull();
+    expect(rowsFrom(h, 'bootstrap')).toHaveLength(0);
+    expect(runReasons(h)).toContain('late_start_market_unusable:no_trade');
+  }, 300_000);
+
+  it('clears only cursor_health and never a current-risk reason', async () => {
+    harness = await buildLateStart({ trading: true, startReader: false });
+    const h = harness;
+    // Two current facts that the cursor-clean path must never touch.
+    h.runtime.reader.verifier.enterConservative('package_hash_drift', 'the seed names another package');
+    h.runtime.reader.verifier.enterConservative('referee_signature_invalid', 'seq 7 did not verify');
+    h.runtime.reader.startContinuous();
+    await waitForFirstPass(h);
+
+    // The cursor set is clean, so the reader clears `cursor_health` — a no-op here
+    // — while the two current reasons stay exactly where they are.
+    const reasons = h.runtime.reader.verifier.state.conservativeReasons;
+    expect(reasons).toContain('package_hash_drift');
+    expect(reasons).toContain('referee_signature_invalid');
+    expect(reasons).not.toContain('cursor_health');
+    expect(h.runtime.reader.snapshot().degraded).toBe(true);
+  }, 120_000);
+
+  it('answers strict mode with `degraded`, so its gate is unchanged', async () => {
+    // A plain harness: no late-start switch at all, so the reader is strict.
+    const transport = new FakeTransport({ readDelayMs: 1 });
+    const h = await buildHarness({ agentCount: 6, transport, now: () => new Date(CLOCK) });
+    try {
+      for (const room of HARNESS_ROOMS) transport.room(room);
+      const reader = h.runtime.reader;
+      const clean = reader.snapshot();
+      // Strict mode's answer is exactly `!degraded`, with `degradedReason` as the
+      // reason: the mode-aware field adds nothing to it.
+      expect(clean.currentMarketUsable).toBe(!clean.degraded);
+
+      reader.verifier.enterConservative('cursor_health', 'a gap happened');
+      const blocked = reader.snapshot();
+      expect(blocked.degraded).toBe(true);
+      expect(blocked.currentMarketUsable).toBe(false);
+      expect(blocked.currentMarketBlockedReason).toBe(blocked.degradedReason);
+    } finally {
+      await h.dispose();
+    }
+  }, 120_000);
 });

@@ -427,12 +427,27 @@ export interface StatusSnapshot {
    * not the strategy switch is armed, so "off" is visible instead of absent.
    */
   strategyGateMode: 'group' | 'late_start_bootstrap';
+  lateStartStrategyTradingArmed: boolean;
   lateStartStrategyTradingReady: boolean;
   strategyBlockedReason: string | null;
   lateStartObservationCount: number;
   lateStartSignal: LateStartSignal | 'insufficient';
   strategyTradesPosted: number;
   bootstrapStrategyTradesPosted: number;
+  /**
+   * The current market, as distinct from the historical audit.
+   *
+   * `currentMarketUsable` answers "may the post in front of us price a trade";
+   * it is false only for a *current* risk, so a resolved cursor gap or an old
+   * omitted flow cannot park the strategy forever. The audit is reported beside
+   * it: `activeUnresolvedGapRooms` is the still-losing set (empty once the room
+   * has provably resumed), and `historicalGapTotal` is every gap ever recorded,
+   * which never goes down.
+   */
+  currentMarketUsable: boolean;
+  currentMarketBlockedReason: string | null;
+  activeUnresolvedGapRooms: string[];
+  historicalGapTotal: number;
   /**
    * The three registration layers, kept apart on purpose.
    *
@@ -756,12 +771,18 @@ export interface ReaderReport {
     participationAgentsCovered: number;
     /** The late-start strategy path: which decision, and what it reads. */
     strategyGateMode: 'group' | 'late_start_bootstrap';
+    lateStartStrategyTradingArmed: boolean;
     lateStartStrategyTradingReady: boolean;
     strategyBlockedReason: string | null;
     lateStartObservationCount: number;
     lateStartSignal: LateStartSignal | 'insufficient';
     strategyTradesPosted: number;
     bootstrapStrategyTradesPosted: number;
+    /** The current market, distinct from the historical audit. */
+    currentMarketUsable: boolean;
+    currentMarketBlockedReason: string | null;
+    activeUnresolvedGapRooms: string[];
+    historicalGapTotal: number;
     audit: StatusSnapshot['lateStartAudit'];
   };
   serverContract: ServerContractProbe | null;
@@ -817,6 +838,15 @@ export interface LateStartGates {
   registration: Readiness;
   trading: Readiness;
   marketSnapshot: Readiness;
+  /**
+   * May the *current* post price a trade, per the reader's mode-aware answer.
+   *
+   * Not the historical audit: a resolved cursor gap leaves the audit dirty
+   * forever without making the current post any less tradeable.
+   */
+  currentMarketUsable: boolean;
+  /** Why the current post may not price a trade; null when it may. */
+  currentMarketBlockedReason: string | null;
   /** The launch configuration pins both the referee DID and the package hash. */
   launchPinVerified: boolean;
   /** Something signed by the pinned referee has been accepted. */
@@ -3298,6 +3328,11 @@ export class OrchestratorScheduler {
       sweepSeconds: this.rules.sweepSeconds,
       maxStaleSweeps: LATE_START_MAX_STALE_SWEEPS,
     });
+    // The reader's mode-aware "may the current post price a trade", computed once
+    // so the gate, the strategy decision and `/status` all read the same fact.
+    const readerSnapshot = this.reader.snapshot();
+    const currentMarketUsable = readerSnapshot.currentMarketUsable ?? !readerSnapshot.degraded;
+    const currentMarketBlockedReason = readerSnapshot.currentMarketBlockedReason ?? null;
     const lateStartTrading = lateStartTradingReadiness({
       lateStartFeed,
       // A trade may not precede its owner's registration, globally, by the same
@@ -3310,6 +3345,12 @@ export class OrchestratorScheduler {
       registrationUnresolvedMissed: registrationProgress.unresolvedMissed,
       tradingArmed: this.config.lateStartTradingArmed,
       marketSnapshot,
+      // The reader's mode-aware answer to "may the current post price a trade".
+      // The gate and the strategy decision read the very same field, so a
+      // resolved historical gap cannot hold the decision back while the gate
+      // reports ready — or the other way round.
+      currentMarketUsable,
+      currentMarketBlockedReason,
       wallClockBeforeLock: lock.beforeLock,
       wallClockLockValid: lock.valid,
       loadAllowsNewOffer: this.loadGuard.allow('new_offer'),
@@ -3342,6 +3383,8 @@ export class OrchestratorScheduler {
           registration: lateStartRegistration,
           trading: lateStartTrading,
           marketSnapshot,
+          currentMarketUsable,
+          currentMarketBlockedReason,
           launchPinVerified,
           refereeSeen,
           lock,
@@ -3358,6 +3401,8 @@ export class OrchestratorScheduler {
         registration: lateStartRegistration,
         trading: lateStartTrading,
         marketSnapshot,
+        currentMarketUsable,
+        currentMarketBlockedReason,
         launchPinVerified,
         refereeSeen,
         lock,
@@ -3483,6 +3528,11 @@ export class OrchestratorScheduler {
       previousObservation === undefined
         ? 'insufficient'
         : lateStartSignal(latestObservation, previousObservation, this.rules.priceStep);
+    // The cursor audit, kept apart on purpose: `historicalGapTotal` is every gap
+    // the process has ever recorded and never goes down, while
+    // `activeUnresolvedGapRooms` is the *still losing* set, which is the only one
+    // that holds risk back.
+    const historicalGapTotal = cursorGaps.states.reduce((sum, state) => sum + state.gapCount, 0);
     const lateStartStrategyTradingReady =
       this.config.lateStartStrategyTradingArmed &&
       readiness.lateStart.trading.ready &&
@@ -3560,8 +3610,13 @@ export class OrchestratorScheduler {
       participationTradesPosted: participationCoverage.posted,
       participationAgentsCovered: participationCoverage.agentsCovered,
       strategyGateMode,
+      lateStartStrategyTradingArmed: this.config.lateStartStrategyTradingArmed,
       lateStartStrategyTradingReady,
       strategyBlockedReason,
+      currentMarketUsable: readiness.lateStart.currentMarketUsable,
+      currentMarketBlockedReason: readiness.lateStart.currentMarketBlockedReason,
+      activeUnresolvedGapRooms: cursorGaps.unresolved,
+      historicalGapTotal,
       lateStartObservationCount: observations.length,
       lateStartSignal: lateStartSignalValue,
       strategyTradesPosted: tradeSourceCounts.strategy,
@@ -3829,12 +3884,17 @@ export class OrchestratorScheduler {
         participationTradesPosted: status.participationTradesPosted,
         participationAgentsCovered: status.participationAgentsCovered,
         strategyGateMode: status.strategyGateMode,
+        lateStartStrategyTradingArmed: status.lateStartStrategyTradingArmed,
         lateStartStrategyTradingReady: status.lateStartStrategyTradingReady,
         strategyBlockedReason: status.strategyBlockedReason,
         lateStartObservationCount: status.lateStartObservationCount,
         lateStartSignal: status.lateStartSignal,
         strategyTradesPosted: status.strategyTradesPosted,
         bootstrapStrategyTradesPosted: status.bootstrapStrategyTradesPosted,
+        currentMarketUsable: status.currentMarketUsable,
+        currentMarketBlockedReason: status.currentMarketBlockedReason,
+        activeUnresolvedGapRooms: status.activeUnresolvedGapRooms,
+        historicalGapTotal: status.historicalGapTotal,
         audit: status.lateStartAudit,
       },
       serverContract: reader.serverContract,
@@ -4183,7 +4243,16 @@ export class OrchestratorScheduler {
               (status.strategyGateMode === 'late_start_bootstrap'
                 ? ` strat=${status.lateStartSignal} obs=${status.lateStartObservationCount}` +
                   ` ready=${status.lateStartStrategyTradingReady}` +
-                  ` st=${status.strategyTradesPosted}/bs${status.bootstrapStrategyTradesPosted}`
+                  ` st=${status.strategyTradesPosted}/bs${status.bootstrapStrategyTradesPosted}` +
+                  // The current market and the audit beside it: `mkt` is the
+                  // current answer, `gaps` the still-open set and `hist` every gap
+                  // ever recorded, so "resolved but never forgotten" is visible.
+                  ` mkt=${status.currentMarketUsable}${
+                    status.currentMarketUsable
+                      ? ''
+                      : `:${status.currentMarketBlockedReason ?? 'unknown'}`
+                  }` +
+                  ` gaps=${status.activeUnresolvedGapRooms.length} hist=${status.historicalGapTotal}`
                 : '') +
               (status.lateStartBlockedReason === null ? '' : ` blocked=${status.lateStartBlockedReason}`),
           ],

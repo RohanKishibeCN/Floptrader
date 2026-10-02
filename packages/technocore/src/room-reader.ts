@@ -1240,8 +1240,16 @@ export class RoomReader {
     this.lastHealthCheckMs = nowMs;
     const health = cursorHealth(this.cursorStore.all());
     this.lastHealth = health;
+    // `cursor_health` is a statement about the cursor *now*, so it has to be able
+    // to leave conservative mode as well as enter it. Without this the flag is a
+    // one-way latch: a gap that happened once, was provably resumed past, and is
+    // now only a line in the audit would hold every upstream gate back forever.
+    // Only this one reason is touched — a bad signature, a wrong referee DID or a
+    // package that drifted are current facts and are never cleared here.
     if (!health.healthy) {
       this.verifier.enterConservative('cursor_health', health.reasons.join('; '));
+    } else {
+      this.verifier.clearConservative('cursor_health');
     }
     this.checkFairness(nowMs);
     this.verifier.reconcileSweeps();

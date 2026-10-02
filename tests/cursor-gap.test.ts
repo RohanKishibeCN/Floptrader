@@ -206,6 +206,50 @@ describe('SqliteCursorStore', () => {
     expect(afterErrors.reasons.join(' ')).toContain('read errors: 5 consecutive');
   });
 
+  it('keeps an active gap and a resolved one apart, and never zeroes the record', () => {
+    const at = '2026-09-28T08:40:00.000Z';
+    // A gap that is still open: the only set that holds risk back.
+    store.commit(
+      'r-active',
+      [message(6), message(7)],
+      {
+        cursor: 7,
+        generation: 1,
+        firstSeq: 6,
+        lastSeq: 7,
+        gap: 2,
+        roomReset: false,
+        reason: 'gap',
+        missedFrom: 4,
+        missedTo: 5,
+      },
+      at,
+    );
+    const active = cursorHealth(store.all());
+    expect(active.healthy).toBe(false);
+    expect(active.roomsWithActiveUnresolvedGaps).toEqual(['r-active']);
+    expect(active.roomsWithHistoricalGaps).toEqual([]);
+    expect(active.roomsWithGaps).toEqual(['r-active']);
+    expect(active.totalGap).toBe(2);
+    expect(active.reasons.join(' ')).toContain('cursor gap in r-active');
+
+    // A contiguous read is the only thing that closes it. Health recovers, but the
+    // loss stays on the record: it is not deleted, and not zeroed.
+    store.commit('r-active', [message(8)], ok(8), at);
+    const resolved = cursorHealth(store.all());
+    expect(resolved.healthy).toBe(true);
+    expect(resolved.reasons).toEqual([]);
+    expect(resolved.roomsWithActiveUnresolvedGaps).toEqual([]);
+    expect(resolved.roomsWithHistoricalGaps).toEqual(['r-active']);
+    expect(resolved.roomsWithGaps).toEqual(['r-active']);
+    // No *open* gap remains, so the live total is zero...
+    expect(resolved.totalGap).toBe(0);
+    // ...while the audit keeps both the count and the recorded range.
+    expect(store.load('r-active').gapCount).toBe(1);
+    expect(store.load('r-active').lastGapTo).toBe(5);
+    expect(store.load('r-active').gapResolvedAt).not.toBeNull();
+  });
+
   it('never loses the messages that were actually returned across a gap', () => {
     store.commit('r1', [message(1), message(2), message(3)], ok(3), '2026-09-28T08:40:00.000Z');
     // 4 and 5 were dropped from the ring; 6..8 were returned and must all store.

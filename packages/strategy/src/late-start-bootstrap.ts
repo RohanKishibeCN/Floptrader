@@ -67,24 +67,25 @@ export function lateStartSignal(
 }
 
 /**
- * Whether the current post may price a trade at all.
+ * Why the current post may not price a trade, or null when it may.
  *
- * Every clause is about the *current* post, never about the opening: a pinned
- * referee, a band, a `for` that names the very next sweep, a reference that is
- * not the referee's own stale marker, and a contest that is not locked. This is
- * the same set of facts `marketSnapshotReadiness` holds the trading gate to, so
- * the decision and the gate cannot disagree about whether the market is usable.
+ * `currentMarketUsable` is the reader's mode-aware answer, so in a late start it
+ * has already dropped the historical audit — a resolved cursor gap, an old sweep
+ * whose flow was omitted — while keeping every current risk. The clauses below
+ * restate the same facts from the snapshot itself, so this decision cannot drift
+ * from the trading gate about whether the post in front of us is usable.
  */
-function marketIsUsable(market: MarketSnapshot): boolean {
-  if (market.locked) return false;
-  if (market.degraded) return false;
-  if (market.staleReference) return false;
-  if (market.reference === null) return false;
-  if (market.limits === null) return false;
-  if (market.limitsUsable === false) return false;
-  if (market.limitsForSweep === null) return false;
-  if (market.limitsForSweep !== market.sweep + 1) return false;
-  return true;
+function marketBlocker(market: MarketSnapshot): string | null {
+  if (market.locked) return 'locked';
+  const usable = market.currentMarketUsable ?? !market.degraded;
+  if (!usable) return market.currentMarketBlockedReason ?? market.degradedReason ?? 'degraded';
+  if (market.staleReference) return 'stale_reference';
+  if (market.reference === null) return 'no_reference';
+  if (market.limits === null) return 'no_limits';
+  if (market.limitsUsable === false) return 'limits_unusable';
+  if (market.limitsForSweep === null) return 'limits_for_missing';
+  if (market.limitsForSweep !== market.sweep + 1) return 'limits_for_mismatch';
+  return null;
 }
 
 function clampFraction(value: Decimal): Decimal {
@@ -113,7 +114,11 @@ export function lateStartBootstrapProposal(
   indicators.previous = previous.toString();
   indicators.latest = latest.toString();
 
-  if (!marketIsUsable(context.market)) return noTrade('late_start_market_unusable', indicators);
+  const blocker = marketBlocker(context.market);
+  if (blocker !== null) {
+    indicators.blocker = blocker;
+    return noTrade('late_start_market_unusable', indicators);
+  }
   if (signal === 'flat') return noTrade('late_start_flat', indicators);
 
   const maxQty = context.caps.maxQty;
