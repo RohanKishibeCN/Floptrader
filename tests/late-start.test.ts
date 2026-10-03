@@ -1814,7 +1814,7 @@ describe('in-fleet matching gives our own open offers a counterparty', () => {
     expect(offers.map((offer) => offer.terms.id)).toContain('our-offer-deep');
   }, 180_000);
 
-  it('accepts a fleet offer, so the maker offer becomes a countersigned trade', async () => {
+  it('countersigns an offer the fleet made, instead of letting it expire', async () => {
     harness = await buildLateStart({
       trading: true,
       strategy: true,
@@ -1822,55 +1822,138 @@ describe('in-fleet matching gives our own open offers a counterparty', () => {
     });
     const h = harness;
     await waitForFirstPass(h);
-    // A flat market: the bootstrap proposes nothing, so the only trade that can
-    // appear in this tick is an acceptance.
-    await primeAt(h, 1757, '232.00');
-    await primeAt(h, 1758, '232.00');
+    // A falling market: the bootstrap posts SELL offers above the reference, and
+    // it writes the row for each offer as it posts it. That row is what the taker
+    // later fills — the reader only stores the message, so an offer that no maker
+    // path wrote a row for cannot be countersigned at all.
+    await primeFalling(h);
     await h.runtime.scheduler.runTick();
     await waitForRegistrations(h);
 
-    // The referee confirms the mints, which is what funds the taker's account.
-    // In production this is the flow post for the sweep our registrations landed
-    // in; `validateExternalOffer` refuses an unfunded taker, and that refusal is
-    // correct — a taker with no collateral would have the trade voided for funds.
-    // A room message is capped at 4096 characters, so the mints are announced in
-    // batches the way the live referee's own posts are trimmed.
+    // The mints are what fund the accepting side. In production this is the flow
+    // post for the sweep the registrations landed in; `validateExternalOffer`
+    // refuses an unfunded taker, and that refusal is correct — a taker with no
+    // collateral would have the trade voided for funds. A room message is capped at
+    // 4096 characters, so the mints arrive in batches, as the live referee's own
+    // posts are trimmed.
     const ourDids = [...h.runtime.keyStore.agentIds]
       .sort()
       .map((id) => h.runtime.keyStore.did(id));
     for (let i = 0; i < ourDids.length; i += 40) {
       h.referee.flow(1758, ourDids.slice(i, i + 40));
     }
-    await h.runtime.scheduler.runTick();
-
-    // A sell offer from one of our owners *below* the reference: that is the side
-    // a taker profits on, 1.31% against the 0.4% it requires. (The same offer
-    // above the reference is a loss and must be refused — pinned in
-    // `strategy-groups.test.ts`.)
-    const makerAgent = [...h.runtime.keyStore.agentIds].sort()[0]!;
-    const makerDid = h.runtime.keyStore.did(makerAgent);
-    postOurOpenOffer(h, makerAgent, { id: 'our-offer-accept', px: '229.00', until: 1759, side: 'sell' });
     await h.runtime.reader.tick();
-
     await h.runtime.scheduler.runTick();
 
-    const accepted = h.runtime.repositories.trades
+    const reference = h.runtime.reader.snapshot().reference!;
+    const offers = h.runtime.repositories.trades
       .all()
-      .filter((row) => row.id === 'our-offer-accept' && row.taker_sig !== null);
-    expect(accepted.length).toBeGreaterThan(0);
-    const row = accepted[0]!;
-    // The maker is ours, the taker is a different owner of ours, and the record
-    // carries the countersignature that makes it settleable.
-    expect(row.maker_did).toBe(makerDid);
-    expect(row.taker_did).not.toBe(makerDid);
-    expect(row.taker_did).not.toBeNull();
-    expect(row.taker_sig).not.toBeNull();
-    expect(h.runtime.keyStore.didSet().has(row.taker_did!)).toBe(true);
-    expect(row.status).toBe('pending');
-    // The acceptance is a strategy decision by the taker group, not a bootstrap.
-    expect(row.trade_source).toBe('strategy');
-    // And the reader did not refuse it as an internal pairing.
-    expect(row.reason).toBeNull();
+      .filter((row) => row.trade_source === 'bootstrap' && row.status === 'pending');
+    expect(offers.length).toBeGreaterThan(0);
+    const ids = offers.map((row) => row.id);
+    for (const row of offers) {
+      expect(row.side).toBe('sell');
+      expect(Decimal.from(row.px).gt(reference)).toBe(true);
+    }
+
+    // One tick later the fleet's own taker group answers them.
+    await h.runtime.scheduler.runTick();
+
+    const filled = ids
+      .map((id) => h.runtime.repositories.trades.get(id)!)
+      .filter((row) => row.taker_sig !== null);
+    expect(filled.length).toBeGreaterThan(0);
+    for (const row of filled) {
+      // The offer is no longer an offer: a *different* owner of ours countersigned
+      // it, which is what makes it settleable rather than expired by the referee.
+      expect(row.taker_did).not.toBe(row.maker_did);
+      expect(row.taker_did).not.toBeNull();
+      expect(h.runtime.keyStore.didSet().has(row.taker_did!)).toBe(true);
+      expect(row.status).toBe('pending');
+      // The maker signature is still the maker's: the acceptance fills the row, it
+      // does not rewrite it from the taker's side.
+      expect(
+        verifyMakerSignature(
+          buildTerms({
+            id: row.id,
+            maker: row.maker_did,
+            side: row.side as 'buy' | 'sell',
+            qty: row.qty,
+            px: row.px,
+            until: row.until_sweep,
+            taker: 'any',
+          }),
+          row.maker_sig,
+        ),
+      ).toBe(true);
+    }
+    // And it is the *taker* that is recorded as this row's agent, so the position
+    // guard holds the agent that actually took the trade.
+    for (const row of filled) {
+      const takerAgent = h.runtime.keyStore.agentIds.find(
+        (id) => h.runtime.keyStore.did(id) === row.taker_did,
+      );
+      expect(takerAgent).toBeDefined();
+    }
+  }, 300_000);
+
+  it('fills a bootstrap sell offer that sits above the reference', async () => {
+    harness = await buildLateStart({
+      trading: true,
+      strategy: true,
+      env: { EXTERNAL_OFFER_TAKER_LOCAL_MATCH: 'true', LOCAL_MATCH_CONFIRM: LOCAL_MATCH_CONFIRM_VALUE },
+    });
+    const h = harness;
+    await waitForFirstPass(h);
+    // The production shape: a falling market, so the bootstrap posts SELL offers
+    // *above* the reference. That price is adverse to any taker — which is why the
+    // stranger rule refuses it and the in-fleet rule is the only thing that lets
+    // our own taker fill it.
+    await primeFalling(h);
+    await h.runtime.scheduler.runTick();
+    await waitForRegistrations(h);
+
+    // The mints are what fund the accepting side. In production they arrive as the
+    // flow post for the sweep the registrations landed in; the reader has to
+    // consume them before the risk book can hold a balance.
+    const ourDids = [...h.runtime.keyStore.agentIds]
+      .sort()
+      .map((id) => h.runtime.keyStore.did(id));
+    for (let i = 0; i < ourDids.length; i += 40) {
+      h.referee.flow(1758, ourDids.slice(i, i + 40));
+    }
+    await h.runtime.reader.tick();
+    await h.runtime.scheduler.runTick();
+    expect(h.runtime.scheduler.mintedDids().size).toBe(150);
+
+    const reference = h.runtime.reader.snapshot().reference!;
+    const bootstrap = h.runtime.repositories.trades
+      .all()
+      .filter((row) => row.trade_source === 'bootstrap' && row.status === 'pending');
+    expect(bootstrap.length).toBeGreaterThan(0);
+    // Every one of them is a sell above the reference. This is the price the
+    // stranger rule refuses and the in-fleet rule fills.
+    for (const row of bootstrap) {
+      expect(row.side).toBe('sell');
+      expect(Decimal.from(row.px).gt(reference)).toBe(true);
+    }
+    const ids = bootstrap.map((row) => row.id);
+
+    // The next tick is where our own taker group answers them: the acceptance
+    // turns the maker's own row into a countersigned trade.
+    await h.runtime.scheduler.runTick();
+
+    const filled = ids
+      .map((id) => h.runtime.repositories.trades.get(id)!)
+      .filter((row) => row.taker_sig !== null);
+    expect(filled.length).toBeGreaterThan(0);
+    for (const row of filled) {
+      // Countersigned by a *different* one of our owners: a real trade between two
+      // funded accounts, not a self-trade.
+      expect(row.taker_did).not.toBe(row.maker_did);
+      expect(h.runtime.keyStore.didSet().has(row.taker_did!)).toBe(true);
+      expect(row.status).toBe('pending');
+    }
   }, 300_000);
 });
 

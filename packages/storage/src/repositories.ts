@@ -1687,6 +1687,52 @@ export class TradeRepository {
       });
     return info.changes > 0;
   }
+
+  /**
+   * Countersign an open offer this process already recorded as its maker.
+   *
+   * A trade is one row keyed by the offer id, and the taker arrives second: the
+   * bootstrap path writes the maker row (`taker_sig` null, `taker_did` still the
+   * maker's placeholder), and the accepting agent's turn comes in the same tick or
+   * a later one. `insert` cannot express that — it is `INSERT OR IGNORE`, so the
+   * existing maker row silently swallows the acceptance and the trade stays an
+   * offer forever, which is exactly what happened the first time in-fleet matching
+   * ran: ten `ACCEPT_EXTERNAL` decisions, zero countersignatures stored.
+   *
+   * So the acceptance is an update, and it is bounded like one:
+   *
+   *   - only a row that exists, belongs to this id, and is not already
+   *     countersigned (`taker_sig IS NULL`) can be filled. A second acceptance of
+   *     the same offer changes nothing — the first copy wins, as on the wire;
+   *   - only a live row is filled. A `refused`, `dry_run` or `void` row describes
+   *     something that did not happen, so countersigning it would invent a trade;
+   *   - the accepting agent becomes `agent_id`, so the position guard holds the
+   *     taker for the trade it just took, and `taker_did` becomes the real
+   *     counterparty instead of the maker's `"any"` placeholder.
+   */
+  countersign(input: {
+    id: string;
+    takerDid: string;
+    takerSig: string;
+    agentId: string;
+    seq: number | null;
+  }): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE trades SET taker_did = @taker_did, taker_sig = @taker_sig, agent_id = @agent_id,
+           seq = COALESCE(@seq, seq), updated_at = @updated_at
+         WHERE id = @id AND taker_sig IS NULL AND status IN ('pending','settled')`,
+      )
+      .run({
+        id: input.id,
+        taker_did: input.takerDid,
+        taker_sig: input.takerSig,
+        agent_id: input.agentId,
+        seq: input.seq,
+        updated_at: nowIso(),
+      });
+    return info.changes > 0;
+  }
 }
 
 export interface LlmCallRow {

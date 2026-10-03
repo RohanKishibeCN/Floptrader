@@ -34,7 +34,8 @@ export interface ExternalOffer {
    * Set by the reader from its own key set, never by a message, so an offer
    * cannot claim it. The accept path uses it to tell the one deliberate in-fleet
    * pairing from the ordinary case, where an offer naming one of our own DIDs is
-   * refused outright.
+   * refused outright — and the taker profile uses it to price the two cases, see
+   * `edgeOverReference`.
    */
   localMaker?: boolean;
 }

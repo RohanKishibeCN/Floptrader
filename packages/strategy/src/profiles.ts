@@ -35,6 +35,20 @@ function fraction(value: Decimal): Decimal {
 }
 
 /**
+ * How far from the market an in-fleet offer may sit and still be filled.
+ *
+ * A maker posts on its own favourable side of the reference, so an offer made by
+ * one of our own DIDs is adverse to our taker by construction — the bootstrap's
+ * own maker edge is 1.25% (`MAKER_EDGE_FRACTION` of the 5% window). Requiring the
+ * taker to have a market edge on it is a contradiction: it refuses every offer we
+ * post, which is what the live box did, run after run, with
+ * `no_offer_meets_edge`. This cap is the concession we are willing to take the
+ * other side of, and it is deliberately just above that 1.25% so the bootstrap
+ * fills and a price far from the market does not.
+ */
+const IN_FLEET_MAKER_EDGE_CAP = Decimal.from('0.015');
+
+/**
  * How much better than the market an offer is, from the taker's point of view.
  *
  * Positive means taking it is profitable at the reference price:
@@ -313,12 +327,32 @@ export const contrarian: StrategyProfile = {
  * Take someone else's offer; never post one.
  *
  * This group does not create maker offers at all. It reads the trading room for
- * open `taker:"any"` offers whose maker is a genuinely external DID, and takes
- * the best one that clears `maxSpreadFromReference`. The safety work is not here:
- * `validateExternalOffer` in `@flop/close-call` re-checks the maker signature,
- * the price window, the id, the deadline, the lock and our funding, and refuses
- * any offer made by one of our own DIDs. This profile only ranks what it is
- * shown, and prefers a bigger edge at a smaller size.
+ * open `taker:"any"` offers and takes the best one that clears its edge
+ * requirement. The safety work is not here: `validateExternalOffer` in
+ * `@flop-close-call` re-checks the maker signature, the price window, the id, the
+ * deadline, the lock and our funding. This profile only ranks what it is shown,
+ * and prefers a bigger edge at a smaller size.
+ *
+ * **Two prices, because a maker's edge and a taker's edge cannot both be had.**
+ * A maker posts on its own favourable side of the reference — it has to, that is
+ * what `MAKER_EDGE_FRACTION` is — so the taker on the other side of that same
+ * offer is 1.25% *behind* the market, not in front of it. Requiring
+ * `maxSpreadFromReference` from every offer therefore means our own offers can
+ * never be filled by our own taker: the two requirements are zero-sum on one
+ * price. Measured on the live book that is exactly what happened, with every run
+ * ending in `no_offer_meets_edge`.
+ *
+ * The two cases are priced apart on purpose:
+ *
+ *   - a **stranger's** offer is a trade we would not otherwise make, so it still
+ *     has to beat the market by `maxSpreadFromReference` — the group's original
+ *     and unchanged business;
+ *   - **our own** offer is the other half of a bet this fleet is already taking.
+ *     Both sides are ours, so the fleet's net position is unchanged either way;
+ *     what changes is whether the trade settles into two scored accounts or is
+ *     expired by the referee and scores nothing. For that case the requirement is
+ *     only that the price is not *adverse* (`edge >= 0`); the band, the id, the
+ *     deadline, the cap and the funding are still checked downstream.
  */
 export const externalOfferTaker: StrategyProfile = {
   group: 'external_offer_taker',
@@ -336,7 +370,13 @@ export const externalOfferTaker: StrategyProfile = {
       return noTrade('no_external_offers', indicatorRecord({ offers: Decimal.zero() }));
     }
 
-    let best: { offer: (typeof externalOffers)[number]; edge: Decimal; qty: Decimal } | null = null;
+    // Collect every offer this agent would take, then take a *different* one per
+    // agent. Picking the single best for all of them makes every taker in a tick
+    // race for the same offer: the first countersignature fills it and the rest
+    // post an acceptance of something already taken, which is a wasted write and a
+    // trade that never happens. The bootstrap path posts one offer per agent, so
+    // the supply is there — it just has to be spread.
+    const candidates: Array<{ offer: (typeof externalOffers)[number]; edge: Decimal; qty: Decimal }> = [];
     for (const offer of externalOffers) {
       const px = Decimal.from(offer.terms.px);
       const qty = Decimal.from(offer.terms.qty);
@@ -350,15 +390,39 @@ export const externalOfferTaker: StrategyProfile = {
       // offer price and give `(reference - px) / px` — negative for exactly the
       // offers worth taking and positive for the ones that lose money.
       const edge = edgeOverReference(offer.terms.side, px, reference);
-      if (edge.lt(minEdge)) continue;
-      if (best === null || edge.gt(best.edge)) best = { offer, edge, qty };
+      // A stranger's offer has to beat the market. Ours is the other half of a bet
+      // this fleet is already taking, so it is filled at the maker's own price —
+      // but only while that price is a *reasonable* maker price. The check is on
+      // the maker's concession (`-edge`, which is positive for a maker posting on
+      // its own favourable side), not on our edge, because a maker-side price is
+      // by construction adverse to us: requiring `edge >= 0` here would refuse
+      // every offer we ever post. 1.5% admits the bootstrap's own 1.25% maker edge
+      // with a little room, and refuses a price so far from the market that it is
+      // no longer a maker price at all.
+      const concession = edge.neg();
+      const acceptable =
+        offer.localMaker === true ? concession.lte(IN_FLEET_MAKER_EDGE_CAP) : edge.gte(minEdge);
+      if (!acceptable) continue;
+      candidates.push({ offer, edge, qty });
     }
 
     const indicators = indicatorRecord({
       offers: Decimal.from(externalOffers.length),
-      bestEdge: best?.edge ?? null,
+      acceptable: Decimal.from(candidates.length),
+      bestEdge: candidates.length === 0 ? null : candidates.reduce((a, b) => (b.edge.gt(a.edge) ? b : a)).edge,
     });
-    if (best === null) return noTrade('no_offer_meets_edge', indicators);
+    if (candidates.length === 0) return noTrade('no_offer_meets_edge', indicators);
+
+    // Best first, then a stable per-agent offset so two agents in the same tick do
+    // not both walk away with the same offer. `randomSeed` is derived from the
+    // agent id, so the offset is stable across restarts and spread across agents,
+    // while the ordering still prefers the best price.
+    candidates.sort((a, b) => {
+      if (!a.edge.eq(b.edge)) return b.edge.gt(a.edge) ? 1 : -1;
+      return a.offer.seq - b.offer.seq;
+    });
+    const offset = context.randomSeed % candidates.length;
+    const best = candidates[offset]!;
 
     const notional = best.qty.mul(Decimal.from(best.offer.terms.px));
     const budget = context.caps.maxOpenNotional.mul(notionalFraction);

@@ -187,6 +187,50 @@ describe('deterministic evaluation', () => {
     // so with an empty list the group must decline rather than invent one.
     expect(evaluate([]).intent).toBe('NO_TRADE');
   });
+
+  it('prices an in-fleet offer against a threshold of its own', () => {
+    const offer = (side: 'buy' | 'sell', px: string, localMaker: boolean) => ({
+      terms: {
+        id: `trade-${side}-${px}-${localMaker ? 'ours' : 'theirs'}`,
+        maker: 'did:key:z6Mk' + 'A'.repeat(44),
+        px,
+        qty: '1.00',
+        side,
+        taker: 'any' as const,
+        until: 950,
+      },
+      makerSig: 'sig',
+      room: 'close1',
+      seq: 1,
+      observedAt: 'now',
+      ...(localMaker ? { localMaker: true } : {}),
+    });
+    const evaluate = (offers: ReturnType<typeof offer>[]) =>
+      evaluateGroup(
+        'external_offer_taker',
+        contextFor('external_offer_taker', { externalOffers: offers }),
+      );
+
+    // A maker's edge and a taker's edge are zero-sum on one price: a maker posts
+    // on its own favourable side, so a stranger's offer at 222.00 (buy) or 228.00
+    // (sell) is behind the market by ~1.4% and correctly refused.
+    expect(evaluate([offer('buy', '222.00', false)]).intent).toBe('NO_TRADE');
+    expect(evaluate([offer('sell', '228.00', false)]).intent).toBe('NO_TRADE');
+    // Our own offer is the other half of a bet the fleet is already taking, so it
+    // is filled at the maker's own price instead of being expired by the referee:
+    // the fleet's net position is unchanged, and the trade settles into two scored
+    // accounts rather than scoring nothing. A maker's concession of ~1.4% is
+    // inside the 1.5% cap that admits our own 1.25% bootstrap edge.
+    expect(evaluate([offer('buy', '222.00', true)]).intent).toBe('ACCEPT_EXTERNAL');
+    expect(evaluate([offer('sell', '228.00', true)]).intent).toBe('ACCEPT_EXTERNAL');
+    // The cap is real: a price so far from the market that it is no longer a maker
+    // price is refused even in-fleet. 5% away is past it.
+    expect(evaluate([offer('sell', '236.40', true)]).intent).toBe('NO_TRADE');
+    expect(evaluate([offer('buy', '213.85', true)]).intent).toBe('NO_TRADE');
+    // And a stranger's offer is still held to the stricter market-edge rule, so
+    // the lane that trades with other operators is unchanged.
+    expect(evaluate([offer('sell', '228.00', false)]).intent).toBe('NO_TRADE');
+  });
 });
 
 describe('the deterministic gate', () => {

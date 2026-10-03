@@ -2776,17 +2776,45 @@ export class OrchestratorScheduler {
           continue;
         }
         const write = await this.writer.postTrade(agentId, this.rules.tradingRoom, signed.text);
+        // Accepting an open offer fills a row that already exists — ours, written
+        // when we posted the offer. It is an update, not an insert; see
+        // `TradeRepository.countersign`. Every other intent creates the row.
+        const accepting = action.intent === 'ACCEPT_EXTERNAL';
         if (write.ok) {
-          this.recordTrade(
-            agentId,
-            terms,
-            'pending',
-            null,
-            signed.maker_sig,
-            signed.taker_sig,
-            write.seq ?? null,
-            tradeSource,
-          );
+          if (accepting) {
+            const filled = this.repositories.trades.countersign({
+              id: terms.id,
+              takerDid: did,
+              takerSig: signed.taker_sig,
+              agentId,
+              seq: write.seq ?? null,
+            });
+            if (!filled) {
+              // The offer was already taken, already ruled on, or never ours to
+              // fill. The post went out, so this is a real duplicate rather than a
+              // lost trade — recorded so it is never silent.
+              this.logger.event({
+                level: 'warn',
+                source: 'scheduler',
+                code: 'offer_countersign_skipped',
+                message: `${agentId} accepted ${terms.id}, which was already taken or no longer live`,
+                data: { agentId, offerId: terms.id, seq: write.seq ?? null },
+              });
+              result.refused += 1;
+              continue;
+            }
+          } else {
+            this.recordTrade(
+              agentId,
+              terms,
+              'pending',
+              null,
+              signed.maker_sig,
+              signed.taker_sig,
+              write.seq ?? null,
+              tradeSource,
+            );
+          }
           result.posted += 1;
         } else {
           this.recordTrade(
