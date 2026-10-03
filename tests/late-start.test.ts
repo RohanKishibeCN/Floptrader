@@ -824,6 +824,27 @@ describe('the trading gate requires registration and the wall clock', () => {
     });
     expect(gate.reasons.join(' ')).toContain(WALL_CLOCK_INVALID_REASON);
   });
+
+  it('does not read the public room\'s coverage at all: an unattainable close1 is not a trade refusal', () => {
+    // Which clauses this gate is allowed to read is the contract. A late start
+    // does not trade on `close1`; it trades on the pinned referee's own signed
+    // price post, and the five referee rooms are held to the feed gate above.
+    // `close1`'s cursor gap is an audit fact about what we managed to *read*, so
+    // it must not be able to veto a trade priced from a post we did read. The
+    // strict gate still refuses on it — that is what makes it an audit answer —
+    // and this pins that the two do not drift into each other.
+    const inputKeys = Object.keys(TRADING_GATE_BASE);
+    for (const coverageKey of [
+      'close1FullyCaughtUp',
+      'close1Unattainable',
+      'close1NetPersistBacklogRate',
+      'tradingRoomUnattainable',
+      'unresolvedGap',
+    ]) {
+      expect(inputKeys).not.toContain(coverageKey);
+    }
+    expect(lateStartTradingReadiness(TRADING_GATE_BASE).ready).toBe(true);
+  });
 });
 
 describe('the registration gate obeys the wall clock', () => {
@@ -1667,19 +1688,31 @@ describe('the bootstrap strategy at the write path', () => {
     expect(status.bootstrapStrategyTradesPosted).toBe(bootstrap.length);
     expect(status.strategyTradesPosted).toBe(0);
     // The fallback still owes every remaining owner one trade: the two sources
-    // together cover the whole fleet, once each.
+    // together cover the whole fleet.
     expect(coveredAgents(h).size).toBe(150);
-    // No owner carries two effective trades: no bootstrap position on top of a
-    // participation trade, and none the other way round.
-    const appearances = new Map<string, number>();
+    // No owner carries two positions at once: no bootstrap trade on top of a
+    // participation trade, and none the other way round. A lifetime count would
+    // also forbid an agent from trading again after its own `until_sweep` has
+    // passed, which is the deadlock, so the invariant here is overlap.
+    const inEffect = new Map<string, number[]>();
     for (const row of h.runtime.repositories.trades.all()) {
-      if (row.status !== 'pending' && row.status !== 'settled' && row.status !== 'void') continue;
+      if (row.status !== 'pending' && row.status !== 'settled') continue;
       // An open bootstrap offer names its own maker on both sides.
-      const dids = new Set<string>([row.maker_did]);
-      if (row.taker_did !== null) dids.add(row.taker_did);
-      for (const did of dids) appearances.set(did, (appearances.get(did) ?? 0) + 1);
+      for (const did of new Set([row.maker_did, row.taker_did ?? row.maker_did])) {
+        const spans = inEffect.get(did) ?? [];
+        spans.push(row.until_sweep);
+        inEffect.set(did, spans);
+      }
     }
-    expect([...appearances.values()].every((count) => count === 1)).toBe(true);
+    for (const [did, spans] of inEffect) {
+      const live = [...spans].sort((a, b) => a - b);
+      for (let i = 1; i < live.length; i += 1) {
+        expect(
+          live[i],
+          `${did.slice(14, 22)} held two trades that can settle at the same time`,
+        ).not.toBe(live[i - 1]);
+      }
+    }
     // The run is labelled as the bootstrap decision, not as a group profile:
     // "which decision asked for this trade" is answerable from the record.
     const versions = (
@@ -1742,6 +1775,95 @@ describe('the bootstrap strategy at the write path', () => {
     expect(runReasons(h)).toContain('late_start_flat:no_trade');
     expect(h.runtime.scheduler.status().lateStartSignal).toBe('flat');
   }, 240_000);
+
+  it('keeps trading after the participation fallback has covered the whole fleet', async () => {
+    harness = await buildLateStart({ trading: true, strategy: true });
+    const h = harness;
+    await waitForFirstPass(h);
+
+    // The production order, which the same-tick tests above never produce: a FLAT
+    // market first, so the bootstrap declines and the one-shot participation
+    // fallback is the only path that writes. It covers all 150 owners and then
+    // stops for good.
+    await primeAt(h, 1755, '229.80');
+    await primeAt(h, 1756, '229.80');
+    await h.runtime.scheduler.runTick();
+    await waitForRegistrations(h);
+    await h.runtime.scheduler.runTick();
+
+    expect(h.runtime.scheduler.status().lateStartSignal).toBe('flat');
+    expect(effectiveFrom(h, 'bootstrap')).toHaveLength(0);
+    expect(h.runtime.repositories.trades.participationCoverage()).toEqual({
+      posted: 75,
+      agentsCovered: 150,
+    });
+    // The fallback's own deadline: the band it priced from is the next sweep.
+    const participationUntil = new Set(
+      h.runtime.repositories.trades
+        .all()
+        .filter((row) => row.trade_source === 'participation')
+        .map((row) => row.until_sweep),
+    );
+    expect([...participationUntil]).toEqual([1757]);
+
+    const refusalsFor = (): number =>
+      rowsFrom(h, 'bootstrap').filter(
+        (row) => row.reason === 'bootstrap_trade_already_recorded',
+      ).length;
+    const refusedWhileFlat = refusalsFor();
+
+    // Now the market turns, *past* the fallback's own deadline. Every owner
+    // already owns a participation trade, so a guard that asks "has this agent
+    // ever traded" answers yes for all 150 and vetoes the only path left, forever
+    // — the production deadlock, 46,080 refusals and zero trades. A guard that
+    // asks "does this agent still hold something that can settle" answers no,
+    // because the signed terms themselves expired, and the strategy keeps working.
+    h.advance(5 * 60_000);
+    await primeAt(h, 1757, '232.00');
+    await primeAt(h, 1758, '232.40');
+    expect(h.runtime.scheduler.status().lateStartSignal).toBe('rising');
+
+    await h.runtime.scheduler.runTick();
+
+    const turned = effectiveFrom(h, 'bootstrap');
+    expect(turned.length).toBeGreaterThan(0);
+    expect(refusalsFor()).toBe(refusedWhileFlat);
+    const status = h.runtime.scheduler.status();
+    expect(status.strategyGateMode).toBe('late_start_bootstrap');
+    expect(status.lateStartStrategyTradingReady).toBe(true);
+    expect(status.bootstrapStrategyTradesPosted).toBe(turned.length);
+    // The fallback stays one-shot: the new bootstrap trades are the only rows the
+    // second write added, and they are not a second position on a covered owner.
+    expect(h.runtime.repositories.trades.participationCoverage()).toEqual({
+      posted: 75,
+      agentsCovered: 150,
+    });
+    for (const row of turned) {
+      expect(row.status).toBe('pending');
+      expect(row.side).toBe('buy');
+      expect(row.qty).toBe('0.1');
+    }
+
+    // And it keeps going. One sweep later the bootstrap trades of the previous
+    // sweep are past their own deadline (`until_sweep` 1759), so a further turn
+    // writes again rather than stopping after a single burst.
+    h.advance(5 * 60_000);
+    await primeAt(h, 1759, '228.00');
+    await primeAt(h, 1760, '227.60');
+    expect(h.runtime.scheduler.status().lateStartSignal).toBe('falling');
+    await h.runtime.scheduler.runTick();
+
+    const second = effectiveFrom(h, 'bootstrap').filter((row) => row.until_sweep === 1761);
+    expect(second.length).toBeGreaterThan(0);
+    for (const row of second) {
+      expect(row.side).toBe('sell');
+      expect(row.until_sweep).toBe(1761);
+    }
+    expect(h.runtime.repositories.trades.participationCoverage()).toEqual({
+      posted: 75,
+      agentsCovered: 150,
+    });
+  }, 300_000);
 
   it('declines when the band does not label the next sweep', async () => {
     harness = await buildLateStart({ trading: true, strategy: true });
@@ -1966,17 +2088,30 @@ describe('a resolved historical gap does not hold the bootstrap back', () => {
     expect(bootstrap.length).toBeGreaterThan(0);
     expect(status.bootstrapStrategyTradesPosted).toBe(bootstrap.length);
     expect(status.strategyTradesPosted).toBe(0);
-    // The bootstrap and the fallback together still cover the whole fleet, once
-    // each: the historical gap did not cost a single owner their trade.
+    // The bootstrap and the fallback together still cover the whole fleet: the
+    // historical gap did not cost a single owner their trade.
     expect(coveredAgents(h).size).toBe(150);
-    const appearances = new Map<string, number>();
+    // The invariant a position needs is "never two trades in effect at once".
+    // A lifetime count would instead forbid an agent from ever trading again once
+    // its own `until_sweep` has passed, which is the deadlock this pins against.
+    const inEffect = new Map<string, number[]>();
     for (const row of h.runtime.repositories.trades.all()) {
-      if (row.status !== 'pending' && row.status !== 'settled' && row.status !== 'void') continue;
-      const dids = new Set<string>([row.maker_did]);
-      if (row.taker_did !== null) dids.add(row.taker_did);
-      for (const did of dids) appearances.set(did, (appearances.get(did) ?? 0) + 1);
+      if (row.status !== 'pending' && row.status !== 'settled') continue;
+      for (const did of new Set([row.maker_did, row.taker_did ?? row.maker_did])) {
+        const spans = inEffect.get(did) ?? [];
+        spans.push(row.until_sweep);
+        inEffect.set(did, spans);
+      }
     }
-    expect([...appearances.values()].every((count) => count === 1)).toBe(true);
+    for (const [did, spans] of inEffect) {
+      const live = [...spans].sort((a, b) => a - b);
+      for (let i = 1; i < live.length; i += 1) {
+        expect(
+          live[i],
+          `${did.slice(14, 22)} held two trades that can settle at the same time`,
+        ).not.toBe(live[i - 1]);
+      }
+    }
     // The trade was refused by neither the historical audit nor the gate.
     expect(runReasons(h)).not.toContain('late_start_market_unusable:no_trade');
   }, 300_000);

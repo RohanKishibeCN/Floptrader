@@ -2645,11 +2645,24 @@ export class OrchestratorScheduler {
           result.refused += 1;
           continue;
         }
-        // One bootstrap trade per agent, ever, and never a second position on
-        // top of one that already exists. The ledger answers this rather than a
-        // counter, so a restart cannot double it and the participation fallback
-        // cannot add to it.
-        if (tradeSource === 'bootstrap' && this.repositories.trades.hasEffectiveTradeForDid(did)) {
+        // One live position per agent, ever, and never a second one on top of a
+        // trade that can still settle. The ledger answers this rather than a
+        // counter, so a restart cannot double it.
+        //
+        // The question is "does this agent hold something that can still settle
+        // in this sweep", not "has this agent ever traded". The second reading is
+        // what deadlocked production: the one-shot participation fallback covers
+        // all 150 owners as a maker or a taker and then stops, so asking whether
+        // any trade exists answered yes for every agent and refused every
+        // proposal the bootstrap path ever built — 46,080 refusals reading
+        // `bootstrap_trade_already_recorded` over 25 hours, and zero trades. A
+        // trade whose own `until_sweep` has passed cannot be a position, so it
+        // must not veto the next one; a participation trade is the requirement a
+        // late start is measured against, never a reason to refuse what follows.
+        if (
+          tradeSource === 'bootstrap' &&
+          this.repositories.trades.hasUnsettledTradeForAgent(agentId, did, snapshot.sweep)
+        ) {
           this.recordTrade(
             agentId,
             terms,

@@ -1572,6 +1572,10 @@ export class TradeRepository {
    * first two are participation, and a `void` is a trade the referee *saw* and
    * ruled on. `missed` and `refused` do not — neither ever reached the book, so
    * neither can stand in for the participation trade a late start owes an agent.
+   *
+   * This is the *coverage* question — "is this owner on the book at all" — and it
+   * is not a safe veto for a repeating write path. See
+   * `hasUnsettledTradeForAgent` for that one.
    */
   hasEffectiveTradeForDid(did: string): boolean {
     return (
@@ -1581,6 +1585,47 @@ export class TradeRepository {
             AND status IN ('pending','settled','void') LIMIT 1`,
         )
         .get(did, did) !== undefined
+    );
+  }
+
+  /**
+   * Whether an agent still holds a trade that can be settled, right now.
+   *
+   * This is the guard a repeating write path needs, and it is deliberately not
+   * `hasEffectiveTradeForDid`: "has this agent ever traded" becomes true for all
+   * 150 owners the moment the one-shot participation fallback covers the fleet,
+   * so using it as a veto refuses the strategy path for the rest of the contest.
+   * The rule a position actually needs is "may another trade be opened on top of
+   * what is still live", and that is answerable locally:
+   *
+   *   - `pending` is written-but-unruled and `settled` is a real position. `void`
+   *     never happened, so it is neither a position nor a block.
+   *   - `until_sweep` is the last sweep the trade may settle in, and the official
+   *     fold expires a trade only *after* that sweep (`n > until`, in
+   *     `packages/close-call/src/fold.ts`). So `until_sweep >= sweep` is exactly
+   *     "still in effect", and it is a property of the signed terms rather than
+   *     of any local clock or of the referee's flow.
+   *
+   * Two consequences matter. An agent can trade again sweep after sweep while a
+   * position is still open it may not, and it keeps working when the local ledger
+   * never learns a settlement: an id the referee ruled on and we never saw stops
+   * blocking as soon as its own deadline passes.
+   *
+   * Both sides are checked, and for a different reason than coverage is. A
+   * counterparty trade is written with the *maker's* `agent_id` and the taker's
+   * DID in `taker_did`, so an agent_id-only question leaves every taker-side owner
+   * unguarded — which is how an owner ends up holding a participation trade and a
+   * bootstrap trade that can settle in the same sweep. Coverage and position have
+   * to agree about who a row belongs to; they differ only on the deadline.
+   */
+  hasUnsettledTradeForAgent(agentId: string, did: string, sweep: number): boolean {
+    return (
+      this.db
+        .prepare(
+          `SELECT 1 FROM trades WHERE (agent_id = ? OR maker_did = ? OR taker_did = ?)
+            AND status IN ('pending','settled') AND until_sweep >= ? LIMIT 1`,
+        )
+        .get(agentId, did, did, sweep) !== undefined
     );
   }
 
