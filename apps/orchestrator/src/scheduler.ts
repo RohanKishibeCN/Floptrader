@@ -71,7 +71,7 @@ import {
   LATE_START_OBSERVATIONS_REQUIRED,
   asDecimals,
   fallbackParams,
-  lateStartSignal,
+  lateStartBootstrapSignal,
   type GatedAction,
   type LateStartSignal,
   type RunOutcome,
@@ -116,6 +116,16 @@ import type { UpstreamMonitor } from './upstream-monitor.js';
 
 /** A trade is only valid until this many sweeps from now, and never past lock. */
 export const DEFAULT_TRADE_HORIZON_SWEEPS = 24;
+/**
+ * How many sweeps a late start's offer stays answerable.
+ *
+ * The band's own `for` is one sweep ahead, and an offer that dies with it is
+ * alive for about one tick. Measured on the live book the offers that fill carry
+ * `until` six to eight sweeps out, so this is where ours sit too: long enough for
+ * a counterparty to answer, short enough that the price is still the price the
+ * band described.
+ */
+export const LATE_START_OFFER_HORIZON_SWEEPS = 6;
 
 /**
  * Status precedence. Higher wins, and a status is never replaced by a lower one.
@@ -2957,12 +2967,28 @@ export class OrchestratorScheduler {
   private buildTermsFor(did: string, action: GatedAction, snapshot: MarketSnapshot): TradeTerms | null {
     if (action.side === null || action.px === null || action.qty === null) return null;
     // A late start prices its trades from the band the referee published for one
-    // specific sweep, so `until` is that band's own `for`: the price we were
-    // bounded by is the price that holds for the trade's whole life. The local
-    // horizon is the strict mode's rule, and it is kept there.
+    // specific sweep, so `until` starts from that band's own `for` — the price we
+    // were bounded by is the price the trade was built from.
+    //
+    // It is not *only* that sweep, though, and the difference was measured on the
+    // live book: an offer whose deadline is the next sweep is alive for about one
+    // tick, while the offers that actually fill sit at `until` six to eight sweeps
+    // out. Ours were the shortest-lived thing on the book, so the fleet's own taker
+    // had a one-tick window to find them and mostly did not — `no_external_offers`
+    // run after run, with 457 strangers' offers visible at the same moment. The band
+    // still bounds the *price*; the deadline only decides how long a counterparty
+    // has to answer, so it gets a usable horizon.
+    //
+    // A longer deadline is never a licence to price outside the band: the referee
+    // re-checks the band at settlement, so a stale offer is voided for `limits`
+    // rather than settled.
+    const horizon =
+      this.config.lateStartArmed && snapshot.limitsForSweep !== null
+        ? snapshot.limitsForSweep + LATE_START_OFFER_HORIZON_SWEEPS - 1
+        : snapshot.sweep + DEFAULT_TRADE_HORIZON_SWEEPS;
     const until =
       this.config.lateStartArmed && snapshot.limitsUsable !== false && snapshot.limitsForSweep !== null
-        ? Math.min(snapshot.limitsForSweep, this.rules.lockSweep)
+        ? Math.min(horizon, this.rules.lockSweep)
         : Math.min(snapshot.sweep + DEFAULT_TRADE_HORIZON_SWEEPS, this.rules.lockSweep);
     if (until <= snapshot.sweep) return null;
     const px = action.px;
@@ -3605,14 +3631,13 @@ export class OrchestratorScheduler {
       ? 'late_start_bootstrap'
       : 'group';
     const observations = this.reader.snapshot().history;
-    const latestObservation = observations[observations.length - 1];
-    const previousObservation = observations[observations.length - 2];
+    // The direction the bootstrap decision runs on: the adjacent-sweep rule first,
+    // and a rolling window only when that rule is flat. See
+    // `lateStartBootstrapSignal` for why silence was the expensive answer.
     const lateStartSignalValue: LateStartSignal | 'insufficient' =
-      observations.length < LATE_START_OBSERVATIONS_REQUIRED ||
-      latestObservation === undefined ||
-      previousObservation === undefined
+      observations.length < LATE_START_OBSERVATIONS_REQUIRED
         ? 'insufficient'
-        : lateStartSignal(latestObservation, previousObservation, this.rules.priceStep);
+        : lateStartBootstrapSignal(observations, this.rules.priceStep);
     // The cursor audit, kept apart on purpose: `historicalGapTotal` is every gap
     // the process has ever recorded and never goes down, while
     // `activeUnresolvedGapRooms` is the *still losing* set, which is the only one

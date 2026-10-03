@@ -47,6 +47,7 @@ import {
   fallbackParams,
   gateDecision,
   lateStartBootstrapProposal,
+  lateStartBootstrapSignal,
   lateStartSignal,
   type StrategyContext,
 } from '@flop/strategy';
@@ -67,6 +68,7 @@ import {
   lockState,
   marketSnapshotReadiness,
 } from '../apps/orchestrator/src/readiness.js';
+import { LATE_START_OFFER_HORIZON_SWEEPS } from '../apps/orchestrator/src/scheduler.js';
 import { FakeTransport } from './support/fake-transport.js';
 import { tempDir, waitFor } from './support/harness.js';
 import {
@@ -1450,6 +1452,54 @@ const BOOTSTRAP_ARMED = { enabled: true, rules: BOOTSTRAP_RULES } as const;
 const BOOTSTRAP_OFF = { enabled: false, rules: BOOTSTRAP_RULES } as const;
 
 describe('the late-start bootstrap decision', () => {
+  it('reads a direction from the window when the last two closes are flat', () => {
+    const step = Decimal.from('0.01');
+    // A one-cent move is the dead band, so the adjacent rule says flat …
+    const flatPair = [Decimal.from('234.60'), Decimal.from('234.61')];
+    expect(lateStartBootstrapSignal(flatPair, step)).toBe('flat');
+    // … but a window that has moved several steps is a direction, and that is the
+    // difference between trading and going quiet while the market drifts.
+    const drifted = [
+      Decimal.from('234.44'),
+      Decimal.from('234.48'),
+      Decimal.from('234.52'),
+      Decimal.from('234.56'),
+      Decimal.from('234.58'),
+      Decimal.from('234.60'),
+      Decimal.from('234.61'),
+    ];
+    expect(lateStartBootstrapSignal(drifted, step)).toBe('rising');
+    const driftedDown = [
+      Decimal.from('234.72'),
+      Decimal.from('234.68'),
+      Decimal.from('234.64'),
+      Decimal.from('234.60'),
+      Decimal.from('234.58'),
+      Decimal.from('234.56'),
+      Decimal.from('234.55'),
+    ];
+    expect(lateStartBootstrapSignal(driftedDown, step)).toBe('falling');
+  });
+
+  it('still refuses a window that is only noise, and one with no window at all', () => {
+    const step = Decimal.from('0.01');
+    // One close cannot answer at all.
+    expect(lateStartBootstrapSignal([Decimal.from('234.60')], step)).toBe('insufficient');
+    expect(lateStartBootstrapSignal([], step)).toBe('insufficient');
+    // A window that has gone nowhere is still nothing, and the dead band is applied
+    // at the window's own scale (three steps), not at one step.
+    const noise = [
+      Decimal.from('234.60'),
+      Decimal.from('234.61'),
+      Decimal.from('234.62'),
+      Decimal.from('234.61'),
+      Decimal.from('234.62'),
+      Decimal.from('234.61'),
+      Decimal.from('234.62'),
+    ];
+    expect(lateStartBootstrapSignal(noise, step)).toBe('flat');
+  });
+
   it('declines while its own switch is off, and says so rather than staying silent', () => {
     const context = bootstrapContext();
     const proposal = lateStartBootstrapProposal(context, BOOTSTRAP_OFF);
@@ -2009,8 +2059,9 @@ describe('the bootstrap strategy at the write path', () => {
       expect(row.side).toBe('buy');
       // The rules' own minimum, not a sized position.
       expect(row.qty).toBe('0.1');
-      // `until` is the band's own `for`, never a local horizon.
-      expect(row.until_sweep).toBe(1759);
+      // `until` starts from the band's own `for` and covers a usable horizon,
+      // never a local guess (see LATE_START_OFFER_HORIZON_SWEEPS).
+      expect(row.until_sweep).toBe(1758 + LATE_START_OFFER_HORIZON_SWEEPS);
       // The external-offer group never takes the bootstrap decision.
       expect(groupByDid.get(row.maker_did)).not.toBe('external_offer_taker');
     }
@@ -2068,7 +2119,7 @@ describe('the bootstrap strategy at the write path', () => {
     for (const row of bootstrap) {
       expect(row.side).toBe('sell');
       expect(row.qty).toBe('0.1');
-      expect(row.until_sweep).toBe(1759);
+      expect(row.until_sweep).toBe(1758 + LATE_START_OFFER_HORIZON_SWEEPS);
     }
   }, 240_000);
 
@@ -2175,20 +2226,40 @@ describe('the bootstrap strategy at the write path', () => {
       expect(row.qty).toBe('0.1');
     }
 
-    // And it keeps going. One sweep later the bootstrap trades of the previous
-    // sweep are past their own deadline (`until_sweep` 1759), so a further turn
-    // writes again rather than stopping after a single burst.
+    // And it keeps going, but only once the previous offers can no longer settle:
+    // an agent that still holds a live offer is not given a second one. That is the
+    // horizon doing its job — with `LATE_START_OFFER_HORIZON_SWEEPS` the fleet
+    // trades every few sweeps instead of every sweep, and never carries two open
+    // positions.
+    const liveUntil = turned[0]!.until_sweep;
+    expect(liveUntil).toBe(1758 + LATE_START_OFFER_HORIZON_SWEEPS);
     h.advance(5 * 60_000);
-    await primeAt(h, 1759, '228.00');
-    await primeAt(h, 1760, '227.60');
+    await primeAt(h, liveUntil, '228.00');
+    await primeAt(h, liveUntil + 1, '227.60');
     expect(h.runtime.scheduler.status().lateStartSignal).toBe('falling');
     await h.runtime.scheduler.runTick();
+    // No agent that already holds a live offer is given another one. (Other agents
+    // *can* still join: theirs may have been a participation trade that has since
+    // expired, which is the release the fix is about.)
+    const held = new Map<string, number>();
+    for (const row of h.runtime.repositories.trades.all()) {
+      if (row.status !== 'pending' && row.status !== 'settled') continue;
+      if (row.until_sweep < h.runtime.reader.snapshot().sweep) continue;
+      for (const did of new Set([row.maker_did, row.taker_did ?? row.maker_did])) {
+        held.set(did, (held.get(did) ?? 0) + 1);
+      }
+    }
+    expect([...held.values()].every((count) => count === 1)).toBe(true);
 
-    const second = effectiveFrom(h, 'bootstrap').filter((row) => row.until_sweep === 1761);
+    // One sweep past the deadline the fleet writes again, on the other side.
+    h.advance(5 * 60_000);
+    await primeAt(h, liveUntil + 1, '227.60');
+    await primeAt(h, liveUntil + 2, '227.20');
+    await h.runtime.scheduler.runTick();
+    const second = effectiveFrom(h, 'bootstrap').filter((row) => row.until_sweep > liveUntil);
     expect(second.length).toBeGreaterThan(0);
     for (const row of second) {
       expect(row.side).toBe('sell');
-      expect(row.until_sweep).toBe(1761);
     }
     expect(h.runtime.repositories.trades.participationCoverage()).toEqual({
       posted: 75,
