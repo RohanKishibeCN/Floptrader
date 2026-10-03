@@ -28,9 +28,12 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   DEFAULT_RISK_CAPS,
   Decimal,
+  buildTerms,
+  buildTradeMessage,
   emptySnapshot,
   parseTradeMessage,
   referenceRules,
+  signTermsAsMaker,
   verifyMakerSignature,
   verifyTakerSignature,
   withinPublishedLimits,
@@ -50,6 +53,7 @@ import {
 import {
   LATE_START_CONFIRM_VALUE,
   LATE_START_STRATEGY_CONFIRM_VALUE,
+  LOCAL_MATCH_CONFIRM_VALUE,
   loadConfig,
   type Config,
 } from '../apps/orchestrator/src/config.js';
@@ -1625,6 +1629,193 @@ function coveredAgents(h: Harness): Set<string> {
   }
   return covered;
 }
+
+// ---------------------------------------------------------------------------
+// In-fleet matching: giving our own open offers a counterparty
+// ---------------------------------------------------------------------------
+
+/**
+ * Post an open `taker:"any"` offer signed by one of *our* owners.
+ *
+ * `copyRunnerBootstrapOffer` does exactly this in production, so the fixture is
+ * the same shape: a real maker signature over the terms, no countersignature,
+ * and the wire envelope's `taker` field present but irrelevant — the offer is
+ * open because `terms.taker` is `any` and `taker_sig` is empty.
+ */
+let offerNonce = 1000;
+function postOurOpenOffer(h: Harness, agentId: string, overrides: { side?: 'buy' | 'sell'; px: string; qty?: string; id: string; until: number }): void {
+  const did = h.runtime.keyStore.did(agentId);
+  const terms = buildTerms({
+    id: overrides.id,
+    maker: did,
+    side: overrides.side ?? 'sell',
+    qty: overrides.qty ?? '0.1',
+    px: overrides.px,
+    until: overrides.until,
+    taker: 'any',
+  });
+  const makerSig = h.runtime.keyStore.withSeed(agentId, (seed) => signTermsAsMaker(terms, seed));
+  const text = buildTradeMessage({ terms, taker: did, makerSig, takerSig: '' });
+  // The envelope is signed with the maker's own key, exactly as the writer does
+  // it; the nonce only has to be a valid one and unique per key.
+  offerNonce += 1;
+  h.runtime.keyStore.withSeed(agentId, (seed) => {
+    h.transport.room('close1').appendFrom(text, { seed, did, nonce: String(offerNonce) });
+  });
+}
+
+describe('in-fleet matching gives our own open offers a counterparty', () => {
+  let harness: Harness | null = null;
+
+  afterEach(async () => {
+    if (harness) await harness.dispose();
+    harness = null;
+  });
+
+  it('is off unless the switch, its literal and a late start all agree', async () => {
+    // The switch alone changes nothing.
+    expect(
+      armLateStart({ EXTERNAL_OFFER_TAKER_LOCAL_MATCH: 'true' }).localOfferMatchingEnabled,
+    ).toBe(false);
+
+    // The switch and the literal, but no late start, is still nothing.
+    expect(
+      loadConfig({
+        ...LIVE_PINS,
+        FLOP_ALLOW_REGISTRATION: 'true',
+        EXTERNAL_OFFER_TAKER_LOCAL_MATCH: 'true',
+        LOCAL_MATCH_CONFIRM: LOCAL_MATCH_CONFIRM_VALUE,
+      }).localOfferMatchingEnabled,
+    ).toBe(false);
+
+    // The switch and a late start, but the wrong literal, is still nothing.
+    expect(
+      armLateStart({
+        LATE_START_MODE: 'true',
+        LATE_START_CONFIRM: LATE_START_CONFIRM_VALUE,
+        EXTERNAL_OFFER_TAKER_LOCAL_MATCH: 'true',
+        LOCAL_MATCH_CONFIRM: 'not-the-literal',
+      }).localOfferMatchingEnabled,
+    ).toBe(false);
+
+    // All three, and only then, does the lane exist. It stays a `close1`-only
+    // lane: it must never widen the room scope the stranger lane waits on.
+    harness = await buildLateStart({
+      trading: true,
+      strategy: true,
+      env: { EXTERNAL_OFFER_TAKER_LOCAL_MATCH: 'true', LOCAL_MATCH_CONFIRM: LOCAL_MATCH_CONFIRM_VALUE },
+    });
+    expect(harness.config.localOfferMatchingEnabled).toBe(true);
+    expect(harness.config.externalOfferTakerEnabled).toBe(false);
+    expect(harness.runtime.reader.roomScope).toBe('close1_only');
+  }, 120_000);
+
+  it('surfaces our own offer to the taker group and refuses every stranger', async () => {
+    harness = await buildLateStart({
+      trading: true,
+      strategy: true,
+      env: { EXTERNAL_OFFER_TAKER_LOCAL_MATCH: 'true', LOCAL_MATCH_CONFIRM: LOCAL_MATCH_CONFIRM_VALUE },
+    });
+    const h = harness;
+    await waitForFirstPass(h);
+    await primeAt(h, 1757, '229.80');
+    await primeAt(h, 1758, '230.00');
+
+    const makerAgent = [...h.runtime.keyStore.agentIds].sort()[0]!;
+    postOurOpenOffer(h, makerAgent, { id: 'our-offer-1', px: '232.00', until: 1759 });
+    // A stranger's offer, structurally identical but made by a DID we do not own.
+    const strangerSeed = new Uint8Array(32).fill(0x7a);
+    const strangerDid = didFromSeed(strangerSeed);
+    const strangerTerms = buildTerms({
+      id: 'stranger-offer-1',
+      maker: strangerDid,
+      side: 'sell',
+      qty: '0.1',
+      px: '232.00',
+      until: 1759,
+      taker: 'any',
+    });
+    h.transport.room('close1').appendFrom(
+      buildTradeMessage({
+        terms: strangerTerms,
+        taker: strangerDid,
+        makerSig: signTermsAsMaker(strangerTerms, strangerSeed),
+        takerSig: '',
+      }),
+      { seed: strangerSeed, did: strangerDid, nonce: '9001' },
+    );
+    await h.runtime.reader.tick();
+
+    // The stranger lane is off in `lite`; the fleet lane is what is on, and it
+    // sees exactly one offer — ours. `includeLocal` is not "allow local DIDs",
+    // it is "this lane is ours", so the stranger must not come with it.
+    const offers = h.runtime.reader.externalOffers({ includeLocal: true });
+    expect(offers).toHaveLength(1);
+    expect(offers[0]!.terms.id).toBe('our-offer-1');
+    expect(offers[0]!.localMaker).toBe(true);
+    // Without the lane asked for, the same reader surfaces nothing at all.
+    expect(h.runtime.reader.externalOffers()).toEqual([]);
+  }, 180_000);
+
+  it('accepts a fleet offer, so the maker offer becomes a countersigned trade', async () => {
+    harness = await buildLateStart({
+      trading: true,
+      strategy: true,
+      env: { EXTERNAL_OFFER_TAKER_LOCAL_MATCH: 'true', LOCAL_MATCH_CONFIRM: LOCAL_MATCH_CONFIRM_VALUE },
+    });
+    const h = harness;
+    await waitForFirstPass(h);
+    // A flat market: the bootstrap proposes nothing, so the only trade that can
+    // appear in this tick is an acceptance.
+    await primeAt(h, 1757, '232.00');
+    await primeAt(h, 1758, '232.00');
+    await h.runtime.scheduler.runTick();
+    await waitForRegistrations(h);
+
+    // The referee confirms the mints, which is what funds the taker's account.
+    // In production this is the flow post for the sweep our registrations landed
+    // in; `validateExternalOffer` refuses an unfunded taker, and that refusal is
+    // correct — a taker with no collateral would have the trade voided for funds.
+    // A room message is capped at 4096 characters, so the mints are announced in
+    // batches the way the live referee's own posts are trimmed.
+    const ourDids = [...h.runtime.keyStore.agentIds]
+      .sort()
+      .map((id) => h.runtime.keyStore.did(id));
+    for (let i = 0; i < ourDids.length; i += 40) {
+      h.referee.flow(1758, ourDids.slice(i, i + 40));
+    }
+    await h.runtime.scheduler.runTick();
+
+    // A sell offer from one of our owners *below* the reference: that is the side
+    // a taker profits on, 1.31% against the 0.4% it requires. (The same offer
+    // above the reference is a loss and must be refused — pinned in
+    // `strategy-groups.test.ts`.)
+    const makerAgent = [...h.runtime.keyStore.agentIds].sort()[0]!;
+    const makerDid = h.runtime.keyStore.did(makerAgent);
+    postOurOpenOffer(h, makerAgent, { id: 'our-offer-accept', px: '229.00', until: 1759, side: 'sell' });
+    await h.runtime.reader.tick();
+
+    await h.runtime.scheduler.runTick();
+
+    const accepted = h.runtime.repositories.trades
+      .all()
+      .filter((row) => row.id === 'our-offer-accept' && row.taker_sig !== null);
+    expect(accepted.length).toBeGreaterThan(0);
+    const row = accepted[0]!;
+    // The maker is ours, the taker is a different owner of ours, and the record
+    // carries the countersignature that makes it settleable.
+    expect(row.maker_did).toBe(makerDid);
+    expect(row.taker_did).not.toBe(makerDid);
+    expect(row.taker_did).not.toBeNull();
+    expect(row.taker_sig).not.toBeNull();
+    expect(h.runtime.keyStore.didSet().has(row.taker_did!)).toBe(true);
+    expect(row.status).toBe('pending');
+    // The acceptance is a strategy decision by the taker group, not a bootstrap.
+    expect(row.trade_source).toBe('strategy');
+    // And the reader did not refuse it as an internal pairing.
+    expect(row.reason).toBeNull();
+  }, 300_000);
+});
 
 describe('the bootstrap strategy at the write path', () => {
   let harness: Harness | null = null;

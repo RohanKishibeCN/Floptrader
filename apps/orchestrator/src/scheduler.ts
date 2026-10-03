@@ -2256,11 +2256,22 @@ export class OrchestratorScheduler {
    */
   private runAgentSlices(): { outcomes: RunOutcome[]; failures: Array<{ agentId: string; error: string }> } {
     const snapshot = this.reader.snapshot();
-    // A late start does not take strangers' offers. Counting on an unknown
+    // A late start does not take *strangers'* offers. Counting on an unknown
     // counterparty's collateral is the one risk this mode has no way to bound —
     // it cannot see the history that would tell it whether the maker is funded —
-    // so the only offers an agent answers are the ones the fleet drives itself.
-    const offers = this.config.lateStartArmed ? [] : this.reader.externalOffers();
+    // so the only offers an agent answers are the ones this fleet made itself.
+    //
+    // Reading them is what keeps the fleet's own maker offers from being no-ops.
+    // The bootstrap path writes open `taker:"any"` offers and in a late start it
+    // is the only path that writes at all; an offer nobody countersigns is
+    // expired by the referee and scores nothing. Measured on the live book, an
+    // unattended open offer settled ~17% of the time while a named counterparty
+    // settled >80%, and the operators settling their own offers at 100% were
+    // matching inside their own fleet. `includeLocal` is that counterparty: the
+    // reader offers only DIDs this process owns, and every stranger stays refused.
+    const offers = this.config.lateStartArmed
+      ? this.reader.externalOffers({ includeLocal: true })
+      : this.reader.externalOffers();
     const perGroup = Math.max(1, this.config.scheduling.agentsPerTick);
     const inputs = STRATEGY_GROUPS.flatMap((group) => {
       const agents = this.repositories.identities
@@ -2810,9 +2821,16 @@ export class OrchestratorScheduler {
     if (action.intent === 'ACCEPT_EXTERNAL') {
       const offer = action.offer;
       if (!offer) return { ok: false, reason: 'no_offer', terms: null };
-      // Refuse anything pairings our own keys, whatever the reader proposed.
+      // Never trade with ourselves: an agent cannot take its own offer, whichever
+      // lane proposed it.
       if (offer.terms.maker === did) return { ok: false, reason: 'self_trade', terms: offer.terms };
-      if (this.keyStore.didSet().has(offer.terms.maker)) {
+      // A maker that is one of our DIDs is refused — unless this is the
+      // deliberate in-fleet pairing, where the reader marked the offer as our own
+      // *and* it belongs to a different agent of ours. That is a real trade
+      // between two funded owners we hold, and it is what gives our open maker
+      // offers a counterparty instead of letting the referee expire them.
+      const localMaker = this.keyStore.didSet().has(offer.terms.maker);
+      if (localMaker && offer.localMaker !== true) {
         return { ok: false, reason: 'local_did', terms: offer.terms };
       }
       const verdict = validateExternalOffer(
@@ -2834,7 +2852,20 @@ export class OrchestratorScheduler {
           // instead of pricing it at the reference and understating it on exactly
           // the move that matters. A void trade is strictly worse than a refusal.
           close: null,
-          localDids: this.keyStore.didSet(),
+          // The validator's own view of "ours". It refuses an offer whose maker is
+          // local, and a second refusal for both sides being ours — the same
+          // policy as the two checks above, and it has to be relaxed in exactly
+          // the same case: the reader told us this is the deliberate in-fleet
+          // pairing, so the maker being ours is the mechanism, not a mistake.
+          // Every other lane passes the real set and keeps both refusals.
+          localDids: offer.localMaker === true ? new Set<string>() : this.keyStore.didSet(),
+          // The in-fleet lane is the one case where both sides being ours is the
+          // point rather than a mistake. It is not a value-transfer question: the
+          // contest scores each owner on its own mark-to-market, so pairing two of
+          // our owners gives the taker a real directional position, and the two
+          // fees are the ordinary cost of taking one. Every other lane keeps the
+          // refusal exactly as it was.
+          refuseLocalPairing: offer.localMaker !== true,
           settledIds: new Set(this.repositories.trades.settledIds()),
           accounts: new Map(this.riskBook),
           conservative: snapshot.degraded,

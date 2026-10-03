@@ -134,6 +134,18 @@ export interface ReaderOptions {
    * the dynamic room read has not been validated against a real staging run.
    */
   externalOfferTakerEnabled?: boolean;
+  /**
+   * Whether the taker group may take offers made by a DID this process owns.
+   *
+   * Late start only, off by default, and independent of
+   * `externalOfferTakerEnabled`: this lane never sees a stranger's offer and
+   * never reads a discovered room, so the staging gate the stranger lane waits on
+   * does not apply to it. It exists because a maker offer nobody takes is not a
+   * trade — the bootstrap path's open `taker:"any"` offers settle only when a
+   * counterparty countersigns, and in-fleet matching is what makes that
+   * counterparty ours.
+   */
+  localOfferMatchingEnabled?: boolean;
   /** Live mode tightens the `applied`/`for` boundaries in the verifier. */
   live?: boolean;
   /**
@@ -428,6 +440,8 @@ export class OrchestratorReader {
   private readonly logger: Logger;
   private readonly maxDiscoveredRooms: number | null;
   private readonly externalOfferTakerEnabled: boolean;
+  /** True when the taker group may match offers inside our own fleet. */
+  private readonly localOfferMatchingEnabled: boolean;
   /** Set once `hydrateFromSnapshots()` has replayed the stored referee history. */
   private hydrated = false;
   /**
@@ -460,6 +474,7 @@ export class OrchestratorReader {
     this.logger = options.logger;
     this.maxDiscoveredRooms = options.maxDiscoveredRooms ?? null;
     this.externalOfferTakerEnabled = options.externalOfferTakerEnabled === true;
+    this.localOfferMatchingEnabled = options.localOfferMatchingEnabled === true;
     this.fixedRooms = roomsFor(options.rules);
 
     const requirePin = options.requireRefereePin === true;
@@ -891,21 +906,37 @@ export class OrchestratorReader {
   }
 
   /**
-   * Open offers posted by other owners in `close1`.
+   * Open offers this reader is willing to act on, from `close1`.
    *
    * This is a *candidate* filter, deliberately not the full acceptance check:
    * it confirms the offer is structurally an open one (`taker:"any"`, no taker
-   * signature), that the maker signature verifies, that the maker is not one of
-   * our own DIDs, and that the price and clock are still plausible. Funds and
-   * caps are checked at accept time, when the accepting agent's own account is
-   * in hand.
+   * signature), that the maker signature verifies, that the maker is acceptable
+   * for the lane being run, and that the price and clock are still plausible.
+   * Funds and caps are checked at accept time, when the accepting agent's own
+   * account is in hand.
    *
-   * Empty unless the external-offer taker is enabled: taking a stranger's offer
-   * found in a discovered room is exactly what the unvalidated dynamic-room read
-   * must not yet permit.
+   * Two lanes share this one filter, and they are not the same trade:
+   *
+   *   - **strangers** (`EXTERNAL_OFFER_TAKER_ENABLED`, `full` profile only). Off
+   *     by default because the dynamic-room read that would find those offers has
+   *     not passed a real staging run. A stranger's offer is refused unless that
+   *     lane is on.
+   *   - **our own fleet** (`EXTERNAL_OFFER_TAKER_LOCAL_MATCH`, late start only).
+   *     The bootstrap path writes open `taker:"any"` offers, and in a late start
+   *     it is the only path that writes at all — but a maker offer nobody takes is
+   *     not a trade: the referee expires it, and it scores nothing. Measured on
+   *     the live book, an unattended open offer settles about 17% of the time
+   *     while a named counterparty settles over 80%, and the operators filling
+   *     their own offers at 100% are matching inside their own fleet. This lane is
+   *     that: it restricts the taker group to offers made by a DID this process
+   *     owns, so mated pairs are both ours and the risk is bounded by keys we
+   *     hold. It reads `close1` alone — a fixed room the reader already owns — so
+   *     it needs none of the dynamic-room coverage the stranger lane waits on,
+   *     and it never claims a wider room scope.
    */
-  externalOffers(): ExternalOffer[] {
-    if (!this.externalOfferTakerEnabled) return [];
+  externalOffers(options: { includeLocal?: boolean } = {}): ExternalOffer[] {
+    const includeLocal = options.includeLocal === true && this.localOfferMatchingEnabled;
+    if (!this.externalOfferTakerEnabled && !includeLocal) return [];
     const local = this.localDids();
     const snapshot = this.snapshot();
     const room = this.rules.tradingRoom || TRADING_ROOM;
@@ -919,10 +950,22 @@ export class OrchestratorReader {
       // Only an open offer: `taker:"any"` and no countersignature yet.
       if (terms.taker !== 'any') continue;
       if (parsed.taker_sig.length > 0) continue;
-      // Only strangers. A trade between two of our own DIDs pays two fees and
-      // moves nothing between owners.
-      if (local.has(terms.maker)) continue;
-      if (local.has(parsed.taker)) continue;
+      // Who may be the maker. A stranger is refused unless the stranger lane is
+      // on; one of ours is refused unless the fleet-matching lane is on. A trade
+      // between two of our own DIDs pays two fees and moves nothing between
+      // owners, which is why the ordinary answer is "refuse" — the exception is
+      // the deliberate, measured one described above.
+      const localMaker = local.has(terms.maker);
+      if (localMaker && !includeLocal) continue;
+      if (!localMaker && !this.externalOfferTakerEnabled) continue;
+      // The envelope's `taker` field is the *sender's* DID, not a taker. For an
+      // open offer the sender is the maker, so `taker === maker` is the ordinary
+      // shape — on the live book 920 of 1535 open offers in one sweep looked
+      // exactly like that, including the operators settling their own offers at
+      // 100%. Refusing it would hide the whole book. Any *other* local DID in
+      // that field is not a placeholder but an offer addressed to one of ours,
+      // and that is still refused.
+      if (local.has(parsed.taker) && parsed.taker !== terms.maker) continue;
       if (!verifyMakerSignature(terms, parsed.maker_sig)) continue;
       const px = Decimal.from(terms.px);
       if (snapshot.nextLimits !== null) {
@@ -938,6 +981,7 @@ export class OrchestratorReader {
         room: row.room,
         seq: row.seq,
         observedAt: row.ingested_at,
+        ...(localMaker ? { localMaker: true } : {}),
       });
     }
     // Newest first: a stale offer is the one most likely to be refused for

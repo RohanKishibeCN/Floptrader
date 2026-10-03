@@ -418,6 +418,27 @@ export const EnvSchema = z.object({
    */
   EXTERNAL_OFFER_TAKER_ENABLED: boolish.default(false),
   /**
+   * Whether the taker group may take open offers made by our *own* DIDs.
+   *
+   * Off by default, late-start only, and deliberately separate from
+   * `EXTERNAL_OFFER_TAKER_ENABLED`: this lane reads `close1` — a fixed room the
+   * reader already owns — and refuses every stranger, so it needs none of the
+   * dynamic-room staging the stranger lane waits on and never widens the claimed
+   * room scope.
+   *
+   * It exists because a maker offer nobody takes is not a trade. The bootstrap
+   * path writes open `taker:"any"` offers and in a late start it is the only path
+   * that writes at all; measured on the live book an unattended open offer settles
+   * about 17% of the time and is otherwise expired, while the operators filling
+   * their own offers at 100% are matching inside their own fleet. Turning it on is
+   * the operator saying "let our 150 owners trade with each other" — allowed by
+   * the contest (`identity_policy: any did:key`, one operator may run many keys)
+   * and bounded by keys we already hold.
+   */
+  EXTERNAL_OFFER_TAKER_LOCAL_MATCH: boolish.default(false),
+  /** Must equal this literal for the local-match lane to arm. */
+  LOCAL_MATCH_CONFIRM: z.string().default(''),
+  /**
    * Whether the language model may review strategy parameters at all.
    *
    * Off by default: every strategy has a deterministic fallback, and the trade
@@ -637,6 +658,15 @@ export interface Config {
    * nor accepts offers from them; the report says `room_scope=close1_only`.
    */
   externalOfferTakerEnabled: boolean;
+  /**
+   * Whether the taker group may take offers made by a DID this process owns.
+   *
+   * A different lane from `externalOfferTakerEnabled` in both reach and reason:
+   * it reads `close1` only, refuses every stranger, and never widens the claimed
+   * room scope. It is what turns the bootstrap path's open maker offers into
+   * settled trades, by supplying a counterparty we already hold.
+   */
+  localOfferMatchingEnabled: boolean;
   archive: {
     baseUrl: string;
     checkIntervalMinutes: number;
@@ -692,6 +722,14 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 export const LATE_START_CONFIRM_VALUE = 'close-1-late-start';
 /** The exact string `LATE_START_STRATEGY_CONFIRM` must equal for it to arm. */
 export const LATE_START_STRATEGY_CONFIRM_VALUE = 'close-1-strategy';
+/**
+ * The exact string `LOCAL_MATCH_CONFIRM` must equal for in-fleet matching to arm.
+ *
+ * A separate literal again, on purpose: "let our own owners take each other's
+ * offers" changes who our counterparties are, and it should never arrive by a
+ * variable being left set from another experiment.
+ */
+export const LOCAL_MATCH_CONFIRM_VALUE = 'close-1-local-match';
 /** Only one sweep of freshness is promised; two is the widest tolerated gap. */
 export const LATE_START_MAX_STALE_SWEEPS = 2;
 
@@ -728,6 +766,27 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     raw.EXTERNAL_OFFER_TAKER_ENABLED,
     'lite: dynamic rooms are not read',
   );
+  /**
+   * The in-fleet matching lane, resolved.
+   *
+   * Not routed through `forceOff`: that helper exists for lanes the `lite`
+   * profile cannot support, and this one is not one of them — it reads `close1`,
+   * which lite reads continuously, and it refuses every stranger, so the reason
+   * lite turns the stranger lane off does not apply. It still requires three
+   * separate decisions: the switch, its confirmation literal, and a late start
+   * (because a seeded start can use the profiles, and matching inside the fleet
+   * is the *substitute* for the history a late start does not have).
+   */
+  const localOfferMatchingEnabled =
+    raw.EXTERNAL_OFFER_TAKER_LOCAL_MATCH &&
+    raw.LOCAL_MATCH_CONFIRM === LOCAL_MATCH_CONFIRM_VALUE &&
+    raw.LATE_START_MODE &&
+    raw.LATE_START_CONFIRM === LATE_START_CONFIRM_VALUE;
+  if (raw.EXTERNAL_OFFER_TAKER_LOCAL_MATCH && !localOfferMatchingEnabled) {
+    profileOverrides.push(
+      'EXTERNAL_OFFER_TAKER_LOCAL_MATCH (needs LOCAL_MATCH_CONFIRM, LATE_START_MODE and LATE_START_CONFIRM)',
+    );
+  }
   // Only an *explicitly requested* discovery cap is worth reporting: the schema's
   // own default is not an operator decision, so it is not announced as overridden.
   const askedForRooms = env.MAX_DISCOVERED_ROOMS !== undefined && env.MAX_DISCOVERED_ROOMS !== '';
@@ -1040,6 +1099,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       dynamicReadConcurrency: Math.max(1, raw.DYNAMIC_ROOM_READ_CONCURRENCY),
     },
     externalOfferTakerEnabled,
+    localOfferMatchingEnabled,
     archive: {
       baseUrl: raw.CHALLENGE_ARCHIVE_BASE_URL.replace(/\/+$/, ''),
       checkIntervalMinutes: raw.ARCHIVE_CHECK_INTERVAL_MINUTES,

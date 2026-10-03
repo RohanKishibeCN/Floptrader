@@ -152,27 +152,40 @@ describe('deterministic evaluation', () => {
     }
   });
 
-  it('only proposes accepting an offer when the maker is external', () => {
-    const terms = {
-      id: 'trade-1',
-      maker: 'did:key:z6Mk' + 'A'.repeat(44),
-      px: '225.10',
-      qty: '1.00',
-      side: 'buy' as const,
-      taker: 'any' as const,
-      until: 950,
-    };
-    const withOffer = evaluateGroup(
-      'external_offer_taker',
-      contextFor('external_offer_taker', {
-        externalOffers: [{ terms, makerSig: 'sig', room: 'close1', seq: 1, observedAt: 'now' }],
-      }),
-    );
+  it('takes the offer on the favourable side of the reference, and only that one', () => {
+    const offer = (side: 'buy' | 'sell', px: string) => ({
+      terms: {
+        id: `trade-${side}-${px}`,
+        maker: 'did:key:z6Mk' + 'A'.repeat(44),
+        px,
+        qty: '1.00',
+        side,
+        taker: 'any' as const,
+        until: 950,
+      },
+      makerSig: 'sig',
+      room: 'close1',
+      seq: 1,
+      observedAt: 'now',
+    });
+    const evaluate = (offers: ReturnType<typeof offer>[]) =>
+      evaluateGroup(
+        'external_offer_taker',
+        contextFor('external_offer_taker', { externalOffers: offers }),
+      );
+
+    // The reference is 225.10. A maker buying at 228.00 leaves us +1.29%, and a
+    // maker selling at 222.00 leaves us +1.38%. Both are worth taking.
+    expect(evaluate([offer('buy', '228.00')]).intent).toBe('ACCEPT_EXTERNAL');
+    expect(evaluate([offer('sell', '222.00')]).intent).toBe('ACCEPT_EXTERNAL');
+    // The same two offers on the wrong side of the reference are losses and must
+    // be refused. This is the direction a denominator of `px` instead of the
+    // reference inverts, which would make the group take *only* these.
+    expect(evaluate([offer('buy', '222.00')]).intent).toBe('NO_TRADE');
+    expect(evaluate([offer('sell', '228.00')]).intent).toBe('NO_TRADE');
     // The reader filters local DIDs out before the strategy ever sees an offer,
     // so with an empty list the group must decline rather than invent one.
-    expect(withOffer.intent === 'ACCEPT_EXTERNAL' || withOffer.intent === 'NO_TRADE').toBe(true);
-    const without = evaluateGroup('external_offer_taker', contextFor('external_offer_taker'));
-    expect(without.intent).toBe('NO_TRADE');
+    expect(evaluate([]).intent).toBe('NO_TRADE');
   });
 });
 

@@ -599,6 +599,7 @@ export async function createRuntime(
     maxDiscoveredRooms: config.roomDiscovery.maxRooms,
     dynamicReadConcurrency: config.roomDiscovery.dynamicReadConcurrency,
     externalOfferTakerEnabled: config.externalOfferTakerEnabled,
+    localOfferMatchingEnabled: config.localOfferMatchingEnabled,
     live: config.mode === 'live',
     // The seedless participation mode. It does not relax the pin: the referee DID
     // and the package hash must still both be fixed at launch, and every post is

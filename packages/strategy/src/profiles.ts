@@ -34,6 +34,29 @@ function fraction(value: Decimal): Decimal {
   return value;
 }
 
+/**
+ * How much better than the market an offer is, from the taker's point of view.
+ *
+ * Positive means taking it is profitable at the reference price:
+ *
+ *   - a maker **sells** to us, so we buy at `px`, and the edge is
+ *     `(reference - px) / reference` — positive when `px` is below the market;
+ *   - a maker **buys** from us, so we sell at `px`, and the edge is
+ *     `(px - reference) / reference` — positive when `px` is above it.
+ *
+ * The reference is always the denominator, because the edge is measured against
+ * the market and not against the offer. Dividing by `px` instead is not a
+ * rounding difference: it inverts the sign, so the group would take only the
+ * offers that lose money. That is why this is a named function with the two
+ * cases spelled out rather than a ternary whose arguments are easy to swap.
+ */
+function edgeOverReference(makerSide: 'buy' | 'sell', px: Decimal, reference: Decimal): Decimal {
+  // Maker sells to us: we buy at `px`, so anything below the market is edge.
+  if (makerSide === 'sell') return reference.sub(px).div(reference);
+  // Maker buys from us: we sell at `px`, so anything above the market is edge.
+  return px.sub(reference).div(reference);
+}
+
 /** Number of history points needed before a profile will act at all. */
 function enoughHistory(context: StrategyContext, needed: number): boolean {
   return context.market.history.length >= needed;
@@ -320,7 +343,13 @@ export const externalOfferTaker: StrategyProfile = {
       if (qty.lt(minQty) || qty.gt(maxQty)) continue;
       // Maker sells to us: we want px below the reference. Maker buys from us: we
       // want px above it. Either way the edge is signed in our favour.
-      const edge = offer.terms.side === 'sell' ? pctChange(px, reference) : pctChange(reference, px);
+      //
+      // The *reference* is the base, because the edge is measured against the
+      // market rather than against the offer. `pctChange(from, to)` is
+      // `(to - from) / from`, so `pctChange(px, reference)` would divide by the
+      // offer price and give `(reference - px) / px` — negative for exactly the
+      // offers worth taking and positive for the ones that lose money.
+      const edge = edgeOverReference(offer.terms.side, px, reference);
       if (edge.lt(minEdge)) continue;
       if (best === null || edge.gt(best.edge)) best = { offer, edge, qty };
     }

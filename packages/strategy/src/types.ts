@@ -18,8 +18,8 @@ export const STRATEGY_GROUP_NAMES: readonly StrategyGroupName[] = STRATEGY_GROUP
 
 /**
  * An open offer read from the trading room: `taker:"any"` with a valid maker
- * signature. Only `external_offer_taker` consumes these, and only when the maker
- * is not one of our own DIDs.
+ * signature. `external_offer_taker` consumes these, and the maker is normally
+ * required not to be one of our own DIDs.
  */
 export interface ExternalOffer {
   terms: TradeTerms;
@@ -28,6 +28,15 @@ export interface ExternalOffer {
   seq: number;
   /** When the reader saw it, for the audit trail. */
   observedAt: string;
+  /**
+   * True when the maker is a DID this process owns.
+   *
+   * Set by the reader from its own key set, never by a message, so an offer
+   * cannot claim it. The accept path uses it to tell the one deliberate in-fleet
+   * pairing from the ordinary case, where an offer naming one of our own DIDs is
+   * refused outright.
+   */
+  localMaker?: boolean;
 }
 
 /** Everything a strategy is allowed to look at. */
