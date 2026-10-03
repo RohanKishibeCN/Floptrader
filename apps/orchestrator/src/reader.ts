@@ -940,7 +940,10 @@ export class OrchestratorReader {
     const local = this.localDids();
     const snapshot = this.snapshot();
     const room = this.rules.tradingRoom || TRADING_ROOM;
-    const rows = this.repositories.messages.byKind(room, 'trade');
+    // A *lookup*, not a scan: the newest trade rows, whichever end of a
+    // multi-million-row room they happen to be at. `byKind` would return the
+    // oldest page and the current book would never be in it.
+    const rows = this.repositories.messages.recentByKind(room, 'trade');
 
     const offers: ExternalOffer[] = [];
     for (const row of rows) {

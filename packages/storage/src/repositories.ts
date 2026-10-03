@@ -916,6 +916,30 @@ export class MessageRepository {
   }
 
   /**
+   * The newest stored messages of one kind in a room.
+   *
+   * `byKind` is the right shape for a *scan* — "everything since the cursor I am
+   * holding" — and the wrong shape for a *lookup*: it orders ascending, so on a
+   * room with more rows than its limit it returns the oldest ones and never the
+   * ones just written. That is not a theoretical difference. `close1` on the live
+   * box carries millions of trade rows, and the offer lookup asked for the first
+   * two thousand of them: it searched 30 September while our own offers sat at
+   * the end of the table, so the taker group saw an empty book and refused every
+   * tick with `no_external_offers`.
+   *
+   * A caller that wants "the current state of the room" has to say so.
+   */
+  recentByKind(room: string, kind: string, limit = 2000): MessageRow[] {
+    return (
+      this.db
+        .prepare(
+          'SELECT * FROM messages WHERE room = ? AND kind = ? ORDER BY seq DESC LIMIT ?',
+        )
+        .all(room, kind, limit) as MessageRow[]
+    ).reverse();
+  }
+
+  /**
    * Messages of one room inside an inclusive seq range, oldest first.
    *
    * This exists for one question only: does a recorded loss band contain

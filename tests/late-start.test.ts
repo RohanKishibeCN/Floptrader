@@ -1757,6 +1757,63 @@ describe('in-fleet matching gives our own open offers a counterparty', () => {
     expect(h.runtime.reader.externalOffers()).toEqual([]);
   }, 180_000);
 
+  it('finds the newest offers in a room far deeper than one page', async () => {
+    harness = await buildLateStart({
+      trading: true,
+      strategy: true,
+      env: { EXTERNAL_OFFER_TAKER_LOCAL_MATCH: 'true', LOCAL_MATCH_CONFIRM: LOCAL_MATCH_CONFIRM_VALUE },
+    });
+    const h = harness;
+    await waitForFirstPass(h);
+    await primeAt(h, 1757, '229.80');
+    await primeAt(h, 1758, '230.00');
+
+    // `close1` on the live box holds millions of trade rows. Fill the room's
+    // discarded history first — everything the reader has already passed — so the
+    // offer that arrives next lands at the *end* of the table, exactly as a live
+    // one does against the two million rows already stored.
+    const messages = h.runtime.repositories.messages;
+    const filler = {
+      room: 'close1',
+      kind: 'trade',
+      ts: '2026-09-25T12:00:00.000Z',
+      sender_did: 'did:key:filler',
+      nonce: null,
+      sig: null,
+      text: '{"t":"trade"}',
+      signature_valid: null,
+      ingested_at: '2026-09-25T12:00:00.000Z',
+    };
+    for (let seq = 1; seq <= 3000; seq += 1) {
+      messages.insert({ ...filler, seq });
+    }
+    // The room hands out the next seq itself, so the offer lands above the filler
+    // rather than beside it.
+    (h.transport.room('close1') as unknown as { nextSeq: number }).nextSeq = 4000;
+
+    // Our offer, appended after all of it and read back at its own seq.
+    const makerAgent = [...h.runtime.keyStore.agentIds].sort()[0]!;
+    postOurOpenOffer(h, makerAgent, { id: 'our-offer-deep', px: '229.00', until: 1759, side: 'sell' });
+    await h.runtime.reader.tick();
+    const offerRow = messages
+      .recentByKind('close1', 'trade')
+      .find((row) => row.text.includes('our-offer-deep'));
+    expect(offerRow).toBeDefined();
+    expect(offerRow!.seq).toBeGreaterThan(3000);
+
+    // The lookup that scans from seq 0 can only ever see the oldest page. That is
+    // the bug this pins: on the live box it searched 30 September while our own
+    // offers sat at the end of a two-million-row table.
+    const scanned = messages.byKind('close1', 'trade');
+    expect(scanned).toHaveLength(2000);
+    expect(scanned.some((row) => row.text.includes('our-offer-deep'))).toBe(false);
+    // Asking for the newest rows is what finds the offer, and it is why the taker
+    // group is shown a book at all.
+    expect(messages.recentByKind('close1', 'trade').some((row) => row.text.includes('our-offer-deep'))).toBe(true);
+    const offers = h.runtime.reader.externalOffers({ includeLocal: true });
+    expect(offers.map((offer) => offer.terms.id)).toContain('our-offer-deep');
+  }, 180_000);
+
   it('accepts a fleet offer, so the maker offer becomes a countersigned trade', async () => {
     harness = await buildLateStart({
       trading: true,

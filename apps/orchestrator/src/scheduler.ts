@@ -602,6 +602,19 @@ export interface StatusSnapshot {
       allowWithClose1Gap: boolean;
       override: { operator: string; reason: string; at: string } | null;
     };
+    /**
+     * Which offer lanes the taker group may act on.
+     *
+     * Reported because the group's behaviour is otherwise invisible from outside:
+     * with the local lane off, every taker run reads `no_external_offers` and looks
+     * exactly like a book with nothing on it.
+     */
+    offerPolicy: {
+      /** Our own DIDs may take each other's open offers (late start only). */
+      localMatch: boolean;
+      /** Strangers' offers in discovered rooms (off in `lite`). */
+      strangerLane: boolean;
+    };
     /** Our own seqs that provably fall inside the recorded band. */
     localMessagesInGap: number[];
     /** Agents whose registration seq is inside the band. */
@@ -3776,6 +3789,13 @@ export class OrchestratorScheduler {
         tradingPolicy: {
           allowWithClose1Gap: this.config.technoCore.allowTradingWithClose1Gap,
           override: this.config.technoCore.tradingOverride,
+        },
+        // Reported because the taker group's behaviour is otherwise invisible from
+        // outside: with this lane off, every taker run reads `no_external_offers`
+        // and looks identical to "there is nothing on the book".
+        offerPolicy: {
+          localMatch: this.config.localOfferMatchingEnabled,
+          strangerLane: this.config.externalOfferTakerEnabled,
         },
         localMessagesInGap: coverage.localSeqsInGap,
         localAgentsInGap: coverage.localAgentsInGap,
